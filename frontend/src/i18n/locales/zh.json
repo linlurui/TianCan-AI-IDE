@@ -461,7 +461,7 @@
     "langPathSection": "各语言可执行文件路径（可选覆盖）",
     "langPathHint": "留空则在安装目录及系统 PATH 中自动查找。填入绝对路径可指定特定版本。",
     "autoFind": "自动查找 {{binary}}",
-    "appName": "天残 AI IDE",
+    "appName": "天蚕 AI IDE",
     "version": "版本",
     "configFile": "配置文件",
     "checking": "检查中…",
