@@ -1,0 +1,16 @@
+{
+  "$schema": "https://wails.io/schemas/config.v3.json",
+  "name": "tiancan-ai-ide",
+  "outputfilename": "tiancan-ai-ide",
+  "frontend": {
+    "dir": "frontend",
+    "devServerURL": "http://localhost:34115",
+    "installCommand": "npm install",
+    "buildCommand": "npm run build",
+    "devCommand": "npm run dev"
+  },
+  "author": {
+    "name": "Rocky",
+    "email": ""
+  }
+}
