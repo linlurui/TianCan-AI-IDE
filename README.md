@@ -10,6 +10,15 @@
 
 ---
 
+## 界面预览
+
+<div align="center">
+  <img src="frontend/ui1.png" width="49%" alt="AI Agent 界面" />
+  <img src="frontend/ui2.png" width="49%" alt="编辑器 + 终端界面" />
+</div>
+
+---
+
 ## 特性总览
 
 | | |
