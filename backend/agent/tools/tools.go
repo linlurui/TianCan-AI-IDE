@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/rocky233/tiancan-ai-ide/backend/agent/ralph"
 	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
 	"github.com/rocky233/tiancan-ai-ide/backend/sandbox"
 )
@@ -19,12 +20,13 @@ type LLMCaller interface {
 
 // Registry manages dynamic tool registration and execution.
 type Registry struct {
-	builtin    map[string]types.Tool
-	mcp        map[string]types.Tool
-	mu         sync.RWMutex
-	rootPath   string
-	llm        LLMCaller        // optional: injected from ai.Service
-	sandboxMgr *sandbox.Manager // optional: injected from ai.Service
+	builtin      map[string]types.Tool
+	mcp          map[string]types.Tool
+	mu           sync.RWMutex
+	rootPath     string
+	llm          LLMCaller           // optional: injected from ai.Service
+	sandboxMgr   *sandbox.Manager    // optional: injected from ai.Service
+	rollbackTool *RollbackTool       // optional: injected from agent
 }
 
 // NewRegistry creates a new tool registry with built-in tools.
@@ -63,6 +65,13 @@ func (r *Registry) GetLLMCaller() LLMCaller {
 // Must be called before registerBuiltinTools or the fallback NewManager() will be used.
 func (r *Registry) SetSandboxManager(mgr *sandbox.Manager) {
 	r.sandboxMgr = mgr
+}
+
+// SetRollbackManager injects the rollback manager for the RollbackTool.
+func (r *Registry) SetRollbackManager(mgr *ralph.RollbackManager) {
+	if r.rollbackTool != nil {
+		r.rollbackTool.SetRollbackManager(mgr)
+	}
 }
 
 // Register adds a tool to the registry.
@@ -208,6 +217,9 @@ func (r *Registry) registerBuiltinTools() {
 	// AutoResearch tools (autoresearch_tools.go)
 	r.Register(&AutoResearchTool{rootPath: r.rootPath})
 	r.Register(&WebSearchTool{})
+	// Rollback tool (rollback_tools.go) — manager will be set via SetRollbackManager
+	r.rollbackTool = NewRollbackTool(nil)
+	r.Register(r.rollbackTool)
 	// Sandbox tools (sandbox/tool.go) — manager will be injected via SetSandboxManager
 	if r.sandboxMgr == nil {
 		r.sandboxMgr = sandbox.NewManager() // fallback if not injected

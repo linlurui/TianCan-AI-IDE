@@ -14,39 +14,89 @@ import (
 
 // FileSnapshot captures file state for rollback.
 type FileSnapshot struct {
-	Path    string    `json:"path"`
-	Content string    `json:"content"`
-	Exists  bool      `json:"exists"`
-	ModTime time.Time `json:"modTime"`
+	Path       string    `json:"path"`
+	Content    string    `json:"content"`
+	Exists     bool      `json:"exists"`
+	ModTime    time.Time `json:"modTime"`
+	Checkpoint string    `json:"checkpoint"` // 所属检查点ID
+}
+
+// Checkpoint 标记一个修改时间点
+type Checkpoint struct {
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`         // 可选名称
+	Timestamp   time.Time       `json:"timestamp"`
+	Description string          `json:"description"`  // 描述此检查点
+	Snapshots   []FileSnapshot  `json:"snapshots"`   // 此检查点的快照
 }
 
 // RollbackManager tracks file changes and supports reverting them.
 type RollbackManager struct {
-	mu        sync.Mutex
-	snapshots map[string][]FileSnapshot
-	rootPath  string
-	enabled   bool
+	mu           sync.Mutex
+	snapshots    map[string][]FileSnapshot    // path -> snapshots stack
+	checkpoints  map[string]*Checkpoint       // checkpoint ID -> checkpoint
+	checkpointOrder []string                  // 检查点顺序（用于列表显示）
+	rootPath     string
+	enabled      bool
+	currentCheckpoint string                  // 当前活跃检查点
 }
 
 func NewRollbackManager(rootPath string) *RollbackManager {
 	return &RollbackManager{
-		snapshots: make(map[string][]FileSnapshot),
-		rootPath:  rootPath,
-		enabled:   os.Getenv("TIANCAN_DISABLE_ROLLBACK") != "1",
+		snapshots:   make(map[string][]FileSnapshot),
+		checkpoints: make(map[string]*Checkpoint),
+		rootPath:    rootPath,
+		enabled:    os.Getenv("TIANCAN_DISABLE_ROLLBACK") != "1",
 	}
 }
 
+// CreateCheckpoint 创建一个新的修改检查点
+func (rm *RollbackManager) CreateCheckpoint(name string, description string) string {
+	if !rm.enabled {
+		return ""
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	cp := &Checkpoint{
+		ID:          fmt.Sprintf("cp-%d", time.Now().UnixNano()),
+		Name:        name,
+		Timestamp:   time.Now(),
+		Description: description,
+		Snapshots:   make([]FileSnapshot, 0),
+	}
+
+	rm.checkpoints[cp.ID] = cp
+	rm.checkpointOrder = append(rm.checkpointOrder, cp.ID)
+	rm.currentCheckpoint = cp.ID
+
+	// 将当前所有快照复制到检查点
+	for _, snaps := range rm.snapshots {
+		for i := range snaps {
+			snaps[i].Checkpoint = cp.ID
+			cp.Snapshots = append(cp.Snapshots, snaps[i])
+		}
+	}
+
+	return cp.ID
+}
+
+// Snapshot 记录文件的当前状态
 func (rm *RollbackManager) Snapshot(path string) error {
 	if !rm.enabled {
 		return nil
 	}
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
+	return rm.snapshotUnlocked(path)
+}
+
+func (rm *RollbackManager) snapshotUnlocked(path string) error {
 	absPath := path
 	if !filepath.IsAbs(path) {
 		absPath = filepath.Join(rm.rootPath, path)
 	}
-	snap := FileSnapshot{Path: absPath, ModTime: time.Now()}
+	snap := FileSnapshot{Path: absPath, ModTime: time.Now(), Checkpoint: rm.currentCheckpoint}
 	data, err := os.ReadFile(absPath)
 	if err != nil {
 		snap.Exists = false
@@ -58,9 +108,126 @@ func (rm *RollbackManager) Snapshot(path string) error {
 	return nil
 }
 
+// SnapshotMultiple 批量快照多个文件
+func (rm *RollbackManager) SnapshotMultiple(paths []string) {
+	if !rm.enabled {
+		return
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for _, p := range paths {
+		rm.snapshotUnlocked(p)
+	}
+}
+
+// GetCheckpoints 返回所有检查点列表
+func (rm *RollbackManager) GetCheckpoints() []*Checkpoint {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	result := make([]*Checkpoint, 0, len(rm.checkpointOrder))
+	for _, id := range rm.checkpointOrder {
+		if cp, ok := rm.checkpoints[id]; ok {
+			result = append(result, cp)
+		}
+	}
+	return result
+}
+
+// GetCheckpoint 获取指定检查点详情
+func (rm *RollbackManager) GetCheckpoint(id string) (*Checkpoint, bool) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	cp, ok := rm.checkpoints[id]
+	return cp, ok
+}
+
+// GetModifiedFiles 返回当前已修改的文件列表
+func (rm *RollbackManager) GetModifiedFiles() []ModifiedFileInfo {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	var files []ModifiedFileInfo
+	for path, snaps := range rm.snapshots {
+		if len(snaps) == 0 {
+			continue
+		}
+		latest := snaps[len(snaps)-1]
+
+		// 检查文件是否与最新快照不同
+		currentExists := true
+		currentContent := ""
+		if data, err := os.ReadFile(path); err == nil {
+			currentContent = string(data)
+		} else {
+			currentExists = false
+		}
+
+		modified := currentExists != latest.Exists ||
+			(currentExists && currentContent != latest.Content)
+
+		files = append(files, ModifiedFileInfo{
+			Path:           path,
+			Modified:       modified,
+			SnapshotCount:  len(snaps),
+			FirstSnapshot:  snaps[0].ModTime,
+			LatestSnapshot: latest.ModTime,
+			Checkpoint:     latest.Checkpoint,
+		})
+	}
+	return files
+}
+
+// ModifiedFileInfo 修改文件信息
+type ModifiedFileInfo struct {
+	Path           string    `json:"path"`
+	Modified       bool      `json:"modified"`       // 是否有未保存的修改
+	SnapshotCount  int       `json:"snapshotCount"`  // 快照数量
+	FirstSnapshot  time.Time `json:"firstSnapshot"`  // 首次快照时间
+	LatestSnapshot time.Time `json:"latestSnapshot"` // 最新快照时间
+	Checkpoint     string    `json:"checkpoint"`    // 所属检查点
+}
+
+// GetFileDiff 获取文件与指定快照的差异
+func (rm *RollbackManager) GetFileDiff(path string, snapshotIndex int) (string, error) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	absPath := path
+	if !filepath.IsAbs(path) {
+		absPath = filepath.Join(rm.rootPath, path)
+	}
+
+	snaps, ok := rm.snapshots[absPath]
+	if !ok || len(snaps) == 0 {
+		return "", fmt.Errorf("no snapshots for %s", path)
+	}
+
+	if snapshotIndex < 0 || snapshotIndex >= len(snaps) {
+		return "", fmt.Errorf("snapshot index out of range: %d", snapshotIndex)
+	}
+
+	// 获取当前文件内容
+	currentContent := ""
+	if data, err := os.ReadFile(absPath); err == nil {
+		currentContent = string(data)
+	}
+
+	snapshot := snaps[snapshotIndex]
+
+	return fmt.Sprintf("File: %s\nSnapshot at: %s\n\n--- Current ---\n%s\n\n--- Snapshot #%d ---\n%s",
+		path, snapshot.ModTime.Format(time.RFC3339),
+		currentContent, snapshotIndex, snapshot.Content), nil
+}
+
+// Rollback 回滚到上一次快照
 func (rm *RollbackManager) Rollback() error {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
+	return rm.rollbackUnlocked()
+}
+
+func (rm *RollbackManager) rollbackUnlocked() error {
 	var errs []string
 	for path, stack := range rm.snapshots {
 		if len(stack) == 0 {
@@ -83,10 +250,159 @@ func (rm *RollbackManager) Rollback() error {
 	return nil
 }
 
+// RollbackToCheckpoint 回滚到指定检查点
+func (rm *RollbackManager) RollbackToCheckpoint(checkpointID string) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	cp, ok := rm.checkpoints[checkpointID]
+	if !ok {
+		return fmt.Errorf("checkpoint not found: %s", checkpointID)
+	}
+
+	// 获取检查点创建时的快照状态
+	var errs []string
+
+	// 首先恢复所有文件到检查点创建时的状态
+	// 我们需要找到每个文件在检查点时的快照
+	for _, snap := range cp.Snapshots {
+		if snap.Checkpoint != checkpointID {
+			continue
+		}
+
+		if !snap.Exists {
+			os.Remove(snap.Path)
+		} else {
+			os.MkdirAll(filepath.Dir(snap.Path), 0755)
+			if err := os.WriteFile(snap.Path, []byte(snap.Content), 0644); err != nil {
+				errs = append(errs, fmt.Sprintf("write %s: %v", snap.Path, err))
+			}
+		}
+	}
+
+	// 清理检查点之后的快照
+	for path := range rm.snapshots {
+		// 保留检查点创建之后的快照，但移除检查点时的快照
+		newSnaps := make([]FileSnapshot, 0)
+		for _, snap := range rm.snapshots[path] {
+			if snap.Checkpoint != checkpointID {
+				newSnaps = append(newSnaps, snap)
+			}
+		}
+		rm.snapshots[path] = newSnaps
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// RollbackFileToSnapshot 回滚单个文件到指定快照
+func (rm *RollbackManager) RollbackFileToSnapshot(path string, snapshotIndex int) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	absPath := path
+	if !filepath.IsAbs(path) {
+		absPath = filepath.Join(rm.rootPath, path)
+	}
+
+	snaps, ok := rm.snapshots[absPath]
+	if !ok || len(snaps) == 0 {
+		return fmt.Errorf("no snapshots for %s", path)
+	}
+
+	if snapshotIndex < 0 || snapshotIndex >= len(snaps) {
+		return fmt.Errorf("snapshot index out of range: %d", snapshotIndex)
+	}
+
+	snap := snaps[snapshotIndex]
+	if !snap.Exists {
+		return os.Remove(absPath)
+	}
+
+	os.MkdirAll(filepath.Dir(absPath), 0755)
+	return os.WriteFile(absPath, []byte(snap.Content), 0644)
+}
+
+// RollbackToIndex 回滚到指定快照索引（全局）
+func (rm *RollbackManager) RollbackToIndex(snapshotIndex int) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	// 找到所有文件的第 snapshotIndex 个快照并恢复
+	var errs []string
+	for path, snaps := range rm.snapshots {
+		if snapshotIndex >= len(snaps) {
+			continue
+		}
+		snap := snaps[snapshotIndex]
+		if !snap.Exists {
+			os.Remove(path)
+		} else {
+			os.MkdirAll(filepath.Dir(path), 0755)
+			if err := os.WriteFile(path, []byte(snap.Content), 0644); err != nil {
+				errs = append(errs, fmt.Sprintf("write %s: %v", path, err))
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// ClearSnapshots 清除所有快照
 func (rm *RollbackManager) ClearSnapshots() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	rm.snapshots = make(map[string][]FileSnapshot)
+	rm.currentCheckpoint = ""
+}
+
+// ClearCheckpoints 清除所有检查点
+func (rm *RollbackManager) ClearCheckpoints() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.checkpoints = make(map[string]*Checkpoint)
+	rm.checkpointOrder = nil
+	rm.currentCheckpoint = ""
+}
+
+// DeleteCheckpoint 删除指定检查点
+func (rm *RollbackManager) DeleteCheckpoint(checkpointID string) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	if _, ok := rm.checkpoints[checkpointID]; !ok {
+		return fmt.Errorf("checkpoint not found: %s", checkpointID)
+	}
+
+	delete(rm.checkpoints, checkpointID)
+
+	// 从顺序列表中移除
+	newOrder := make([]string, 0)
+	for _, id := range rm.checkpointOrder {
+		if id != checkpointID {
+			newOrder = append(newOrder, id)
+		}
+	}
+	rm.checkpointOrder = newOrder
+
+	return nil
+}
+
+// GetSnapshotCount 获取快照数量
+func (rm *RollbackManager) GetSnapshotCount() int {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	count := 0
+	for _, snaps := range rm.snapshots {
+		count += len(snaps)
+	}
+	return count
 }
 
 // RalphConfig holds Ralph Loop V2 configuration.

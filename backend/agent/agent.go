@@ -50,15 +50,16 @@ type ProgressCallback func(iteration int, toolName string, toolArgs map[string]i
 
 // Agent is the main orchestrator that wires all subsystems together.
 type Agent struct {
-	rootPath     string
-	homeDir      string
-	registry     *tools.Registry
-	safetySys    *safety.SafetySystem
-	memorySys    *memory.MemorySystem
-	compactSvc   *compact.CompactService
-	mcpClient    *mcp.Client
-	ralphLoop    *ralph.RalphLoop
-	parallelExec *parallel.Executor
+	rootPath      string
+	homeDir       string
+	registry      *tools.Registry
+	safetySys     *safety.SafetySystem
+	memorySys     *memory.MemorySystem
+	compactSvc    *compact.CompactService
+	mcpClient     *mcp.Client
+	ralphLoop     *ralph.RalphLoop
+	parallelExec  *parallel.Executor
+	rollbackMgr   *ralph.RollbackManager
 
 	mu          sync.Mutex
 	messages    []Message
@@ -78,6 +79,7 @@ func NewAgent(rootPath string) *Agent {
 	memorySys := memory.NewMemorySystem(homeDir)
 	compactSvc := compact.NewCompactService()
 	mcpClient := mcp.NewClient()
+	rollbackMgr := ralph.NewRollbackManager(rootPath)
 
 	a := &Agent{
 		rootPath:     rootPath,
@@ -88,6 +90,7 @@ func NewAgent(rootPath string) *Agent {
 		compactSvc:   compactSvc,
 		mcpClient:    mcpClient,
 		parallelExec: parallel.NewExecutor(4),
+		rollbackMgr:  rollbackMgr,
 	}
 
 	// Load config files
@@ -104,6 +107,11 @@ func (a *Agent) SetProgressCallback(cb ProgressCallback) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.progressCB = cb
+}
+
+// GetRollbackManager returns the rollback manager for file versioning.
+func (a *Agent) GetRollbackManager() *ralph.RollbackManager {
+	return a.rollbackMgr
 }
 
 // Registry returns the tool registry so callers can inject shared dependencies.

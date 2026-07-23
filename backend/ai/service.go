@@ -2886,6 +2886,7 @@ func (s *Service) ChatWeb(message string) (string, error) {
 func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxIterations int, mode string) agent.AgentRunResult {
 	a := agent.NewAgent(rootPath)
 	a.Registry().SetSandboxManager(s.sandboxMgr)
+	a.Registry().SetRollbackManager(a.GetRollbackManager())
 
 	// Build chat function based on mode
 	var chatFn agent.ChatFunc
