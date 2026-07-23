@@ -17,6 +17,11 @@ export class HardwareProfile {
     "gpuMemoryGB": number;
     "hasGpu": boolean;
     "gpuName"?: string;
+
+    /**
+     * GPU 使用率百分比
+     */
+    "gpuUtilization"?: number;
     "os": string;
 
     /** Creates a new HardwareProfile instance. */

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -651,14 +652,40 @@ func applyHeuristicModification(code, hypothesis, metric string) (string, string
 
 // ─── Web Search Tool (for AutoResearch extension) ─────────────────────
 
+// SearchSource 搜索源
+type SearchSource string
+
+const (
+	SourceAuto     SearchSource = "auto"     // 自动选择最佳源
+	SourceSearXNG  SearchSource = "searxng" // SearXNG 元搜索引擎
+	SourceDuckDuck SearchSource = "duckduckgo"
+	SourceBing     SearchSource = "bing"
+)
+
+// SearchResult 单条搜索结果
+type SearchResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet"`
+	Engine  string `json:"engine,omitempty"`
+}
+
 // WebSearchTool allows the agent to search the web for information.
-// Uses SearXNG for full search results with pagination support.
-// Falls back to DuckDuckGo instant answers if SearXNG is unavailable.
-type WebSearchTool struct{}
+// Supports multiple search engines: SearXNG, DuckDuckGo, Bing.
+// Falls back gracefully when primary source is unavailable.
+type WebSearchTool struct {
+	defaultSource SearchSource
+}
+
+func NewWebSearchTool() *WebSearchTool {
+	return &WebSearchTool{
+		defaultSource: SearchSource(os.Getenv("TIANCAN_SEARCH_SOURCE")),
+	}
+}
 
 func (t *WebSearchTool) Name() string { return "web_search" }
 func (t *WebSearchTool) Description() string {
-	return "搜索互联网获取信息（用于研究和技术查询），支持分页"
+	return "搜索互联网获取信息，支持多种搜索源（SearXNG/Bing/DuckDuckGo），包含分页、排序和安全搜索选项"
 }
 func (t *WebSearchTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
@@ -668,13 +695,36 @@ func (t *WebSearchTool) InputSchema() map[string]interface{} {
 				"type":        "string",
 				"description": "搜索查询",
 			},
+			"source": map[string]interface{}{
+				"type": "string",
+				"enum": []string{"auto", "searxng", "duckduckgo", "bing"},
+				"description": "搜索源 (auto=自动选择, searxng=元搜索, duckduckgo=即时答案, bing=Bing搜索)",
+			},
 			"page": map[string]interface{}{
 				"type":        "number",
 				"description": "页码（从1开始，默认1）",
 			},
-			"categories": map[string]interface{}{
+			"per_page": map[string]interface{}{
+				"type":        "number",
+				"description": "每页结果数（默认10，最大50）",
+			},
+			"category": map[string]interface{}{
+				"type": "string",
+				"enum": []string{"general", "news", "science", "it", "files", "images", "videos"},
+				"description": "搜索类别",
+			},
+			"safe": map[string]interface{}{
+				"type":        "boolean",
+				"description": "安全搜索（默认开启）",
+			},
+			"language": map[string]interface{}{
 				"type":        "string",
-				"description": "搜索类别（可选：general, news, science, it, files, images）",
+				"description": "搜索语言代码（zh/en/ja等，默认auto）",
+			},
+			"time_range": map[string]interface{}{
+				"type": "string",
+				"enum": []string{"day", "week", "month", "year"},
+				"description": "时间范围过滤",
 			},
 		},
 		"required": []string{"query"},
@@ -688,91 +738,324 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}
 	if query == "" {
 		return types.ToolResult{Success: false, Error: "query is required"}, nil
 	}
-	page := 1
-	if v, ok := args["page"].(float64); ok && v > 0 {
-		page = int(v)
-	}
-	categories, _ := args["categories"].(string)
 
-	// Try SearXNG first (configurable via TIANCAN_SEARXNG_URL env)
-	searxURL := os.Getenv("TIANCAN_SEARXNG_URL")
-	if searxURL == "" {
-		searxURL = "https://searx.be" // public SearXNG instance
+	// 解析参数
+	source := SearchSource(getStringArg(args, "source", string(t.defaultSource)))
+	if source == "" || source == "auto" {
+		source = "searxng" // 默认使用 SearXNG
+	}
+	page := getIntArg(args, "page", 1)
+	perPage := getIntArg(args, "per_page", 10)
+	if perPage > 50 {
+		perPage = 50
+	}
+	category := getStringArg(args, "category", "")
+	safe := getBoolArg(args, "safe", true)
+	language := getStringArg(args, "language", "auto")
+	timeRange := getStringArg(args, "time_range", "")
+
+	var results []SearchResult
+	var err error
+	var usedEngine string
+
+	// 根据源执行搜索
+	switch source {
+	case "searxng":
+		results, err = t.searchSearXNG(ctx, query, page, perPage, category, safe, language, timeRange)
+		usedEngine = "SearXNG"
+	case "bing":
+		results, err = t.searchBing(ctx, query, page, perPage, safe, language, timeRange)
+		usedEngine = "Bing"
+	case "duckduckgo":
+		results, err = t.searchDuckDuckGoHTML(ctx, query, page, perPage, safe)
+		usedEngine = "DuckDuckGo"
+	default:
+		// 尝试 SearXNG，失败则降级到其他源
+		results, err = t.searchSearXNG(ctx, query, page, perPage, category, safe, language, timeRange)
+		if err != nil {
+			results, err = t.searchBing(ctx, query, page, perPage, safe, language, timeRange)
+			usedEngine = "Bing"
+		} else {
+			usedEngine = "SearXNG"
+		}
 	}
 
-	result, err := searchSearXNG(searxURL, query, page, categories)
-	if err == nil && result != "" {
-		return types.ToolResult{Content: result, Success: true}, nil
+	if err != nil {
+		// 最终降级：尝试 DuckDuckGo 即时答案
+		abstract, fallbackErr := t.searchDuckDuckGoInstant(query)
+		if fallbackErr == nil && abstract != "" {
+			return types.ToolResult{
+				Content: fmt.Sprintf("📋 来自 DuckDuckGo 即时答案:\n\n%s\n\n💡 提示: 详细搜索结果不可用，可尝试设置 source='searxng'", abstract),
+				Success: true,
+			}, nil
+		}
+		return types.ToolResult{Success: false, Error: err.Error()}, nil
 	}
 
-	// Fallback to DuckDuckGo instant answers
-	return searchDuckDuckGo(query)
+	// 格式化结果
+	return t.formatResults(query, results, page, perPage, usedEngine)
 }
 
-// searchSearXNG queries a SearXNG instance and returns formatted results.
-func searchSearXNG(baseURL, query string, page int, categories string) (string, error) {
-	pagenum := page - 1 // SearXNG uses 0-indexed pages
-	url := fmt.Sprintf("%s/search?q=%s&format=json&pageno=%d", baseURL, query, pagenum)
-	if categories != "" {
-		url += "&categories=" + categories
+// searchSearXNG 使用 SearXNG 元搜索引擎
+func (t *WebSearchTool) searchSearXNG(ctx context.Context, query string, page, perPage int, category string, safe bool, language, timeRange string) ([]SearchResult, error) {
+	baseURL := os.Getenv("TIANCAN_SEARXNG_URL")
+	if baseURL == "" {
+		baseURL = "https://searx.be"
 	}
 
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("format", "json")
+	params.Set("pageno", strconv.Itoa(page))
+	params.Set("engines", "google,bing,duckduckgo") // 指定引擎
+	params.Set("tokens", "20")                      // 结果数
+
+	if category != "" {
+		params.Set("categories", category)
+	}
+	if safe {
+		params.Set("safesearch", "1")
+	}
+	if language != "" && language != "auto" {
+		params.Set("language", language)
+	}
+	if timeRange != "" {
+		params.Set("time_range", timeRange)
+	}
+
+	fullURL := fmt.Sprintf("%s/search?%s", baseURL, params.Encode())
+
 	fetchTool := &WebFetchTool{}
-	result, err := fetchTool.Execute(context.Background(), map[string]interface{}{"url": url})
+	result, err := fetchTool.Execute(ctx, map[string]interface{}{"url": fullURL})
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("SearXNG 请求失败: %v", err)
 	}
 
 	var resp map[string]interface{}
 	if err := json.Unmarshal([]byte(result.Content), &resp); err != nil {
-		return "", err
+		return nil, fmt.Errorf("SearXNG 响应解析失败: %v", err)
 	}
 
 	results, ok := resp["results"].([]interface{})
 	if !ok || len(results) == 0 {
-		return "", fmt.Errorf("no results from SearXNG")
+		return nil, fmt.Errorf("SearXNG 返回空结果")
 	}
 
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("搜索结果 (第%d页, 共%d条):\n", page, len(results)))
-	for i, r := range results {
+	var searchResults []SearchResult
+	for _, r := range results {
 		item, ok := r.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		title, _ := item["title"].(string)
-		url, _ := item["url"].(string)
-		snippet, _ := item["content"].(string)
-		b.WriteString(fmt.Sprintf("%d. %s\n   URL: %s\n", i+1, title, url))
-		if snippet != "" {
-			b.WriteString(fmt.Sprintf("   %s\n", snippet))
+		result := SearchResult{
+			Title:   getString(item, "title"),
+			URL:     getString(item, "url"),
+			Snippet: getString(item, "content"),
+			Engine:  getString(item, "engine"),
+		}
+		if result.URL != "" {
+			searchResults = append(searchResults, result)
+		}
+		if len(searchResults) >= perPage {
+			break
 		}
 	}
 
-	// Add pagination hint
-	if len(results) >= 10 {
-		b.WriteString(fmt.Sprintf("\n提示: 使用 page=%d 获取下一页结果", page+1))
-	}
-
-	return b.String(), nil
+	return searchResults, nil
 }
 
-// searchDuckDuckGo is the fallback search using DuckDuckGo instant answers.
-func searchDuckDuckGo(query string) (types.ToolResult, error) {
+// searchBing 使用 Bing 搜索 API（网页抓取）
+func (t *WebSearchTool) searchBing(ctx context.Context, query string, page, perPage int, safe bool, language, timeRange string) ([]SearchResult, error) {
+	// Bing 的非官方 API（用于演示，实际生产应使用官方 API）
+	// 这里使用 html scraping 方式
+	safeParam := "on"
+	if !safe {
+		safeParam = "off"
+	}
+
+	offset := (page - 1) * perPage
+	url := fmt.Sprintf("https://www.bing.com/search?q=%s&first=%d&safeSearch=%s",
+		url.QueryEscape(query), offset+1, safeParam)
+
+	if language != "" && language != "auto" {
+		url += "&setlang=" + language
+	}
+
+	fetchTool := &WebFetchTool{}
+	result, err := fetchTool.Execute(ctx, map[string]interface{}{"url": url})
+	if err != nil {
+		return nil, fmt.Errorf("Bing 请求失败: %v", err)
+	}
+
+	// 解析 Bing 搜索结果
+	return parseBingHTML(result.Content), nil
+}
+
+// searchDuckDuckGoHTML 使用 DuckDuckGo HTML 搜索
+func (t *WebSearchTool) searchDuckDuckGoHTML(ctx context.Context, query string, page, perPage int, safe bool) ([]SearchResult, error) {
+	offset := (page - 1) * perPage
+	searchURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s&s=%d", url.QueryEscape(query), offset)
+
+	fetchTool := &WebFetchTool{}
+	result, err := fetchTool.Execute(ctx, map[string]interface{}{"url": searchURL})
+	if err != nil {
+		return nil, fmt.Errorf("DuckDuckGo 请求失败: %v", err)
+	}
+
+	return parseDuckDuckGoHTML(result.Content), nil
+}
+
+// searchDuckDuckGoInstant 获取 DuckDuckGo 即时答案
+func (t *WebSearchTool) searchDuckDuckGoInstant(query string) (string, error) {
 	fetchTool := &WebFetchTool{}
 	result, err := fetchTool.Execute(context.Background(), map[string]interface{}{
-		"url": fmt.Sprintf("https://api.duckduckgo.com/?q=%s&format=json&no_html=1", query),
+		"url": fmt.Sprintf("https://api.duckduckgo.com/?q=%s&format=json&no_html=1", url.QueryEscape(query)),
 	})
 	if err != nil {
-		return types.ToolResult{Success: false, Error: err.Error()}, nil
+		return "", err
 	}
 
 	var ddg map[string]interface{}
-	if err := json.Unmarshal([]byte(result.Content), &ddg); err == nil {
-		if abstract, ok := ddg["AbstractText"].(string); ok && abstract != "" {
-			return types.ToolResult{Content: abstract, Success: true}, nil
+	if err := json.Unmarshal([]byte(result.Content), &ddg); err != nil {
+		return "", err
+	}
+
+	if abstract, ok := ddg["AbstractText"].(string); ok && abstract != "" {
+		return abstract, nil
+	}
+
+	return "", fmt.Errorf("无即时答案")
+}
+
+// formatResults 格式化搜索结果
+func (t *WebSearchTool) formatResults(query string, results []SearchResult, page, perPage int, engine string) (types.ToolResult, error) {
+	if len(results) == 0 {
+		return types.ToolResult{Content: "未找到相关结果", Success: true}, nil
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("🔍 搜索结果: %s\n", query))
+	b.WriteString(fmt.Sprintf("📊 引擎: %s | 第 %d 页\n", engine, page))
+	b.WriteString(fmt.Sprintf("📄 结果数: %d\n\n", len(results)))
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+
+	for i, r := range results {
+		b.WriteString(fmt.Sprintf("【%d】%s\n", page*perPage-perPage+i+1, r.Title))
+		b.WriteString(fmt.Sprintf("🔗 %s\n", r.URL))
+		if r.Snippet != "" {
+			// 清理 HTML 实体
+			snippet := cleanHTMLEntities(r.Snippet)
+			b.WriteString(fmt.Sprintf("📝 %s\n", snippet))
+		}
+		if r.Engine != "" && r.Engine != engine {
+			b.WriteString(fmt.Sprintf("🏷 来源: %s\n", r.Engine))
+		}
+		b.WriteString("\n")
+	}
+
+	// 添加导航提示
+	b.WriteString("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	if page > 1 {
+		b.WriteString(fmt.Sprintf("⬅️ 上一页: page=%d\n", page-1))
+	}
+	b.WriteString(fmt.Sprintf("➡️ 下一页: page=%d\n", page+1))
+	b.WriteString("💡 使用 source 参数切换搜索源: searxng/bing/duckduckgo\n")
+
+	return types.ToolResult{Content: b.String(), Success: true}, nil
+}
+
+// parseBingHTML 解析 Bing 搜索结果 HTML
+func parseBingHTML(html string) []SearchResult {
+	var results []SearchResult
+
+	// 简单的正则匹配
+	titleRe := regexp.MustCompile(`<h2[^>]*><a[^>]*href="([^"]*)"[^>]*>([^<]*)</a></h2>`)
+	snippetRe := regexp.MustCompile(`<p class="b_paractraph"[^>]*><a href="[^"]*"[^>]*>([^<]*)</a></p>`)
+
+	titleMatches := titleRe.FindAllStringSubmatch(html, -1)
+	snippetMatches := snippetRe.FindAllStringSubmatch(html, -1)
+
+	for i, match := range titleMatches {
+		if len(match) >= 3 {
+			result := SearchResult{
+				URL:   match[1],
+				Title: cleanHTMLEntities(match[2]),
+			}
+			if i < len(snippetMatches) && len(snippetMatches[i]) >= 2 {
+				result.Snippet = cleanHTMLEntities(snippetMatches[i][1])
+			}
+			results = append(results, result)
 		}
 	}
 
-	return result, nil
+	return results
+}
+
+// parseDuckDuckGoHTML 解析 DuckDuckGo HTML 结果
+func parseDuckDuckGoHTML(html string) []SearchResult {
+	var results []SearchResult
+
+	// 匹配 DuckDuckGo 结果格式
+	resultRe := regexp.MustCompile(`<a class="result__a" href="([^"]*)">([^<]*)</a>`)
+	snippetRe := regexp.MustCompile(`<a class="result__snippet"[^>]*>([^<]*)</a>`)
+
+	titleMatches := resultRe.FindAllStringSubmatch(html, -1)
+	snippetMatches := snippetRe.FindAllStringSubmatch(html, -1)
+
+	for i, match := range titleMatches {
+		if len(match) >= 3 {
+			result := SearchResult{
+				URL:   match[1],
+				Title: cleanHTMLEntities(match[2]),
+			}
+			if i < len(snippetMatches) && len(snippetMatches[i]) >= 2 {
+				result.Snippet = cleanHTMLEntities(snippetMatches[i][1])
+			}
+			results = append(results, result)
+		}
+	}
+
+	return results
+}
+
+// cleanHTMLEntities 清理 HTML 实体
+func cleanHTMLEntities(s string) string {
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", "\"")
+	s = strings.ReplaceAll(s, "&#39;", "'")
+	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	s = strings.ReplaceAll(s, "<[^>]+>", "") // 移除剩余 HTML 标签
+	s = strings.TrimSpace(s)
+	return s
+}
+
+// 辅助函数
+func getStringArg(args map[string]interface{}, key, defaultVal string) string {
+	if v, ok := args[key].(string); ok && v != "" {
+		return v
+	}
+	return defaultVal
+}
+
+func getIntArg(args map[string]interface{}, key string, defaultVal int) int {
+	if v, ok := args[key].(float64); ok {
+		return int(v)
+	}
+	return defaultVal
+}
+
+func getBoolArg(args map[string]interface{}, key string, defaultVal bool) bool {
+	if v, ok := args[key].(bool); ok {
+		return v
+	}
+	return defaultVal
+}
+
+func getString(m map[string]interface{}, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
 }
