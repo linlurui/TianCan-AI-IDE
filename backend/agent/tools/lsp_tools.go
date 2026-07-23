@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
 )
@@ -15,7 +16,7 @@ import (
 // ── LSPDefinitionTool ───────────────────────────────────────────
 
 type LSPDefinitionTool struct {
-	lspPort int
+	lspPort  int
 	rootPath string
 }
 
@@ -74,10 +75,10 @@ func (t *LSPReferencesTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
 		"properties": map[string]interface{}{
-			"file":                  map[string]interface{}{"type": "string", "description": "File URI or path"},
-			"line":                  map[string]interface{}{"type": "integer", "description": "Line number (1-indexed)"},
-			"column":                map[string]interface{}{"type": "integer", "description": "Column number (1-indexed)"},
-			"include_declaration":   map[string]interface{}{"type": "boolean", "description": "Include declarations (default true)"},
+			"file":                map[string]interface{}{"type": "string", "description": "File URI or path"},
+			"line":                map[string]interface{}{"type": "integer", "description": "Line number (1-indexed)"},
+			"column":              map[string]interface{}{"type": "integer", "description": "Column number (1-indexed)"},
+			"include_declaration": map[string]interface{}{"type": "boolean", "description": "Include declarations (default true)"},
 		},
 		"required": []string{"file", "line", "column"},
 	}
@@ -263,7 +264,8 @@ func lspRequestTo(ctx context.Context, port int, method string, params map[strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("LSP request failed: %w", err)
 	}
@@ -367,8 +369,8 @@ func formatLSPSymbols(raw json.RawMessage) string {
 			} `json:"start"`
 		} `json:"range"`
 		Children []struct {
-			Name string `json:"name"`
-			Kind int    `json:"kind"`
+			Name  string `json:"name"`
+			Kind  int    `json:"kind"`
 			Range struct {
 				Start struct {
 					Line int `json:"line"`

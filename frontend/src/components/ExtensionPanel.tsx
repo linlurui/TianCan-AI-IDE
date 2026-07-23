@@ -26,7 +26,7 @@ export default function ExtensionPanel({ ext, lspPort, rootPath, monaco, onUnins
     setContrib(null);
     setLspStatus("idle");
     GetExtensionContributes(ext.publisher, ext.technicalName)
-      .then((c) => {
+      .then((c: ExtensionContributes | null) => {
         if (!c) return;
         setContrib(c);
         setLspStatus(c.lspCmd && c.lspCmd.length > 0 ? "idle" : "unavailable");

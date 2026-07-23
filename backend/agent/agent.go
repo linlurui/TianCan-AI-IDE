@@ -45,6 +45,9 @@ type StreamEvent struct {
 // It calls onToken for each token and returns the full accumulated response.
 type StreamChatFunc func(systemPrompt string, messages []Message, onToken func(token string)) (string, error)
 
+// ProgressCallback is called by the agent loop to report iteration progress.
+type ProgressCallback func(iteration int, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string)
+
 // Agent is the main orchestrator that wires all subsystems together.
 type Agent struct {
 	rootPath     string
@@ -60,6 +63,7 @@ type Agent struct {
 	mu          sync.Mutex
 	messages    []Message
 	configFiles []config.ConfigFile
+	progressCB  ProgressCallback
 }
 
 // NewAgent creates a new agent with all subsystems initialized.
@@ -93,6 +97,18 @@ func NewAgent(rootPath string) *Agent {
 	memorySys.EnsureDirExists()
 
 	return a
+}
+
+// SetProgressCallback sets the callback for agent loop progress reporting.
+func (a *Agent) SetProgressCallback(cb ProgressCallback) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.progressCB = cb
+}
+
+// Registry returns the tool registry so callers can inject shared dependencies.
+func (a *Agent) Registry() *tools.Registry {
+	return a.registry
 }
 
 // loadConfig loads TIANCAN.md config files.
@@ -181,10 +197,15 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 			// No more tool calls - done
 			a.mu.Lock()
 			a.messages = messages
+			cb := a.progressCB
 			a.mu.Unlock()
 
 			// Extract memories
 			a.memorySys.ExtractMemories(messages)
+
+			if cb != nil {
+				cb(i+1, "", nil, response, true, "")
+			}
 
 			return AgentRunResult{
 				Done:        true,
@@ -237,6 +258,12 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 					Success:  false,
 				})
 			case DecisionAllow:
+				a.mu.Lock()
+				cb := a.progressCB
+				a.mu.Unlock()
+				if cb != nil {
+					cb(i+1, tc.Name, tc.Args, "", false, "")
+				}
 				result, err := tool.Execute(ctx, tc.Args)
 				if err != nil {
 					result = ToolResult{Content: err.Error(), Success: false, Error: err.Error()}
@@ -248,6 +275,13 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 					Success:  result.Success,
 				})
 				totalTokens += len(result.Content) / 4
+				if cb != nil {
+					errStr := ""
+					if !result.Success {
+						errStr = result.Error
+					}
+					cb(i+1, tc.Name, tc.Args, result.Content, false, errStr)
+				}
 			}
 		}
 	}

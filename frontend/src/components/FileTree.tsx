@@ -306,6 +306,8 @@ export default function FileTree({
   const ctxRef = useRef<HTMLDivElement>(null);
   const fileCtxRef = useRef<HTMLDivElement>(null);
   const isCommittingRef = useRef(false);
+  // Track previous tree references per project to detect refreshProject updates
+  const prevTreeRef = useRef<Map<string, FileNode | null>>(new Map());
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
@@ -368,6 +370,42 @@ export default function FileTree({
     setLazyChildren((prev) => { const m = new Map(prev); m.delete(dirPath); return m; });
     loadDirIfNeeded(dirPath);
   }, [loadDirIfNeeded]);
+
+  // When a project's tree is refreshed (new reference from refreshProject),
+  // clear lazyChildren cache for that project so the fresh tree data is displayed.
+  useEffect(() => {
+    let changed = false;
+    for (const proj of projects) {
+      const prev = prevTreeRef.current.get(proj.id);
+      if (prev !== proj.tree) {
+        prevTreeRef.current.set(proj.id, proj.tree);
+        // Clear all lazy entries under this project root
+        setLazyChildren((prev) => {
+          const m = new Map(prev);
+          for (const key of m.keys()) {
+            if (key === proj.rootPath || key.startsWith(proj.rootPath + "/")) {
+              m.delete(key);
+              lazyRef.current.delete(key);
+            }
+          }
+          return m;
+        });
+        changed = true;
+      }
+    }
+    // Purge entries for removed projects
+    const currentIds = new Set(projects.map((p) => p.id));
+    for (const id of prevTreeRef.current.keys()) {
+      if (!currentIds.has(id)) prevTreeRef.current.delete(id);
+    }
+    if (changed) {
+      // Re-load lazy children for currently expanded dirs
+      for (const dir of expandedDirs) {
+        const proj = projects.find((p) => dir === p.rootPath || dir.startsWith(p.rootPath + "/"));
+        if (proj) loadDirIfNeeded(dir);
+      }
+    }
+  }, [projects, expandedDirs, loadDirIfNeeded]);
 
   const toggleDir = useCallback((path: string) => {
     setExpandedDirs((prev) => {

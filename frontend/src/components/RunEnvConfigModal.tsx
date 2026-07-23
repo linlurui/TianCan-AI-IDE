@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useTranslation } from "../i18n";
 import { X, Plus, Trash2, Loader2, Zap, Check } from "lucide-react";
-import { GetRunEnvConfig, SetRunEnvConfig, DetectRunEnv } from "../bindings/process";
+import { GetRunEnvConfig, SetRunEnvConfig, DetectRunEnv, RunEnvConfig } from "../bindings/process";
 import type { ProjectType } from "../types";
 
 const PROJECT_TYPES: { type: ProjectType; emoji: string; label?: string; cmd?: string; labelKey?: string; cmdKey?: string }[] = [
@@ -36,7 +36,7 @@ export default function RunEnvConfigModal({ projectName, rootPath, projectType, 
   useEffect(() => {
     setLoading(true);
     GetRunEnvConfig(rootPath)
-      .then((cfg) => {
+      .then((cfg: RunEnvConfig) => {
         setPreCmd(cfg?.preCmd ?? "");
         setBuildFlags((cfg as any)?.buildFlags ?? "");
         const rows: EnvRow[] = Object.entries(cfg?.env ?? {}).map(([key, value]) => ({ key, value: value as string }));

@@ -36,7 +36,7 @@ export default function CommitFileDiffViewer({ repoPath, commitHash, filePath }:
     setError(null);
 
     GetCommitFileDiff(repoPath, commitHash, filePath)
-      .then((diff) => {
+      .then((diff: string) => {
         if (cancelled) return;
 
         // Parse unified diff to extract original and modified content
@@ -69,7 +69,7 @@ export default function CommitFileDiffViewer({ repoPath, commitHash, filePath }:
         setOriginal(originalLines.join("\n"));
         setModified(modifiedLines.join("\n"));
       })
-      .catch((e) => {
+      .catch((e: unknown) => {
         if (!cancelled) setError(String(e));
       })
       .finally(() => {

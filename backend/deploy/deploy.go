@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // ── Model types ──────────────────────────────────────────────
@@ -461,10 +463,28 @@ func sshDial(sv *ServerConfig) (*ssh.Client, error) {
 	} else {
 		authMethods = append(authMethods, ssh.Password(sv.Password))
 	}
+	// Build HostKeyCallback from ~/.ssh/known_hosts
+	var hostKeyCB ssh.HostKeyCallback
+	khPath := filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts")
+	if kh, err := knownhosts.New(khPath); err == nil {
+		hostKeyCB = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			return kh(hostname, remote, key)
+		}
+	} else {
+		os.MkdirAll(filepath.Dir(khPath), 0700)
+		os.WriteFile(khPath, []byte{}, 0600)
+		if kh2, err2 := knownhosts.New(khPath); err2 == nil {
+			hostKeyCB = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+				return kh2(hostname, remote, key)
+			}
+		} else {
+			hostKeyCB = ssh.InsecureIgnoreHostKey()
+		}
+	}
 	cfg := &ssh.ClientConfig{
 		User:            sv.User,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCB,
 		Timeout:         15 * time.Second,
 	}
 	port := sv.Port

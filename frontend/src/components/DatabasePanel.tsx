@@ -1,18 +1,19 @@
-import React, { useState, useCallback, useRef, useEffect } from "react";
+import React, { useState, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import {
-  Database, Plus, Trash2, RefreshCw, Play, ChevronRight, ChevronDown,
+  Database, Plus, RefreshCw, Play, ChevronRight, ChevronDown,
   Table2, Eye, X, Loader2, AlertTriangle, Link,
 } from "lucide-react";
 import {
   Connect, Disconnect, ListTables, DescribeTable, RunQuery,
   ConnectionConfig, ConnectionInfo, TableInfo, ColumnInfo, QueryResult,
+  ConnectionType,
 } from "../bindings/database";
 import { SelectFile } from "../bindings/filesystem";
 
 interface ConnForm {
   name: string;
-  type: "sqlite" | "mysql" | "postgres";
+  type: ConnectionType;
   host: string;
   port: string;
   user: string;
@@ -22,12 +23,12 @@ interface ConnForm {
 }
 
 const DEFAULT_FORM: ConnForm = {
-  name: "", type: "sqlite", host: "localhost", port: "",
+  name: "", type: ConnectionType.ConnSQLite, host: "localhost", port: "",
   user: "", password: "", database: "", filePath: "",
 };
 
 const TYPE_LABELS: Record<string, string> = {
-  sqlite: "SQLite", mysql: "MySQL", postgres: "PostgreSQL",
+  [ConnectionType.ConnSQLite]: "SQLite", [ConnectionType.ConnMySQL]: "MySQL", [ConnectionType.ConnPostgres]: "PostgreSQL",
 };
 
 export default function DatabasePanel() {
@@ -85,8 +86,8 @@ export default function DatabasePanel() {
 
   const handleConnect = useCallback(async () => {
     if (!form.name.trim()) { setFormError(t("database.nameRequired")); return; }
-    if (form.type === "sqlite" && !form.filePath) { setFormError(t("database.selectFile")); return; }
-    if (form.type !== "sqlite" && (!form.host || !form.user)) { setFormError(t("database.hostUserRequired")); return; }
+    if (form.type === ConnectionType.ConnSQLite && !form.filePath) { setFormError(t("database.selectFile")); return; }
+    if (form.type !== ConnectionType.ConnSQLite && (!form.host || !form.user)) { setFormError(t("database.hostUserRequired")); return; }
     setFormError(null);
     setConnecting(true);
     const cfg: ConnectionConfig = {
@@ -165,17 +166,17 @@ export default function DatabasePanel() {
         <div className="db-form">
           <div className="db-form-row">
             <label>{t("database.type")}</label>
-            <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value as ConnForm["type"], port: e.target.value === "mysql" ? "3306" : e.target.value === "postgres" ? "5432" : "" })}>
-              <option value="sqlite">SQLite</option>
-              <option value="mysql">MySQL</option>
-              <option value="postgres">PostgreSQL</option>
+            <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value as ConnectionType, port: e.target.value === ConnectionType.ConnMySQL ? "3306" : e.target.value === ConnectionType.ConnPostgres ? "5432" : "" })}>
+              <option value={ConnectionType.ConnSQLite}>SQLite</option>
+              <option value={ConnectionType.ConnMySQL}>MySQL</option>
+              <option value={ConnectionType.ConnPostgres}>PostgreSQL</option>
             </select>
           </div>
           <div className="db-form-row">
             <label>{t("database.name")}</label>
             <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder={t("database.name")} />
           </div>
-          {form.type === "sqlite" ? (
+          {form.type === ConnectionType.ConnSQLite ? (
             <div className="db-form-row">
               <label>{t("database.file")}</label>
               <div style={{ display: "flex", gap: 4, flex: 1 }}>
@@ -194,7 +195,7 @@ export default function DatabasePanel() {
               </div>
               <div className="db-form-row">
                 <label>{t("database.port")}</label>
-                <input value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} placeholder={form.type === "mysql" ? "3306" : "5432"} style={{ width: 80 }} />
+                <input value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} placeholder={form.type === ConnectionType.ConnMySQL ? "3306" : "5432"} style={{ width: 80 }} />
               </div>
               <div className="db-form-row">
                 <label>{t("database.username")}</label>

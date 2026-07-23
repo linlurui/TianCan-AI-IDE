@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,12 +23,16 @@ import (
 	"github.com/rocky233/tiancan-ai-ide/backend/agent/safety"
 	"github.com/rocky233/tiancan-ai-ide/backend/agent/tools"
 	agenttypes "github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	aiprovider "github.com/rocky233/tiancan-ai-ide/backend/ai/providers"
+	"github.com/rocky233/tiancan-ai-ide/backend/router"
+	"github.com/rocky233/tiancan-ai-ide/backend/sandbox"
 	"github.com/rocky233/tiancan-ai-ide/backend/skills"
 	"github.com/rocky233/tiancan-ai-ide/backend/webai/browser"
 	"github.com/rocky233/tiancan-ai-ide/backend/webai/parser"
 	"github.com/rocky233/tiancan-ai-ide/backend/webai/providers"
 	"github.com/rocky233/tiancan-ai-ide/backend/webai/tokenstore"
 	"github.com/rocky233/tiancan-ai-ide/backend/webai/types"
+	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -40,27 +45,37 @@ type APIProviderConfig struct {
 }
 
 // Service manages LM Studio integration and AI chat/agent capabilities.
-// TODO: Integrate with router for hardware-aware model selection on first launch
 type Service struct {
 	mu             sync.Mutex
 	apiURL         string // e.g. http://127.0.0.1:1234/v1
 	model          string
 	running        bool
-	provider       APIProviderConfig // active remote API provider
-	webAuth        *types.AuthResult // active web provider auth
-	webID          string            // active web provider ID
-	webConvID      string            // persisted conversation_id for web providers
-	webLastRequest string            // last user request for follow-up context
-	webLastActions string            // last turn actions+results summary for follow-up context
-	App            *application.App  // set by main.go; used for Events.Emit
+	rootPathVal    string              // current project root path
+	provider       APIProviderConfig   // active remote API provider
+	webAuth        *types.AuthResult   // active web provider auth
+	webID          string              // active web provider ID
+	webConvID      string              // persisted conversation_id for web providers
+	webLastRequest string              // last user request for follow-up context
+	webLastActions string              // last turn actions+results summary for follow-up context
+	App            *application.App    // set by main.go; used for Events.Emit
+	Router         *router.SmartRouter // hardware-aware model tier routing
+	sandboxMgr     *sandbox.Manager    // persistent sandbox manager (shared state)
+	// Provider management
+	providerRegistry *aiprovider.Registry
+	activeProvider   string // ID of active provider
 }
 
 // NewService creates a new AI service.
 func NewService() *Service {
-	return &Service{
-		apiURL: "http://127.0.0.1:1234/v1",
-		model:  "default",
+	s := &Service{
+		apiURL:           "http://127.0.0.1:1234/v1",
+		model:            "default",
+		sandboxMgr:       sandbox.NewManager(),
+		providerRegistry: aiprovider.GetRegistry(),
+		activeProvider:   "lm-studio",
 	}
+	s.Router = router.NewSmartRouter(router.DefaultConfig())
+	return s
 }
 
 // ── LM Studio lifecycle ──────────────────────────────────────────
@@ -283,8 +298,14 @@ func (s *Service) LaunchLMStudio() error {
 
 // ModelInfo describes a model loaded in LM Studio.
 type ModelInfo struct {
-	ID     string `json:"id"`
-	Object string `json:"object"`
+	ID            string  `json:"id"`
+	Object        string  `json:"object"`
+	SizeGB        float64 `json:"size_gb,omitempty"`        // Model file size in GB (estimated from ID heuristics or API)
+	ParamsB       float64 `json:"params_b,omitempty"`       // Parameter count in billions (e.g. 7.0 for 7B)
+	MinRAMGB      float64 `json:"min_ram_gb,omitempty"`     // Minimum system RAM required in GB
+	MinVRAMGB     float64 `json:"min_vram_gb,omitempty"`    // Minimum GPU VRAM required in GB (0 = CPU-only OK)
+	Available     bool    `json:"available"`                // Whether this model can run on current hardware
+	DisableReason string  `json:"disable_reason,omitempty"` // Why model is unavailable
 }
 
 // ListModels returns the list of loaded models in LM Studio.
@@ -302,7 +323,155 @@ func (s *Service) ListModels() ([]ModelInfo, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("解析模型列表失败: %w", err)
 	}
+
+	// Enrich models with hardware requirements and availability
+	s.enrichModelHardwareInfo(result.Data)
 	return result.Data, nil
+}
+
+// ListModelsAvailable returns models with hardware availability status.
+// Models that cannot run on current hardware are marked Available=false with a reason.
+// If ALL models are unavailable, it automatically stops LM Studio to free resources.
+func (s *Service) ListModelsAvailable() ([]ModelInfo, error) {
+	models, err := s.ListModels()
+	if err != nil {
+		return nil, err
+	}
+
+	allUnavailable := true
+	for i := range models {
+		if models[i].Available {
+			allUnavailable = false
+		}
+	}
+
+	// If no local model can run, stop LM Studio to free memory
+	if allUnavailable && len(models) > 0 {
+		log.Printf("ai: all local models unavailable on current hardware, stopping LM Studio")
+		s.StopLMStudio()
+	}
+
+	return models, nil
+}
+
+// enrichModelHardwareInfo estimates hardware requirements from model ID and checks availability.
+func (s *Service) enrichModelHardwareInfo(models []ModelInfo) {
+	ramGB, vramGB := s.detectSystemMemory()
+
+	for i := range models {
+		m := &models[i]
+		m.ParamsB = estimateParamsFromID(m.ID)
+		m.SizeGB = estimateSizeFromParams(m.ParamsB)
+		m.MinRAMGB = m.SizeGB * 1.3  // 30% overhead for runtime (KV cache, etc.)
+		m.MinVRAMGB = m.SizeGB * 0.8 // GPU-offloadable portion
+
+		m.Available = true
+
+		// Check RAM constraint (hard requirement — model won't load without enough RAM)
+		if m.MinRAMGB > 0 && ramGB > 0 && m.MinRAMGB > ramGB {
+			m.Available = false
+			m.DisableReason = fmt.Sprintf("需要 %.0fGB 内存，当前 %.0fGB", m.MinRAMGB, ramGB)
+		}
+
+		// If model specifies VRAM requirement and we have GPU info, check it
+		// (VRAM is soft — model can fall back to CPU, just slower)
+		if m.MinVRAMGB > 0 && vramGB > 0 && m.MinVRAMGB > vramGB && m.Available {
+			// Model can still run but will be slow (CPU offload)
+			m.DisableReason = fmt.Sprintf("GPU显存不足(需%.0fGB/有%.0fGB)，将使用CPU推理(较慢)", m.MinVRAMGB, vramGB)
+			// Don't mark unavailable — just warn. User can still choose it.
+		}
+	}
+}
+
+// detectSystemMemory returns (total RAM GB, total VRAM GB).
+func (s *Service) detectSystemMemory() (float64, float64) {
+	var ramGB, vramGB float64
+
+	// System RAM via gopsutil
+	if vmStat, err := mem.VirtualMemory(); err == nil {
+		ramGB = float64(vmStat.Available) / 1024 / 1024 / 1024 // use AVAILABLE, not total
+	}
+
+	// GPU VRAM from env (TIANCAN_GPU_MEMORY_GB) — we can't reliably detect this programmatically
+	if gpuStr := os.Getenv("TIANCAN_GPU_MEMORY_GB"); gpuStr != "" {
+		if v, err := strconv.ParseFloat(gpuStr, 64); err == nil {
+			vramGB = v
+		}
+	}
+
+	return ramGB, vramGB
+}
+
+// estimateParamsFromID extracts parameter count from model ID heuristics.
+// e.g. "qwen2.5-7b-instruct" → 7.0, "llama-3-70b" → 70.0
+func estimateParamsFromID(id string) float64 {
+	lower := strings.ToLower(id)
+
+	// Common patterns: 0.5b, 1.5b, 3b, 7b, 8b, 13b, 14b, 32b, 70b, etc.
+	// Try to find a number followed by 'b' (billion)
+	for i := 0; i < len(lower)-1; i++ {
+		if lower[i] == 'b' && i > 0 {
+			// Walk backwards to find the number
+			end := i
+			start := i - 1
+			for start >= 0 && (lower[start] >= '0' && lower[start] <= '9' || lower[start] == '.') {
+				start--
+			}
+			numStr := lower[start+1 : end]
+			if v, err := strconv.ParseFloat(numStr, 64); err == nil && v > 0 {
+				return v
+			}
+		}
+	}
+
+	// Fallback: estimate from model name patterns
+	switch {
+	case strings.Contains(lower, "mini") || strings.Contains(lower, "tiny"):
+		return 1.0
+	case strings.Contains(lower, "small"):
+		return 3.0
+	case strings.Contains(lower, "medium"):
+		return 7.0
+	case strings.Contains(lower, "large") || strings.Contains(lower, "xl"):
+		return 13.0
+	default:
+		return 7.0 // assume 7B as default
+	}
+}
+
+// estimateSizeFromParams estimates model file size in GB from parameter count.
+// Rule of thumb: ~1.2GB per billion parameters for Q4_K_M quantization.
+func estimateSizeFromParams(paramsB float64) float64 {
+	if paramsB <= 0 {
+		return 5.0 // default ~5GB
+	}
+	return paramsB * 1.2
+}
+
+// StopLMStudio stops the LM Studio server process to free system resources.
+func (s *Service) StopLMStudio() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find LM Studio process and kill it
+	var cmd string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = "pkill -f 'LM Studio' || pkill -f lm-studio"
+	case "windows":
+		cmd = "taskkill /F /IM 'LM Studio.exe' 2>nul || taskkill /F /IM lm-studio.exe 2>nul"
+	default:
+		cmd = "pkill -f lm-studio"
+	}
+
+	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+		log.Printf("ai: stop LM Studio: %s (%v)", string(out), err)
+		return fmt.Errorf("停止 LM Studio 失败: %v", err)
+	}
+
+	s.running = false
+	log.Printf("ai: LM Studio stopped to free system resources")
+	return nil
 }
 
 // SetModel sets the active model for chat.
@@ -356,6 +525,218 @@ func (s *Service) ListAPIProviders() []APIProviderConfig {
 	}
 }
 
+// ── Provider Management ───────────────────────────────────────────
+
+// DiscoverProviders discovers all available AI providers.
+func (s *Service) DiscoverProviders() ([]*aiprovider.Provider, error) {
+	return s.providerRegistry.DiscoverAll()
+}
+
+// ListProviders returns all discovered providers with their status.
+func (s *Service) ListProviders() []*aiprovider.ProviderInfo {
+	all := s.providerRegistry.List()
+	result := make([]*aiprovider.ProviderInfo, 0, len(all))
+	for _, p := range all {
+		result = append(result, p.ToInfo())
+	}
+	return result
+}
+
+// GetActiveProvider returns the currently active provider.
+func (s *Service) GetActiveProvider() *aiprovider.Provider {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	activeID := s.activeProvider
+	if activeID == "" {
+		activeID = "lm-studio"
+	}
+	return s.providerRegistry.Get(activeID)
+}
+
+// SetActiveProvider sets the active provider by ID.
+func (s *Service) SetActiveProvider(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	p := s.providerRegistry.Get(id)
+	if p == nil {
+		return fmt.Errorf("provider not found: %s", id)
+	}
+
+	s.activeProvider = id
+
+	// Update service configuration to match the provider
+	s.apiURL = p.BaseURL
+	s.model = p.Model
+
+	return nil
+}
+
+// TestProvider tests the connectivity of a provider.
+func (s *Service) TestProvider(id string) error {
+	return s.providerRegistry.TestProvider(id)
+}
+
+// AddCustomProvider adds a custom API provider.
+func (s *Service) AddCustomProvider(id, name, baseURL, apiKey, model string) error {
+	cfg := aiprovider.CustomProviderConfig{
+		ID:      id,
+		Name:    name,
+		BaseURL: baseURL,
+		APIKey:  apiKey,
+		Model:   model,
+	}
+	p := s.providerRegistry.AddCustomProvider(cfg)
+	return s.providerRegistry.TestProvider(p.ID)
+}
+
+// RemoveProvider removes a provider.
+func (s *Service) RemoveProvider(id string) {
+	// Only allow removing custom providers
+	if strings.HasPrefix(id, "custom-") {
+		s.providerRegistry.RemoveCustomProvider(id)
+	}
+}
+
+// GetCommonProviders returns the list of common provider templates.
+func (s *Service) GetCommonProviders() []aiprovider.Provider {
+	return aiprovider.GetCommonProviders()
+}
+
+// ChatWithProvider sends a chat request using a specific provider.
+func (s *Service) ChatWithProvider(providerID string, messages []ChatMessage) (string, error) {
+	p := s.providerRegistry.Get(providerID)
+	if p == nil {
+		return "", fmt.Errorf("provider not found: %s", providerID)
+	}
+
+	if p.BaseURL == "" {
+		return "", fmt.Errorf("provider %s has no base URL configured", p.Name)
+	}
+
+	reqBody := ChatRequest{
+		Model:       p.Model,
+		Messages:    messages,
+		Temperature: 0.7,
+		MaxTokens:   4096,
+		Stream:      false,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", p.BaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed (%s): %w", p.Name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API returned %d (%s): %s", resp.StatusCode, p.Name, string(b))
+	}
+
+	var result ChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("empty response from %s", p.Name)
+	}
+
+	return result.Choices[0].Message.Content, nil
+}
+
+// StreamChatWithProvider sends a streaming chat request using a specific provider.
+func (s *Service) StreamChatWithProvider(providerID string, messages []ChatMessage, onToken func(token string)) (string, error) {
+	p := s.providerRegistry.Get(providerID)
+	if p == nil {
+		return "", fmt.Errorf("provider not found: %s", providerID)
+	}
+
+	if p.BaseURL == "" {
+		return "", fmt.Errorf("provider %s has no base URL configured", p.Name)
+	}
+
+	reqBody := ChatRequest{
+		Model:       p.Model,
+		Messages:    messages,
+		Temperature: 0.7,
+		MaxTokens:   4096,
+		Stream:      true,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", p.BaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed (%s): %w", p.Name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API returned %d (%s): %s", resp.StatusCode, p.Name, string(b))
+	}
+
+	var full strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk ChatStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				full.WriteString(choice.Delta.Content)
+				if onToken != nil {
+					onToken(choice.Delta.Content)
+				}
+			}
+		}
+	}
+
+	return full.String(), nil
+}
+
 // ── Chat API (OpenAI-compatible) ──────────────────────────────────
 
 // ChatMessage is a single message in the conversation.
@@ -400,6 +781,190 @@ type ChatStreamChunk struct {
 	} `json:"choices"`
 }
 
+// ── Smart Router API ───────────────────────────────────────────────
+
+// RouteRequest 请求路由
+func (s *Service) RouteRequest(userMessage string) *router.TierRecommendation {
+	// 获取各 Provider 的可用性分数
+	providerScores := s.getProviderScores()
+
+	// 调用路由
+	return s.Router.RouteWithProviders(userMessage, providerScores)
+}
+
+// GetHardwareProfile 获取硬件配置
+func (s *Service) GetHardwareProfile() *router.HardwareProfile {
+	return s.Router.GetHardwareProfile()
+}
+
+// GetSystemStatus 获取系统状态
+func (s *Service) GetSystemStatus() map[string]interface{} {
+	return s.Router.GetSystemStatus()
+}
+
+// SetPreferredTier 设置首选层级
+func (s *Service) SetPreferredTier(tier string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch router.ModelTier(tier) {
+	case router.TierLocal:
+		s.Router.SetConfig(router.SmartRouterConfig{PreferredTier: router.TierLocal})
+	case router.TierAPI:
+		s.Router.SetConfig(router.SmartRouterConfig{PreferredTier: router.TierAPI})
+	case router.TierWeb:
+		s.Router.SetConfig(router.SmartRouterConfig{PreferredTier: router.TierWeb})
+	}
+}
+
+// SetAutoDowngrade 设置自动降级
+func (s *Service) SetAutoDowngrade(enabled bool) {
+	s.Router.SetAutoDowngrade(enabled)
+}
+
+// getProviderScores 获取各 Provider 的可用性分数
+func (s *Service) getProviderScores() map[string]float64 {
+	scores := make(map[string]float64)
+
+	providers := s.providerRegistry.List()
+	for _, p := range providers {
+		score := 50.0 // 基础分
+
+		switch p.Status {
+		case aiprovider.ProviderStatusAvailable:
+			score = 100.0
+		case aiprovider.ProviderStatusUnavailable:
+			score = 0.0
+		case aiprovider.ProviderStatusNeedsLogin:
+			score = 30.0
+		case aiprovider.ProviderStatusError:
+			score = 10.0
+		}
+
+		// 根据 Provider 类型调整分数
+		switch p.Type {
+		case aiprovider.ProviderTypeCLI:
+			score *= 1.2 // CLI 通常更可靠
+		case aiprovider.ProviderTypeDesktop:
+			score *= 1.1
+		case aiprovider.ProviderTypeLocal:
+			// 本地服务需要检查内存
+			hw := s.Router.GetHardwareProfile()
+			if hw.AvailableRAMGB < 4 {
+				score *= 0.5 // 内存不足降低分数
+			}
+		case aiprovider.ProviderTypeAPI:
+			score *= 1.0
+		}
+
+		// 根据配额剩余量调整分数
+		if p.Quota != nil && p.Quota.Remaining > 0 {
+			// 配额紧张时降低分数
+			if p.Quota.Percent > 80 {
+				score *= 0.5
+			} else if p.Quota.Percent > 60 {
+				score *= 0.8
+			}
+		}
+
+		scores[p.ID] = score
+	}
+
+	return scores
+}
+
+// ── Quota Management ───────────────────────────────────────────────
+
+// GetProviderQuota 获取指定 Provider 的配额
+func (s *Service) GetProviderQuota(providerID string) (*aiprovider.Quota, error) {
+	return s.providerRegistry.RefreshQuota(providerID)
+}
+
+// GetAllQuotas 获取所有 Provider 的配额
+func (s *Service) GetAllQuotas() map[string]*aiprovider.Quota {
+	return s.providerRegistry.RefreshAllQuotas()
+}
+
+// ProviderQuotaInfo 配额信息（用于前端显示）
+type ProviderQuotaInfo struct {
+	ProviderID string            `json:"providerId"`
+	Name       string            `json:"name"`
+	HasQuota   bool              `json:"hasQuota"`
+	Used       int               `json:"used"`
+	Limit      int               `json:"limit"`
+	Remaining  int               `json:"remaining"`
+	Percent    float64           `json:"percent"`
+	Status     string            `json:"status"`
+}
+
+// GetProviderQuotaInfo 获取配额信息（包含 Provider 名称）
+func (s *Service) GetProviderQuotaInfo() []ProviderQuotaInfo {
+	quotas := s.providerRegistry.RefreshAllQuotas()
+	providers := s.providerRegistry.List()
+
+	result := make([]ProviderQuotaInfo, 0)
+
+	// 创建一个 map 便于查找
+	providerMap := make(map[string]*aiprovider.Provider)
+	for _, p := range providers {
+		providerMap[p.ID] = p
+	}
+
+	// 添加有配额的 Provider
+	for id, quota := range quotas {
+		p := providerMap[id]
+		name := id
+		if p != nil {
+			name = p.Name
+		}
+
+		result = append(result, ProviderQuotaInfo{
+			ProviderID: id,
+			Name:       name,
+			HasQuota:   quota.Limit > 0,
+			Used:       quota.Used,
+			Limit:      quota.Limit,
+			Remaining:  quota.Remaining,
+			Percent:    quota.Percent,
+			Status:     "ok",
+		})
+	}
+
+	// 添加没有配额查询结果的 Provider
+	for _, p := range providers {
+		if _, ok := quotas[p.ID]; !ok {
+			result = append(result, ProviderQuotaInfo{
+				ProviderID: p.ID,
+				Name:       p.Name,
+				HasQuota:   false,
+				Status:     "no_quota_api",
+			})
+		}
+	}
+
+	return result
+}
+
+// RecordFailure 记录 Provider 失败
+func (s *Service) RecordFailure(providerID string, errMsg string) {
+	// 尝试找到 Provider 对应的层级
+	p := s.providerRegistry.Get(providerID)
+	if p != nil {
+		var tier router.ModelTier
+		switch p.Type {
+		case aiprovider.ProviderTypeLocal:
+			tier = router.TierLocal
+		case aiprovider.ProviderTypeAPI:
+			tier = router.TierAPI
+		default:
+			tier = router.TierAPI
+		}
+		s.Router.RecordFailure(tier, errMsg)
+	}
+}
+
+// ── Legacy Chat API (for backward compatibility) ────────────────────
+
 // Chat sends a non-streaming chat request and returns the full response.
 func (s *Service) Chat(messages []ChatMessage) (string, error) {
 	s.mu.Lock()
@@ -441,6 +1006,39 @@ func (s *Service) Chat(messages []ChatMessage) (string, error) {
 	}
 
 	return result.Choices[0].Message.Content, nil
+}
+
+// CallLLM implements tools.LLMCaller interface — a simple single-turn LLM call
+// for tools that need AI-driven decisions (e.g. AutoResearch hypothesis generation).
+// It tries local LM Studio first, then falls back to the configured API provider.
+func (s *Service) CallLLM(ctx context.Context, prompt string) (string, error) {
+	// Try local LM Studio first
+	messages := []ChatMessage{
+		{Role: "system", Content: "You are a code optimization assistant. Respond concisely and precisely."},
+		{Role: "user", Content: prompt},
+	}
+
+	// Try local
+	resp, err := s.Chat(messages)
+	if err == nil && resp != "" {
+		return resp, nil
+	}
+
+	// Fallback to API provider if configured
+	s.mu.Lock()
+	p := s.provider
+	s.mu.Unlock()
+	if p.BaseURL != "" && p.APIKey != "" {
+		s.mu.Lock()
+		s.provider = p
+		s.mu.Unlock()
+		resp, err = s.ChatAPI(messages)
+		if err == nil && resp != "" {
+			return resp, nil
+		}
+	}
+
+	return "", fmt.Errorf("LLM unavailable: local error=%v, API not configured", err)
 }
 
 // ChatAPI sends a non-streaming chat request to a remote API provider.
@@ -588,20 +1186,31 @@ var (
 )
 
 // getRegistry returns (or creates) a tools.Registry for the given rootPath.
-func getRegistry(rootPath string) *tools.Registry {
+// Injects the LLMCaller so tools like AutoResearch can call the LLM.
+func (s *Service) getRegistry(rootPath string) *tools.Registry {
 	registryCacheMu.Lock()
 	defer registryCacheMu.Unlock()
 	if r, ok := registryCache[rootPath]; ok {
 		return r
 	}
 	r := tools.NewRegistry(rootPath)
+	r.SetLLMCaller(s) // ai.Service implements tools.LLMCaller via CallLLM
+	r.SetSandboxManager(s.sandboxMgr)
 	registryCache[rootPath] = r
 	return r
 }
 
+// RemoveRegistry removes a cached registry for the given rootPath.
+// Called when a project is closed to free memory.
+func (s *Service) RemoveRegistry(rootPath string) {
+	registryCacheMu.Lock()
+	defer registryCacheMu.Unlock()
+	delete(registryCache, rootPath)
+}
+
 // builtInTools returns the tools available to the agent from the Registry.
-func builtInTools(rootPath string) []AgentTool {
-	r := getRegistry(rootPath)
+func (s *Service) builtInTools(rootPath string) []AgentTool {
+	r := s.getRegistry(rootPath)
 	all := r.All()
 	result := make([]AgentTool, 0, len(all))
 	for _, t := range all {
@@ -616,8 +1225,8 @@ func builtInTools(rootPath string) []AgentTool {
 }
 
 // toolDescriptions builds the tool descriptions string for the system prompt.
-func toolDescriptions(rootPath string) string {
-	ts := builtInTools(rootPath)
+func (s *Service) toolDescriptions(rootPath string) string {
+	ts := s.builtInTools(rootPath)
 	var b strings.Builder
 	b.WriteString("你可以使用以下工具来完成任务。每个工具调用格式为：\n")
 	b.WriteString("```tool\n{\"name\": \"工具名\", \"args\": {参数}}\n```\n\n")
@@ -645,14 +1254,15 @@ func toolDescriptions(rootPath string) string {
 	return b.String()
 }
 
-// executeTool runs a tool call via the tools.Registry and returns the result as a string.
-func executeTool(name string, args map[string]interface{}, rootPath string) string {
+// ExecuteTool runs a tool call via the tools.Registry and returns the result as a string.
+// This is the exported version that implements hierarchy.ToolExecutor.
+func (s *Service) ExecuteTool(name string, args map[string]interface{}, rootPath string) string {
 	// Handle use_skill virtual tool
 	if name == "use_skill" {
-		return executeSkill(args, rootPath)
+		return s.executeSkill(args, rootPath)
 	}
 
-	r := getRegistry(rootPath)
+	r := s.getRegistry(rootPath)
 	result, err := r.Execute(context.Background(), name, args)
 	if err != nil {
 		// Tool not found in registry — try name aliases for backward compatibility
@@ -676,7 +1286,7 @@ func executeTool(name string, args map[string]interface{}, rootPath string) stri
 }
 
 // executeSkill runs a skill by name, executing each step sequentially.
-func executeSkill(args map[string]interface{}, rootPath string) string {
+func (s *Service) executeSkill(args map[string]interface{}, rootPath string) string {
 	skillName, _ := args["skill"].(string)
 	if skillName == "" {
 		return "错误: use_skill 缺少 skill 参数"
@@ -699,7 +1309,7 @@ func executeSkill(args map[string]interface{}, rootPath string) string {
 
 	var results []string
 	for i, step := range skill.Steps {
-		result := executeTool(step.Tool, step.Args, rootPath)
+		result := s.ExecuteTool(step.Tool, step.Args, rootPath) // already method
 		results = append(results, fmt.Sprintf("步骤 %d (%s): %s", i+1, step.Tool, result))
 	}
 	return strings.Join(results, "\n")
@@ -714,11 +1324,218 @@ func (s *Service) ListSkills() []skills.SkillInfo {
 	return sm.ListInfo()
 }
 
+// InstallSkill installs a skill from YAML content string.
+func (s *Service) InstallSkill(yamlContent string) error {
+	sm := skills.NewManager(s.rootPath())
+	return sm.InstallLocal(yamlContent)
+}
+
+// InstallSkillFromFile installs a skill from a local file path.
+func (s *Service) InstallSkillFromFile(filePath string) error {
+	sm := skills.NewManager(s.rootPath())
+	return sm.InstallFromFile(filePath)
+}
+
+// DeleteSkill removes a skill by name.
+func (s *Service) DeleteSkill(name string) error {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return fmt.Errorf("加载技能失败: %w", err)
+	}
+	return sm.Delete(name)
+}
+
+// ValidateSkill validates a skill by name and returns the result.
+func (s *Service) ValidateSkill(name string) (bool, string) {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return false, fmt.Sprintf("加载技能失败: %s", err)
+	}
+	return sm.Validate(name)
+}
+
+// ValidateAllSkills validates all loaded skills.
+func (s *Service) ValidateAllSkills() map[string]string {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return map[string]string{"error": err.Error()}
+	}
+	return sm.ValidateAll()
+}
+
+// GetSkillDetail returns full detail for a skill.
+func (s *Service) GetSkillDetail(name string) *skills.Skill {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return nil
+	}
+	skill, ok := sm.SkillDetail(name)
+	if !ok {
+		return nil
+	}
+	return skill
+}
+
+// ExportSkill exports a skill as portable JSON for sharing.
+func (s *Service) ExportSkill(name string) string {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return ""
+	}
+	exported, err := sm.ExportSkill(name)
+	if err != nil {
+		return ""
+	}
+	return exported
+}
+
+// ExportAllSkills exports all skills as a JSON array.
+func (s *Service) ExportAllSkills() string {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return ""
+	}
+	exported, err := sm.ExportAll()
+	if err != nil {
+		return ""
+	}
+	return exported
+}
+
+// ImportSkillFromJSON imports a skill from market JSON string.
+func (s *Service) ImportSkillFromJSON(jsonStr string) string {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return fmt.Sprintf("failed to load skills: %v", err)
+	}
+	if err := sm.ImportFromMarket(jsonStr); err != nil {
+		return fmt.Sprintf("import failed: %v", err)
+	}
+	return "ok"
+}
+
+// ImportSkillsFromFile imports skills from a local market JSON file.
+func (s *Service) ImportSkillsFromFile(filePath string) string {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return fmt.Sprintf("failed to load skills: %v", err)
+	}
+	if err := sm.ImportFromFile(filePath); err != nil {
+		return fmt.Sprintf("import failed: %v", err)
+	}
+	return "ok"
+}
+
+// SearchMarketSkills searches the community market for skills.
+func (s *Service) SearchMarketSkills(query, category string) []skills.MarketEntry {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return nil
+	}
+	results, err := sm.SearchMarket(query, category)
+	if err != nil {
+		return nil
+	}
+	return results
+}
+
+// RateSkill records a rating for a skill.
+func (s *Service) RateSkill(name string, rating int) string {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return fmt.Sprintf("failed: %v", err)
+	}
+	if err := sm.RateSkill(name, rating); err != nil {
+		return fmt.Sprintf("failed: %v", err)
+	}
+	return "ok"
+}
+
+// GetSkillMarketInfo returns market info for a skill.
+func (s *Service) GetSkillMarketInfo(name string) *skills.MarketEntry {
+	sm := skills.NewManager(s.rootPath())
+	if err := sm.LoadAll(); err != nil {
+		return nil
+	}
+	skill, ok := sm.SkillDetail(name)
+	if !ok {
+		return nil
+	}
+
+	// Build market entry from skill
+	data, _ := os.ReadFile(skill.FilePath)
+	entry := skills.MarketEntry{
+		Name:        skill.Name,
+		Description: skill.Description,
+		Version:     skill.Version,
+		Author:      "local",
+		Category:    skills.InferCategory(skill),
+		Tags:        skill.Triggers,
+		YAMLContent: string(data),
+		Rating:      float64(sm.GetSkillRating(name)),
+	}
+	return &entry
+}
+
+// ─── Sandbox Management API ─────────────────────────────────────────────
+
+// SandboxProviderStatus returns the availability status of each sandbox provider.
+func (s *Service) SandboxProviderStatus() []sandbox.ProviderStatus {
+	return s.sandboxMgr.GetProviderStatuses()
+}
+
+// SandboxAutoInstall auto-downloads and installs a sandbox provider.
+func (s *Service) SandboxAutoInstall(providerName string) ([]string, error) {
+	return s.sandboxMgr.AutoInstallProvider(providerName)
+}
+
+// SandboxSetE2BAPIKey configures the E2B API key.
+func (s *Service) SandboxSetE2BAPIKey(apiKey string) {
+	s.sandboxMgr.SetE2BAPIKey(apiKey)
+}
+
+// SandboxSetProvider manually selects the sandbox provider.
+func (s *Service) SandboxSetProvider(providerName string) error {
+	return s.sandboxMgr.SetProvider(providerName)
+}
+
+// SandboxList returns active sandboxes.
+func (s *Service) SandboxList() []*sandbox.SandboxInfo {
+	return s.sandboxMgr.List()
+}
+
+// SandboxCreate creates a new sandbox.
+func (s *Service) SandboxCreate(image string) (*sandbox.SandboxInfo, error) {
+	cfg := sandbox.DefaultConfig()
+	if image != "" {
+		cfg.Image = image
+	}
+	return s.sandboxMgr.Create(context.Background(), cfg)
+}
+
+// SandboxStop stops a sandbox by ID.
+func (s *Service) SandboxStop(id string) error {
+	return s.sandboxMgr.Stop(context.Background(), id)
+}
+
+// SetRootPath sets the current project root path.
+func (s *Service) SetRootPath(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rootPathVal = path
+}
+
 // rootPath returns the current project root path.
 func (s *Service) rootPath() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.apiURL // reuse for now; TODO: add dedicated rootPath field
+	return s.rootPathVal
+}
+
+// ParseToolCalls implements hierarchy.ToolCallParser interface.
+// It parses the first tool call from an LLM response.
+func (s *Service) ParseToolCalls(response string) (string, map[string]interface{}, bool) {
+	return parseToolCall(response)
 }
 
 // parseToolCall extracts a tool call from the assistant's response.
@@ -1068,11 +1885,28 @@ func isAlphaUnderscore(ch byte) bool {
 	return isAlpha(ch) || ch == '_'
 }
 
+// emitProgress emits a subagent:progress event to the frontend via Wails.
+func (s *Service) emitProgress(iteration int, agentType, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string) {
+	if s.App != nil {
+		s.App.Event.Emit("subagent:progress", map[string]interface{}{
+			"agentId":   "main",
+			"agentType": agentType,
+			"iteration": iteration,
+			"toolName":  toolName,
+			"toolArgs":  toolArgs,
+			"output":    output,
+			"isDone":    isDone,
+			"error":     err,
+		})
+	}
+}
+
 // AgentRun executes the TAOR (Think-Act-Observe-Repeat) loop.
 // It sends the user's message, lets the model think and use tools,
 // and iterates until the model produces a final text response or
 // reaches maxIterations.
 func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations int) AgentRunResult {
+	s.SetRootPath(rootPath)
 	if maxIterations <= 0 {
 		maxIterations = 20
 	}
@@ -1095,7 +1929,7 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 - 等待工具结果后再决定下一步
 - 不要猜测文件内容，先用 read_file 查看
 - 修改代码前先读取原文件
-- 完成任务后直接回复用户，不要再调用工具`, rootPath, toolDescriptions(rootPath))
+- 完成任务后直接回复用户，不要再调用工具`, rootPath, s.toolDescriptions(rootPath))
 
 	messages := []ChatMessage{
 		{Role: "system", Content: systemPrompt},
@@ -1112,6 +1946,7 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 		if err != nil {
 			result.Error = fmt.Sprintf("AI 请求失败: %v", err)
 			result.Done = true
+			s.emitProgress(i+1, "local", "", nil, "", true, result.Error)
 			return result
 		}
 
@@ -1124,11 +1959,14 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 			// No tool call — the model is done, return final response
 			result.Done = true
 			result.Messages = messages
+			s.emitProgress(i+1, "local", "", nil, resp, true, "")
 			return result
 		}
 
 		// Execute the tool
-		toolResult := executeTool(toolName, toolArgs, rootPath)
+		s.emitProgress(i+1, "local", toolName, toolArgs, "", false, "")
+		toolResult := s.ExecuteTool(toolName, toolArgs, rootPath)
+		s.emitProgress(i+1, "local", toolName, toolArgs, toolResult, false, "")
 
 		// Add tool result as user message (observation)
 		messages = append(messages, ChatMessage{
@@ -1141,11 +1979,13 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 	result.Done = false
 	result.Messages = messages
 	result.Error = fmt.Sprintf("达到最大迭代次数 %d", maxIterations)
+	s.emitProgress(maxIterations, "local", "", nil, "", true, result.Error)
 	return result
 }
 
 // AgentRunAPI executes the TAOR loop using a remote API provider.
 func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations int) AgentRunResult {
+	s.SetRootPath(rootPath)
 	if maxIterations <= 0 {
 		maxIterations = 20
 	}
@@ -1168,7 +2008,7 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 - 等待工具结果后再决定下一步
 - 不要猜测文件内容，先用 read_file 查看
 - 修改代码前先读取原文件
-- 完成任务后直接回复用户，不要再调用工具`, rootPath, toolDescriptions(rootPath))
+- 完成任务后直接回复用户，不要再调用工具`, rootPath, s.toolDescriptions(rootPath))
 
 	messages := []ChatMessage{
 		{Role: "system", Content: systemPrompt},
@@ -1185,6 +2025,7 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 		if err != nil {
 			result.Error = fmt.Sprintf("API 请求失败: %v", err)
 			result.Done = true
+			s.emitProgress(i+1, "api", "", nil, "", true, result.Error)
 			return result
 		}
 
@@ -1194,10 +2035,13 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 		if !hasTool {
 			result.Done = true
 			result.Messages = messages
+			s.emitProgress(i+1, "api", "", nil, resp, true, "")
 			return result
 		}
 
-		toolResult := executeTool(toolName, toolArgs, rootPath)
+		s.emitProgress(i+1, "api", toolName, toolArgs, "", false, "")
+		toolResult := s.ExecuteTool(toolName, toolArgs, rootPath)
+		s.emitProgress(i+1, "api", toolName, toolArgs, toolResult, false, "")
 
 		messages = append(messages, ChatMessage{
 			Role:    "user",
@@ -1208,7 +2052,356 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 	result.Done = false
 	result.Messages = messages
 	result.Error = fmt.Sprintf("达到最大迭代次数 %d", maxIterations)
+	s.emitProgress(maxIterations, "api", "", nil, "", true, result.Error)
 	return result
+}
+
+// ── Smart Router Integration ────────────────────────────────────────
+
+// SmartRouteResult is returned to the frontend when using auto-routing.
+type SmartRouteResult struct {
+	Tier       string  `json:"tier"`
+	Category   string  `json:"category"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+	Fallback   bool    `json:"fallback"`
+}
+
+// SmartRoute queries the SmartRouter for the best tier for a given message.
+// The frontend can call this to decide which source to use, or use SmartAgentRun
+// to let the backend auto-route and execute.
+func (s *Service) SmartRoute(userMessage string) SmartRouteResult {
+	if s.Router == nil {
+		return SmartRouteResult{Tier: "local", Reason: "router not initialized"}
+	}
+	rr := s.Router.Route(userMessage)
+	return SmartRouteResult{
+		Tier:       string(rr.Tier),
+		Category:   string(rr.Category),
+		Confidence: rr.Confidence,
+		Reason:     rr.Reason,
+		Fallback:   rr.Fallback,
+	}
+}
+
+// SmartAgentRun uses the SmartRouter to auto-select the best tier,
+// then executes the agent loop on that tier. If the selected tier fails,
+// it records the failure and falls back to the next tier.
+func (s *Service) SmartAgentRun(userMessage string, rootPath string, maxIterations int) AgentRunResult {
+	s.SetRootPath(rootPath)
+	if maxIterations <= 0 {
+		maxIterations = 20
+	}
+
+	if s.Router == nil {
+		// No router — fall back to local
+		return s.AgentRun(userMessage, rootPath, maxIterations)
+	}
+
+	// Refresh hardware state before routing
+	s.Router.RefreshHardwareState()
+
+	rr := s.Router.Route(userMessage)
+	tier := rr.Tier
+
+	// Emit routing decision to frontend
+	if s.App != nil {
+		s.App.Event.Emit("router:decision", SmartRouteResult{
+			Tier:       string(rr.Tier),
+			Category:   string(rr.Category),
+			Confidence: rr.Confidence,
+			Reason:     rr.Reason,
+			Fallback:   rr.Fallback,
+		})
+	}
+
+	// Try the routed tier
+	result := s.runOnTier(tier, userMessage, rootPath, maxIterations)
+	if result.Error == "" {
+		return result
+	}
+
+	// Record failure and try fallback tiers
+	originalErr := result.Error
+	s.Router.RecordFailure(tier, originalErr)
+	for _, fallback := range s.Router.GetConfig().FallbackOrder {
+		if fallback == tier {
+			continue
+		}
+		if s.Router.HasRecentFailure(fallback) {
+			continue
+		}
+
+		result = s.runOnTier(fallback, userMessage, rootPath, maxIterations)
+		if result.Error == "" {
+			if s.App != nil {
+				s.App.Event.Emit("router:fallback", map[string]string{
+					"from":   string(tier),
+					"to":     string(fallback),
+					"reason": originalErr,
+				})
+			}
+			return result
+		}
+		s.Router.RecordFailure(fallback, result.Error)
+	}
+
+	// All tiers failed — return last error
+	return result
+}
+
+// runOnTier executes the agent loop on a specific tier.
+func (s *Service) runOnTier(tier router.ModelTier, userMessage string, rootPath string, maxIterations int) AgentRunResult {
+	switch tier {
+	case router.TierLocal:
+		return s.AgentRun(userMessage, rootPath, maxIterations)
+	case router.TierAPI:
+		return s.AgentRunAPI(userMessage, rootPath, maxIterations)
+	case router.TierWeb:
+		return s.AgentRunWeb(userMessage, rootPath, maxIterations)
+	default:
+		return s.AgentRun(userMessage, rootPath, maxIterations)
+	}
+}
+
+// SmartAgentStream uses the SmartRouter to auto-select the best tier for streaming.
+func (s *Service) SmartAgentStream(userMessage string, rootPath string, maxIterations int) (<-chan AgentStreamEvent, error) {
+	if s.Router == nil {
+		return s.AgentStream(userMessage, rootPath, maxIterations)
+	}
+
+	s.Router.RefreshHardwareState()
+	rr := s.Router.Route(userMessage)
+
+	// Emit routing decision
+	if s.App != nil {
+		s.App.Event.Emit("router:decision", SmartRouteResult{
+			Tier:       string(rr.Tier),
+			Category:   string(rr.Category),
+			Confidence: rr.Confidence,
+			Reason:     rr.Reason,
+			Fallback:   rr.Fallback,
+		})
+	}
+
+	// For streaming, we use the selected tier directly
+	// (fallback on error is handled by the frontend re-calling with a different source)
+	switch rr.Tier {
+	case router.TierAPI:
+		return s.agentStreamAPI(userMessage, rootPath, maxIterations)
+	case router.TierWeb:
+		return s.agentStreamWeb(userMessage, rootPath, maxIterations)
+	default:
+		return s.AgentStream(userMessage, rootPath, maxIterations)
+	}
+}
+
+// GetRouterConfig returns the current SmartRouter config for the frontend.
+func (s *Service) GetRouterConfig() router.SmartRouterConfig {
+	if s.Router == nil {
+		return router.DefaultConfig()
+	}
+	return s.Router.GetConfig()
+}
+
+// SetRouterConfig updates the SmartRouter config from the frontend.
+func (s *Service) SetRouterConfig(cfg router.SmartRouterConfig) {
+	if s.Router == nil {
+		return
+	}
+	cfg.App = s.App
+	s.Router.SetConfig(cfg)
+}
+
+// RefreshModelStatuses queries LM Studio for current models and updates the router.
+func (s *Service) RefreshModelStatuses() {
+	models, err := s.ListModels()
+	if err != nil || len(models) == 0 {
+		// LM Studio not running — all local models unavailable
+		s.Router.UpdateModelStatuses(nil)
+		return
+	}
+
+	cfg := s.Router.GetConfig()
+	statuses := make([]router.LocalModelStatus, 0, len(models))
+	for _, m := range models {
+		ms := router.LocalModelStatus{
+			ID:        m.ID,
+			Available: true, // assume available unless hardware check says otherwise
+		}
+		// Estimate model size from ID heuristics (e.g. "qwen2.5-7b" → ~7B params → ~4GB)
+		paramsGB, ramGB := estimateModelResources(m.ID)
+		ms.ParamsB = paramsGB
+		ms.SizeGB = ramGB
+		ms.MinRAMGB = ramGB * 1.3 // 30% overhead for KV cache
+		if ms.MinRAMGB > 0 && cfg.AvailableMemoryGB > 0 && ms.MinRAMGB > cfg.AvailableMemoryGB {
+			ms.Available = false
+			ms.DisableReason = fmt.Sprintf("需要 %.1fGB 内存，当前可用 %.1fGB", ms.MinRAMGB, cfg.AvailableMemoryGB)
+		}
+		statuses = append(statuses, ms)
+	}
+	s.Router.UpdateModelStatuses(statuses)
+}
+
+// estimateModelResources tries to estimate parameter count and RAM requirement from model ID.
+func estimateModelResources(modelID string) (paramsB, ramGB float64) {
+	// Common patterns: "7b", "13b", "34b", "70b", "0.5b", "1.5b", "3b"
+	lower := strings.ToLower(modelID)
+	// Try to find a pattern like "7b", "13b", etc.
+	for _, suffix := range []string{"b", "B"} {
+		for i := len(lower) - 1; i >= 0; i-- {
+			if lower[i] == suffix[0] && i > 0 {
+				// Scan backwards for digits and dots
+				j := i - 1
+				for j >= 0 && (lower[j] >= '0' && lower[j] <= '9' || lower[j] == '.') {
+					j--
+				}
+				numStr := lower[j+1 : i]
+				if v, err := strconv.ParseFloat(numStr, 64); err == nil && v > 0 {
+					paramsB = v
+					// Rough RAM estimate: params * 2 bytes (fp16) / 1e9 → GB
+					// Quantized models use less; assume Q4 → ~0.6 bytes/param
+					ramGB = v * 0.6
+					return
+				}
+			}
+		}
+	}
+	return 0, 0
+}
+
+// agentStreamAPI runs the streaming agent loop using the API provider.
+func (s *Service) agentStreamAPI(userMessage string, rootPath string, maxIterations int) (<-chan AgentStreamEvent, error) {
+	s.SetRootPath(rootPath)
+	ch := make(chan AgentStreamEvent, 256)
+
+	go func() {
+		defer close(ch)
+		if maxIterations <= 0 {
+			maxIterations = 20
+		}
+
+		systemPrompt := fmt.Sprintf(`你是天蚕 AI 编程助手，一个专业的编程 AI Agent。
+
+你在一个 IDE 环境中工作，当前项目根目录是: %s
+
+%s
+
+工作流程：
+1. 理解用户需求
+2. 如果需要信息，先使用工具获取
+3. 如果需要修改文件，使用 write_file
+4. 如果需要执行命令，使用 run_bash
+5. 完成后，用自然语言总结你做了什么
+
+重要规则：
+- 每次只调用一个工具
+- 等待工具结果后再决定下一步
+- 不要猜测文件内容，先用 read_file 查看
+- 修改代码前先读取原文件
+- 完成任务后直接回复用户，不要再调用工具`, rootPath, s.toolDescriptions(rootPath))
+
+		messages := []ChatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userMessage},
+		}
+
+		for i := 0; i < maxIterations; i++ {
+			resp, err := s.ChatAPI(messages)
+			if err != nil {
+				ch <- AgentStreamEvent{Type: "error", Content: fmt.Sprintf("API 请求失败: %v", err)}
+				return
+			}
+
+			messages = append(messages, ChatMessage{Role: "assistant", Content: resp})
+			ch <- AgentStreamEvent{Type: "token", Content: resp}
+
+			toolName, toolArgs, hasTool := parseToolCall(resp)
+			if !hasTool {
+				ch <- AgentStreamEvent{Type: "done", Content: resp}
+				return
+			}
+
+			argsJSON, _ := json.Marshal(toolArgs)
+			ch <- AgentStreamEvent{Type: "tool_call", Name: toolName, Content: string(argsJSON)}
+
+			toolResult := s.ExecuteTool(toolName, toolArgs, rootPath)
+			ch <- AgentStreamEvent{Type: "tool_result", Name: toolName, Content: toolResult}
+
+			messages = append(messages, ChatMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("工具 %s 执行结果:\n%s", toolName, toolResult),
+			})
+		}
+		ch <- AgentStreamEvent{Type: "error", Content: fmt.Sprintf("达到最大迭代次数 %d", maxIterations)}
+	}()
+
+	return ch, nil
+}
+
+// agentStreamWeb runs the streaming agent loop using the web provider.
+func (s *Service) agentStreamWeb(userMessage string, rootPath string, maxIterations int) (<-chan AgentStreamEvent, error) {
+	s.SetRootPath(rootPath)
+	ch := make(chan AgentStreamEvent, 256)
+
+	go func() {
+		defer close(ch)
+		if maxIterations <= 0 {
+			maxIterations = 20
+		}
+
+		toolDescs := s.toolDescriptions(rootPath)
+		prompt := fmt.Sprintf(`你是天蚕 AI 编程助手。当前项目根目录: %s
+
+%s
+
+工作流程：理解需求→使用工具→执行命令→总结结果
+重要规则：每次只调用一个工具，等待结果后再决定下一步。`, rootPath, toolDescs)
+
+		convID := s.webConvID
+		lastActions := ""
+
+		for i := 0; i < maxIterations; i++ {
+			var userMsg string
+			if i == 0 {
+				userMsg = prompt + "\n\n用户请求: " + userMessage
+			} else {
+				userMsg = lastActions
+			}
+
+			resp, newConvID, err := s.chatWebConv(userMsg, convID)
+			if err != nil {
+				ch <- AgentStreamEvent{Type: "error", Content: fmt.Sprintf("Web 请求失败: %v", err)}
+				return
+			}
+			if newConvID != "" {
+				convID = newConvID
+				s.webConvID = convID
+			}
+
+			// Strip thinking artifacts
+			resp = stripThinkingArtifacts(resp)
+
+			ch <- AgentStreamEvent{Type: "token", Content: resp}
+
+			toolName, toolArgs, hasTool := parseToolCall(resp)
+			if !hasTool {
+				ch <- AgentStreamEvent{Type: "done", Content: resp}
+				return
+			}
+
+			argsJSON, _ := json.Marshal(toolArgs)
+			ch <- AgentStreamEvent{Type: "tool_call", Name: toolName, Content: string(argsJSON)}
+
+			toolResult := s.ExecuteTool(toolName, toolArgs, rootPath)
+			ch <- AgentStreamEvent{Type: "tool_result", Name: toolName, Content: toolResult}
+
+			lastActions = fmt.Sprintf("工具 %s 执行结果:\n%s", toolName, toolResult)
+		}
+		ch <- AgentStreamEvent{Type: "error", Content: fmt.Sprintf("达到最大迭代次数 %d", maxIterations)}
+	}()
+
+	return ch, nil
 }
 
 // ── Streaming Agent Run (for UI) ──────────────────────────────────
@@ -1275,6 +2468,7 @@ func (s *Service) RespondPermission(requestID string, approved bool) {
 
 // AgentStream runs the TAOR loop and streams events via a channel.
 func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations int) (<-chan AgentStreamEvent, error) {
+	s.SetRootPath(rootPath)
 	ch := make(chan AgentStreamEvent, 256)
 
 	go func() {
@@ -1313,7 +2507,7 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
   * 用户的需求可能有多种理解方式
   * 涉及删除或覆盖操作但未确认目标
 - 澄清时，给出具体的选项让用户选择，例如"你是指 A 还是 B？"
-- 如果需求足够明确，直接执行，不要不必要地提问`, rootPath, toolDescriptions(rootPath))
+- 如果需求足够明确，直接执行，不要不必要地提问`, rootPath, s.toolDescriptions(rootPath))
 
 		messages := []ChatMessage{
 			{Role: "system", Content: systemPrompt},
@@ -1339,6 +2533,7 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 			toolName, toolArgs, hasTool := parseToolCall(resp)
 			if !hasTool {
 				// Done — final response already streamed
+				s.emitProgress(i+1, "local", "", nil, resp, true, "")
 				ch <- AgentStreamEvent{Type: "done", Content: resp}
 				return
 			}
@@ -1365,8 +2560,17 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 					Reason:  permResult.Reason,
 				}
 
-				// Block until user responds
-				approved := <-respCh
+				// Block until user responds (with timeout to prevent goroutine leak)
+				var approved bool
+				select {
+				case approved = <-respCh:
+				case <-time.After(5 * time.Minute):
+					approved = false
+					pendingPermissionsMu.Lock()
+					delete(pendingPermissions, reqID)
+					pendingPermissionsMu.Unlock()
+					ch <- AgentStreamEvent{Type: "tool_result", Name: toolName, Content: "⏰ 权限请求超时，已自动拒绝"}
+				}
 				if !approved {
 					ch <- AgentStreamEvent{Type: "tool_result", Name: toolName, Content: "❌ 用户拒绝了此操作"}
 					messages = append(messages, ChatMessage{
@@ -1385,7 +2589,9 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 			}
 
 			// Execute tool
-			toolResult := executeTool(toolName, toolArgs, rootPath)
+			s.emitProgress(i+1, "local", toolName, toolArgs, "", false, "")
+			toolResult := s.ExecuteTool(toolName, toolArgs, rootPath)
+			s.emitProgress(i+1, "local", toolName, toolArgs, toolResult, false, "")
 			ch <- AgentStreamEvent{Type: "tool_result", Name: toolName, Content: toolResult}
 
 			// Add observation
@@ -1396,6 +2602,7 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 		}
 
 		ch <- AgentStreamEvent{Type: "error", Content: fmt.Sprintf("达到最大迭代次数 %d", maxIterations)}
+		s.emitProgress(maxIterations, "local", "", nil, "", true, fmt.Sprintf("达到最大迭代次数 %d", maxIterations))
 	}()
 
 	return ch, nil
@@ -1678,6 +2885,7 @@ func (s *Service) ChatWeb(message string) (string, error) {
 // It accepts a mode string ("local", "api", "web") to select the chat backend.
 func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxIterations int, mode string) agent.AgentRunResult {
 	a := agent.NewAgent(rootPath)
+	a.Registry().SetSandboxManager(s.sandboxMgr)
 
 	// Build chat function based on mode
 	var chatFn agent.ChatFunc
@@ -1707,6 +2915,22 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 			return s.Chat(chatMsgs)
 		}
 	}
+
+	// Wire agent loop progress to frontend via Wails events
+	a.SetProgressCallback(func(iteration int, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string) {
+		if s.App != nil {
+			s.App.Event.Emit("subagent:progress", map[string]interface{}{
+				"agentId":   "main",
+				"agentType": mode,
+				"iteration": iteration,
+				"toolName":  toolName,
+				"toolArgs":  toolArgs,
+				"output":    output,
+				"isDone":    isDone,
+				"error":     err,
+			})
+		}
+	})
 
 	return a.Run(context.Background(), userMessage, maxIterations, chatFn)
 }
@@ -1793,7 +3017,7 @@ func (s *Service) chatWebConv(message string, convID string) (string, string, er
 }
 
 // buildWebToolPrompt builds a tool description block injected into the user message.
-func buildWebToolPrompt(rootPath string) string {
+func (s *Service) buildWebToolPrompt(rootPath string) string {
 	var b strings.Builder
 	b.WriteString("You have access to the following tools. To call a tool, use <invoke> XML format:\n")
 	b.WriteString("<invoke name=\"tool_name\">\n{\"arg1\": \"value1\"}\n</invoke>\n\n")
@@ -1804,7 +3028,7 @@ func buildWebToolPrompt(rootPath string) string {
 	b.WriteString("- Do NOT just describe what you would do — actually call the tool to perform the action.\n")
 	b.WriteString("- When the user asks you to delete/remove a file, call bash with rm immediately. Do not just list files.\n\n")
 	b.WriteString("Available tools:\n\n")
-	b.WriteString(toolDescriptions(rootPath))
+	b.WriteString(s.toolDescriptions(rootPath))
 	return b.String()
 }
 
@@ -1886,7 +3110,7 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 	}
 
 	// Build tool prompt and inject into first message (web providers have no system prompt)
-	toolPrompt := buildWebToolPrompt(rootPath)
+	toolPrompt := s.buildWebToolPrompt(rootPath)
 
 	s.mu.Lock()
 	hasExistingConv := s.webConvID != ""
@@ -1942,6 +3166,7 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 			result.Error = fmt.Sprintf("Web AI 请求失败: %v", err)
 			result.Done = true
 			result.Messages = messages
+			s.emitProgress(i+1, "web", "", nil, "", true, result.Error)
 			return result
 		}
 		if newConvID != "" {
@@ -1954,21 +3179,9 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 		// Split thinking and answer from DeepSeek SSE output
 		thinkPart, answerPart := splitThinkingContent(resp)
 
-		// Debug: log raw response and answer part for diagnosing parser failures
-		log.Printf("AgentRunWeb DEBUG iteration %d: resp_len=%d answer_len=%d think_len=%d",
-			i+1, len(resp), len(answerPart), len(thinkPart))
-		if len(resp) > 200 {
-			log.Printf("AgentRunWeb DEBUG resp_preview: %q", resp[:200])
-		} else {
-			log.Printf("AgentRunWeb DEBUG resp_full: %q", resp)
-		}
-
 		// Parse tool calls (same strategies as Python ResponseParser)
 		toolCalls := parser.ParseToolCalls(resp)
-		log.Printf("AgentRunWeb DEBUG: parser found %d tool calls", len(toolCalls))
-		for ti, tc := range toolCalls {
-			log.Printf("AgentRunWeb DEBUG tool[%d]: name=%s args=%s rawLen=%d", ti, tc.Name, string(tc.Arguments)[:min(200, len(string(tc.Arguments)))], len(tc.RawText))
-		}
+		log.Printf("AgentRunWeb iteration %d: %d tool call(s), resp_len=%d", i+1, len(toolCalls), len(resp))
 		if len(toolCalls) == 0 {
 			// No tool calls — final response: only show the answer part
 			finalAnswer := stripThinkingArtifacts(answerPart)
@@ -1988,15 +3201,9 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 
 			result.Done = true
 			result.Messages = messages
+			s.emitProgress(i+1, "web", "", nil, finalAnswer, true, "")
 			return result
 		}
-
-		names := make([]string, 0, len(toolCalls))
-		for _, tc := range toolCalls {
-			names = append(names, tc.Name)
-		}
-		log.Printf("AgentRunWeb iteration %d: %d tool call(s): %s",
-			i+1, len(toolCalls), strings.Join(names, ", "))
 
 		// Intermediate thinking: use thinkPart only (not the answer)
 		thinking := resp
@@ -2029,7 +3236,9 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 			argsStr := string(tc.Arguments)
 			messages = append(messages, ChatMessage{Role: "tool_call", Content: argsStr, Name: tc.Name})
 
-			res := executeTool(tc.Name, args, rootPath)
+			s.emitProgress(i+1, "web", tc.Name, args, "", false, "")
+			res := s.ExecuteTool(tc.Name, args, rootPath)
+			s.emitProgress(i+1, "web", tc.Name, args, res, false, "")
 			if len(res) > 2000 {
 				res = res[:2000]
 			}
@@ -2058,5 +3267,6 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 	result.Done = false
 	result.Messages = messages
 	result.Error = fmt.Sprintf("达到最大迭代次数 %d", maxIterations)
+	s.emitProgress(maxIterations, "web", "", nil, "", true, result.Error)
 	return result
 }

@@ -47,7 +47,7 @@ export default function PlaywrightPanel() {
 
   // Check Playwright readiness on mount
   useEffect(() => {
-    pwAPI.IsPlaywrightReady().then((ready) => setPwReady(!!ready)).catch(() => setPwReady(false));
+    pwAPI.IsPlaywrightReady().then((ready: boolean) => setPwReady(!!ready)).catch(() => setPwReady(false));
   }, []);
 
   // Listen for streaming output events

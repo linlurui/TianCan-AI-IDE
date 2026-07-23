@@ -10,6 +10,15 @@
 
 ---
 
+## 界面预览
+
+<div align="center">
+  <img src="frontend/ui1.png" width="49%" alt="AI Agent 界面" />
+  <img src="frontend/ui2.png" width="49%" alt="编辑器 + 终端界面" />
+</div>
+
+---
+
 ## 特性总览
 
 | | |
@@ -183,14 +192,39 @@ go build -tags production -o tiancan-ai-ide .
 
 ### 🚧 进行中 / 规划中
 
-- Smart Router 硬件感知模型分发 + 资源监控自动降级/升级（当前仅有任务分类 + 失败降级，缺少硬件检测、gopsutil 负载感知、AI 驱动分类）
-- AutoResearch 完整闭环（当前仅有 benchmark 循环骨架，缺少 AI 驱动代码修改、假设生成、多源研究、pprof 分析）
 - WebSearchTool 全搜索结果（当前仅 DuckDuckGo 即时答案，缺完整搜索、分页排序）
-- 子 Agent 层级编排（多级派生与结果聚合、worktree 隔离、配置驱动 Agent 定义）
 - 技能市场（社区技能导入/导出/共享、技能验证沙箱、技能依赖解析）
 - 容器沙箱 E2B 集成 + 沙箱 Provider 抽象层（Daytona / Docker / E2B 可选）
 - 多窗口独立面板（编辑器 / 终端 / AI / 调试各自独立窗口）
 - 团队协作功能
+
+---
+
+## 近期更新 (2026-07)
+
+### Smart Router 硬件感知 ✅
+
+- **实时硬件监控**：后台监控 CPU、内存、GPU（NVIDIA nvidia-smi / Apple Silicon）
+- **任务复杂度评估**：基于消息长度、关键词、任务类型综合评分
+- **智能路由**：简单任务优先本地模型，复杂任务优先 API，支持 GPU 利用率感知
+- **负载预测**：历史负载数据移动平均预测未来资源需求
+- **Provider 延迟追踪**：指数移动平均记录各 provider 响应时间
+
+### AutoResearch AI 驱动 ✅
+
+- **AI 假设生成**：自动分析代码生成优化假设，无 LLM 时回退到启发式
+- **自动代码修改**：LLM 驱动安全代码变更，支持回滚
+- **pprof 分析集成**：Go 项目自动运行 CPU/Memory profile
+- **迭代收敛控制**：连续 3 次无改进自动停止
+- **结构化报告**：详细迭代历史、改进百分比、警告收集
+
+### 子 Agent Worktree 隔离 ✅
+
+- **WorktreeManager**：完整的 worktree 生命周期管理
+- **冲突检测与解决**：支持 accept-ours / accept-theirs / abort 三种策略
+- **状态跟踪**：active / merging / conflicted / merged / abandoned
+- **遗弃清理**：自动清理超时未合并的 worktree
+- **父子 Agent 追踪**：记录 worktree 所属的父 Agent
 
 ---
 

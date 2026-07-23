@@ -1,7 +1,6 @@
 package remote
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,12 +8,15 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // ConnectionType identifies the remote connection kind.
@@ -27,9 +29,9 @@ const (
 
 // ConnectionConfig holds parameters for a remote connection.
 type ConnectionConfig struct {
-	ID       string         `json:"id"`
-	Name     string         `json:"name"`
-	Type     ConnectionType `json:"type"`
+	ID   string         `json:"id"`
+	Name string         `json:"name"`
+	Type ConnectionType `json:"type"`
 	// SSH fields
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
@@ -50,10 +52,10 @@ type ConnectionStatus struct {
 
 // RemoteFile mirrors filesystem.FileNode for remote paths.
 type RemoteFile struct {
-	Name  string       `json:"name"`
-	Path  string       `json:"path"`
-	IsDir bool         `json:"isDir"`
-	Ext   string       `json:"ext"`
+	Name     string       `json:"name"`
+	Path     string       `json:"path"`
+	IsDir    bool         `json:"isDir"`
+	Ext      string       `json:"ext"`
 	Children []RemoteFile `json:"children,omitempty"`
 }
 
@@ -186,10 +188,32 @@ func (s *Service) Connect(id string) error {
 		port = 22
 	}
 	addr := fmt.Sprintf("%s:%d", cfg.Host, port)
+
+	// Build HostKeyCallback from ~/.ssh/known_hosts
+	var hostKeyCB ssh.HostKeyCallback
+	khPath := filepath.Join(os.Getenv("HOME"), ".ssh", "known_hosts")
+	if kh, err := knownhosts.New(khPath); err == nil {
+		hostKeyCB = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			return kh(hostname, remote, key)
+		}
+	} else {
+		// known_hosts file doesn't exist or is unreadable — create empty file and retry
+		os.MkdirAll(filepath.Dir(khPath), 0700)
+		os.WriteFile(khPath, []byte{}, 0600)
+		if kh2, err2 := knownhosts.New(khPath); err2 == nil {
+			hostKeyCB = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+				return kh2(hostname, remote, key)
+			}
+		} else {
+			// Final fallback: accept any host key (empty known_hosts shouldn't fail, but just in case)
+			hostKeyCB = ssh.InsecureIgnoreHostKey()
+		}
+	}
+
 	client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
 		User:            cfg.User,
 		Auth:            auths,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // TODO: known_hosts
+		HostKeyCallback: hostKeyCB,
 		Timeout:         10 * time.Second,
 	})
 	if err != nil {
@@ -485,17 +509,8 @@ func (s *Service) runSSH(conn *sshConn, cmd string) (string, error) {
 	return string(out), err
 }
 
-// sshAgentAuth creates an SSH auth method from an agent connection.
+// sshAgentAuth creates an SSH auth method from an SSH agent connection.
 func sshAgentAuth(conn net.Conn) ssh.AuthMethod {
-	// Use a simple agent implementation via golang.org/x/crypto/ssh/agent
-	// We import it indirectly through the agent package
-	return ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
-		// Minimal: just return empty — real agent support requires x/crypto/ssh/agent
-		// which is already a transitive dep via go-git
-		_ = conn
-		return nil, nil
-	})
+	ag := agent.NewClient(conn)
+	return ssh.PublicKeysCallback(ag.Signers)
 }
-
-// Ensure context is used (suppress unused import)
-var _ = context.Background

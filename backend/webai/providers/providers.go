@@ -303,7 +303,9 @@ func chatDeepSeek(ctx context.Context, auth *types.AuthResult, req types.ChatReq
 		}
 
 		var sessionData map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&sessionData)
+		if err := json.NewDecoder(resp.Body).Decode(&sessionData); err != nil {
+			return nil, fmt.Errorf("parse session response: %w", err)
+		}
 		if data, ok := sessionData["data"].(map[string]interface{}); ok {
 			if biz, ok := data["biz_data"].(map[string]interface{}); ok {
 				if id, ok := biz["id"].(string); ok {
@@ -329,7 +331,9 @@ func chatDeepSeek(ctx context.Context, auth *types.AuthResult, req types.ChatReq
 		defer powResp.Body.Close()
 		if powResp.StatusCode == 200 {
 			var powData map[string]interface{}
-			json.NewDecoder(powResp.Body).Decode(&powData)
+			if err := json.NewDecoder(powResp.Body).Decode(&powData); err != nil {
+				log.Printf("chatDeepSeek: parse PoW challenge: %v", err)
+			}
 			// Python: data.get("data",{}).get("biz_data",{}).get("challenge") or data.get("challenge")
 			var ch map[string]interface{}
 			if d, ok := powData["data"].(map[string]interface{}); ok {
@@ -413,7 +417,9 @@ func chatClaude(ctx context.Context, auth *types.AuthResult, req types.ChatReque
 		resp, err := client.Do(orgReq)
 		if err == nil {
 			var orgs []map[string]interface{}
-			json.NewDecoder(resp.Body).Decode(&orgs)
+			if decErr := json.NewDecoder(resp.Body).Decode(&orgs); decErr != nil {
+				log.Printf("chatDeepSeek: parse orgs: %v", decErr)
+			}
 			resp.Body.Close()
 			if len(orgs) > 0 {
 				orgID, _ = orgs[0]["uuid"].(string)
@@ -437,7 +443,9 @@ func chatClaude(ctx context.Context, auth *types.AuthResult, req types.ChatReque
 		resp, err := client.Do(convReq)
 		if err == nil {
 			var data map[string]interface{}
-			json.NewDecoder(resp.Body).Decode(&data)
+			if decErr := json.NewDecoder(resp.Body).Decode(&data); decErr != nil {
+				log.Printf("chatDeepSeek: parse conv: %v", decErr)
+			}
 			resp.Body.Close()
 			convID, _ = data["uuid"].(string)
 		}

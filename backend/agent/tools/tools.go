@@ -11,12 +11,20 @@ import (
 	"github.com/rocky233/tiancan-ai-ide/backend/sandbox"
 )
 
+// LLMCaller allows tools to call the LLM for AI-driven decisions.
+// Injected from ai.Service to avoid circular dependency.
+type LLMCaller interface {
+	CallLLM(ctx context.Context, prompt string) (string, error)
+}
+
 // Registry manages dynamic tool registration and execution.
 type Registry struct {
-	builtin  map[string]types.Tool
-	mcp      map[string]types.Tool
-	mu       sync.RWMutex
-	rootPath string
+	builtin    map[string]types.Tool
+	mcp        map[string]types.Tool
+	mu         sync.RWMutex
+	rootPath   string
+	llm        LLMCaller        // optional: injected from ai.Service
+	sandboxMgr *sandbox.Manager // optional: injected from ai.Service
 }
 
 // NewRegistry creates a new tool registry with built-in tools.
@@ -28,6 +36,33 @@ func NewRegistry(rootPath string) *Registry {
 	}
 	r.registerBuiltinTools()
 	return r
+}
+
+// SetLLMCaller injects the LLM caller for tools that need AI (e.g. AutoResearch).
+// Also propagates the caller to any already-registered tools that implement LLMCallerSetter.
+func (r *Registry) SetLLMCaller(caller LLMCaller) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.llm = caller
+	// Propagate to already-registered tools
+	for _, t := range r.builtin {
+		if setter, ok := t.(interface{ SetLLMCaller(LLMCaller) }); ok {
+			setter.SetLLMCaller(caller)
+		}
+	}
+}
+
+// GetLLMCaller returns the injected LLM caller (may be nil if not set).
+func (r *Registry) GetLLMCaller() LLMCaller {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.llm
+}
+
+// SetSandboxManager injects the shared sandbox manager from ai.Service.
+// Must be called before registerBuiltinTools or the fallback NewManager() will be used.
+func (r *Registry) SetSandboxManager(mgr *sandbox.Manager) {
+	r.sandboxMgr = mgr
 }
 
 // Register adds a tool to the registry.
@@ -173,11 +208,13 @@ func (r *Registry) registerBuiltinTools() {
 	// AutoResearch tools (autoresearch_tools.go)
 	r.Register(&AutoResearchTool{rootPath: r.rootPath})
 	r.Register(&WebSearchTool{})
-	// Sandbox tools (sandbox/tool.go)
-	sbMgr := sandbox.NewManager()
-	r.Register(&sandbox.SandboxCreateTool{Manager: sbMgr})
-	r.Register(&sandbox.SandboxExecTool{Manager: sbMgr})
-	r.Register(&sandbox.SandboxStopTool{Manager: sbMgr})
+	// Sandbox tools (sandbox/tool.go) — manager will be injected via SetSandboxManager
+	if r.sandboxMgr == nil {
+		r.sandboxMgr = sandbox.NewManager() // fallback if not injected
+	}
+	r.Register(&sandbox.SandboxCreateTool{Manager: r.sandboxMgr})
+	r.Register(&sandbox.SandboxExecTool{Manager: r.sandboxMgr})
+	r.Register(&sandbox.SandboxStopTool{Manager: r.sandboxMgr})
 	// Self-verification tools (verify_tools.go)
 	r.Register(&GenerateTestsTool{rootPath: r.rootPath})
 	r.Register(&AssessCompletionTool{rootPath: r.rootPath})

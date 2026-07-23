@@ -744,7 +744,7 @@ const DebugPanel = forwardRef<DebugPanelHandle, Props>(function DebugPanel(
   useEffect(() => {
     if (!rootPath) { setMainPkgs([]); setSelectedPkg("."); setIsWailsProject(false); return; }
     ScanMainPackages(rootPath)
-      .then(pkgs => {
+      .then((pkgs: string[]) => {
         setIsWailsProject(false);
         const l = pkgs ?? [];
         setMainPkgs(l);
@@ -886,7 +886,7 @@ const DebugPanel = forwardRef<DebugPanelHandle, Props>(function DebugPanel(
         const lines = await GetProcessOutput(rootPath).catch(() => [] as string[]);
         if (lines && lines.length > 0) {
           setOutput(prev => {
-            const next = [...prev, ...lines.map(l => l + "\n")];
+            const next = [...prev, ...lines.map((l: string) => l + "\n")];
             return next.length > 1000 ? next.slice(-1000) : next;
           });
         }

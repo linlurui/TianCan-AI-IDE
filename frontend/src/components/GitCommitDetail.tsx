@@ -106,8 +106,8 @@ export default function GitCommitDetail({ repoPath, commit, onRefresh }: Props) 
     setFiles(null);
     setError(null);
     GetCommitFiles(repoPath, commit.hash)
-      .then((list) => setFiles(list ?? []))
-      .catch((e) => setError(String(e)))
+      .then((list: CommitFileInfo[]) => setFiles(list ?? []))
+      .catch((e: Error) => setError(String(e)))
       .finally(() => setLoading(false));
   }, [repoPath, commit.hash]);
 

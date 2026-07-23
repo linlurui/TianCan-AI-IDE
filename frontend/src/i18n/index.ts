@@ -3,7 +3,8 @@ import zh from "./locales/zh.json";
 import en from "./locales/en.json";
 
 type Lang = "zh" | "en";
-type Locale = typeof zh;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Locale = Record<string, any>;
 
 const LOCALES: Record<Lang, Locale> = { zh, en };
 

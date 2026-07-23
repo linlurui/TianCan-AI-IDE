@@ -5,46 +5,13 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import { Server, Container, Plus, Trash2, Plug, Unplug, FolderOpen } from "lucide-react";
-
-// Wails bindings - use mock if not available (dev without backend)
-let remoteAPI: any = null;
-try {
-  // Dynamic import will be replaced with static import once bindings are generated
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  remoteAPI = require("../bindings/remote");
-} catch {
-  remoteAPI = {
-    GetConnections: async () => [],
-    AddConnection: async () => {},
-    RemoveConnection: async () => {},
-    Connect: async () => {},
-    Disconnect: async () => {},
-    GetConnectionStatus: async () => [],
-    ListDockerContainers: async () => [],
-  };
-}
+import {
+  GetConnections, AddConnection, RemoveConnection,
+  Connect, Disconnect, GetConnectionStatus, ListDockerContainers,
+} from "../bindings/remote";
+import { ConnectionConfig, ConnectionStatus, DockerContainer } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/remote/models";
 
 type ConnectionType = "ssh" | "docker";
-
-interface ConnectionConfig {
-  id: string;
-  name: string;
-  type: ConnectionType;
-  host?: string;
-  port?: number;
-  user?: string;
-  password?: string;
-  keyPath?: string;
-  containerId?: string;
-  containerName?: string;
-}
-
-interface DockerContainer {
-  id: string;
-  name: string;
-  image: string;
-  state: string;
-}
 
 interface Props {
   onOpenRemoteFile?: (connID: string, path: string, type: "ssh" | "docker") => void;
@@ -105,16 +72,18 @@ function AddConnectionForm({ onAdd, onCancel }: {
           className="remote-btn-primary"
           onClick={() => {
             if (!name.trim()) return;
-            onAdd({
+            onAdd(ConnectionConfig.createFrom({
               id: "",
               name: name.trim(),
-              type,
+              type: type as any,
               host,
               port: parseInt(port) || 22,
               user,
               password,
               keyPath,
-            });
+              containerId: "",
+              containerName: "",
+            }));
           }}
         >
           {t("remote.add")}
@@ -138,8 +107,8 @@ export default function RemotePanel({ onOpenRemoteFile }: Props) {
   const loadConnections = useCallback(async () => {
     try {
       const [conns, sts] = await Promise.all([
-        remoteAPI.GetConnections(),
-        remoteAPI.GetConnectionStatus(),
+        GetConnections(),
+        GetConnectionStatus(),
       ]);
       setConnections(conns ?? []);
       const statusMap: Record<string, boolean> = {};
@@ -152,7 +121,7 @@ export default function RemotePanel({ onOpenRemoteFile }: Props) {
 
   const loadDockerContainers = useCallback(async () => {
     try {
-      const containers = await remoteAPI.ListDockerContainers();
+      const containers = await ListDockerContainers();
       setDockerContainers(containers ?? []);
     } catch {
       setDockerContainers([]);
@@ -166,7 +135,7 @@ export default function RemotePanel({ onOpenRemoteFile }: Props) {
 
   const handleAdd = useCallback(async (cfg: ConnectionConfig) => {
     try {
-      await remoteAPI.AddConnection(cfg);
+      await AddConnection(cfg);
       setShowAddForm(false);
       await loadConnections();
     } catch (e: any) {
@@ -178,7 +147,7 @@ export default function RemotePanel({ onOpenRemoteFile }: Props) {
     setLoading((p) => ({ ...p, [id]: true }));
     setError(null);
     try {
-      await remoteAPI.Connect(id);
+      await Connect(id);
       await loadConnections();
     } catch (e: any) {
       setError(e?.message ?? t("remote.connFail"));
@@ -189,7 +158,7 @@ export default function RemotePanel({ onOpenRemoteFile }: Props) {
 
   const handleDisconnect = useCallback(async (id: string) => {
     try {
-      await remoteAPI.Disconnect(id);
+      await Disconnect(id);
       await loadConnections();
     } catch (e: any) {
       setError(e?.message ?? t("remote.disconnFail"));
@@ -198,7 +167,7 @@ export default function RemotePanel({ onOpenRemoteFile }: Props) {
 
   const handleRemove = useCallback(async (id: string) => {
     try {
-      await remoteAPI.RemoveConnection(id);
+      await RemoveConnection(id);
       await loadConnections();
     } catch (e: any) {
       setError(e?.message ?? t("remote.deleteFail"));

@@ -40,6 +40,7 @@ interface EditorState {
   closeTab: (path: string, paneId?: "left" | "right") => void;
   setActiveTab: (path: string | null, paneId?: "left" | "right") => void;
   updateTabContent: (path: string, content: string) => void;
+  reloadTabContent: (path: string, content: string) => void;
   markTabSaved: (path: string) => void;
   renameTab: (oldPath: string, newPath: string, newName: string) => void;
   deleteTabsByPrefix: (prefix: string) => void;
@@ -141,6 +142,28 @@ export const useEditorStore = create<EditorState>((set, get) => ({
           ...s.panes.right,
           tabs: s.panes.right.tabs.map((t) =>
             t.path === path ? { ...t, content, isDirty: true } : t
+          ),
+        },
+      },
+    }));
+  },
+
+  reloadTabContent: (path, content) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.path === path ? { ...t, content, isDirty: false } : t
+      ),
+      panes: {
+        left: {
+          ...s.panes.left,
+          tabs: s.panes.left.tabs.map((t) =>
+            t.path === path ? { ...t, content, isDirty: false } : t
+          ),
+        },
+        right: {
+          ...s.panes.right,
+          tabs: s.panes.right.tabs.map((t) =>
+            t.path === path ? { ...t, content, isDirty: false } : t
           ),
         },
       },

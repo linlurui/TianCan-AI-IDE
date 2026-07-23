@@ -1,5 +1,6 @@
 import React, { useCallback, useRef, useEffect } from "react";
 import { useTranslation } from "./i18n";
+import WindowRouter from "./components/WindowRouter";
 import {
   BrainCircuit, Code2, Files, FolderPlus, GitBranch, Globe,
   LocateFixed, RefreshCw, Save, Settings, Wrench, Terminal, Bug,
@@ -25,7 +26,8 @@ import {
 } from "./bindings/extension";
 import { StartAndGetPort } from "./bindings/terminal";
 import { StartAndGetPort as StartLspPort } from "./bindings/lsp";
-import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, RespondPermission } from "./bindings/ai";
+import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, RespondPermission, SmartAgentRun } from "./bindings/ai";
+import { RemoteReadFile, DockerReadFile } from "./bindings/remote";
 import { Events } from "@wailsio/runtime";
 import type { ModelSource } from "./components/AIPanel";
 import PermissionConfirmModal, { type PermissionRequest } from "./components/PermissionConfirmModal";
@@ -136,12 +138,22 @@ export default function App() {
 
   // Listen for filetree:refresh events from backend (emitted after AI write operations)
   useEffect(() => {
-    const off = Events.On("filetree:refresh", (rootPath: any) => {
+    const off = Events.On("filetree:refresh", async (rootPath: any) => {
       const projId = typeof rootPath === "string" ? rootPath : project.activeProject?.id;
       if (projId) project.refreshProject(projId);
+      // Reload content of any open editor tabs that match the project root
+      const openTabs = editor.tabs;
+      for (const tab of openTabs) {
+        if (!tab.path.startsWith("remote://")) {
+          try {
+            const content = await ReadFile(tab.path);
+            editor.reloadTabContent(tab.path, content ?? "");
+          } catch { /* file may have been deleted */ }
+        }
+      }
     });
     return () => { Events.Off("filetree:refresh"); };
-  }, [project]);
+  }, [project, editor]);
 
   useEffect(() => {
     loadInstalledExtensions();
@@ -167,7 +179,7 @@ export default function App() {
       if (monacoGlobalRef.current) {
         for (const ext of list) {
           GetExtensionContributes(ext.publisher, ext.technicalName)
-            .then((contrib) => contrib && applyExtensionContributes(monacoGlobalRef.current, contrib))
+            .then((contrib: ExtensionContributes | null) => contrib && applyExtensionContributes(monacoGlobalRef.current, contrib))
             .catch(() => {});
         }
       }
@@ -367,6 +379,7 @@ export default function App() {
 
   // ── Render ───────────────────────────────────────────────────────────────
   return (
+    <WindowRouter>
     <div className="ide-root">
       {/* Titlebar */}
       <div className="titlebar">
@@ -566,7 +579,15 @@ export default function App() {
           {/* Remote */}
           <div className="sidebar-panel" style={{ display: ui.sidebarTab === "remote" ? "flex" : "none", flexDirection: "column", height: "100%", overflow: "hidden" }}>
             <div className="sidebar-header"><span className="sidebar-header-path">{t("remote.title")}</span></div>
-            <RemotePanel onOpenRemoteFile={(connID, path, type) => console.log("remote open", connID, path, type)} />
+            <RemotePanel onOpenRemoteFile={async (connID, path, type) => {
+              try {
+                const content = type === "docker" ? await DockerReadFile(connID, path) : await RemoteReadFile(connID, path);
+                const name = path.split("/").pop() ?? path;
+                editor.openTab({ path: `remote://${connID}/${path}`, name, content: content ?? "", isDirty: false });
+              } catch (e: any) {
+                console.error("open remote file:", e);
+              }
+            }} />
           </div>
 
           {/* Database */}
@@ -775,6 +796,29 @@ export default function App() {
             setAiLoading(true);
 
             const rootPath = project.activeProject?.rootPath ?? "";
+
+            // Auto mode: let SmartRouter decide the best tier
+            if (source === "auto") {
+              try {
+                const result = await SmartAgentRun(text, rootPath, 20);
+                const rawMsgs = (result.messages ?? []).filter((m: any) => m.role !== "user");
+                const agentMsgs: Array<{role: any; content: string; name?: string}> = [];
+                for (let i = 0; i < rawMsgs.length; i++) {
+                  const m = rawMsgs[i];
+                  const next = rawMsgs[i + 1];
+                  if (m.role === "assistant" && next && (next.role === "tool_call" || next.role === "tool_result")) {
+                    agentMsgs.push({ role: "thinking", content: m.content });
+                  } else {
+                    agentMsgs.push({ role: m.role, content: m.content, name: m.name });
+                  }
+                }
+                setMessages((p) => [...p, ...agentMsgs]);
+              } catch (err: any) {
+                setMessages((p) => [...p, { role: "assistant", content: `❌ Smart Router 失败: ${err?.message ?? err}` }]);
+              }
+              setAiLoading(false);
+              return;
+            }
 
             // Use streaming for local mode (LM Studio supports ChatStream)
             if (source === "local") {
@@ -1069,5 +1113,6 @@ export default function App() {
         onUninstall={(e) => { handleUninstallExtension(e); setExtensionDetailExt(null); }}
       />
     </div>
+    </WindowRouter>
   );
 }

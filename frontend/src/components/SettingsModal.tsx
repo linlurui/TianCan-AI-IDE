@@ -160,25 +160,12 @@ export default function SettingsModal({ onClose }: Props) {
 
             {tab === "ai" && (
               <>
-                <div className="settings-section-title">{t("settings.lmStudioSection")}</div>
-                <SettingRow label={t("settings.serviceUrl")}>
-                  <input className="settings-input" value={settings.lmStudioUrl}
-                    onChange={(e) => set("lmStudioUrl", e.target.value)} />
-                </SettingRow>
-                <SettingRow label={t("settings.defaultModel")}>
-                  <input className="settings-input" value={settings.defaultModel}
-                    onChange={(e) => set("defaultModel", e.target.value)} />
-                </SettingRow>
+                <div className="settings-section-title">🤖 AI Provider</div>
 
-                <div className="settings-section-title">{t("settings.apiCloudSection")}</div>
-                <div className="settings-hint">
-                  {t("settings.apiCloudHint")}
-                </div>
+                <ProviderSelector />
 
-                <div className="settings-section-title">{t("settings.completionSection")}</div>
-                <SettingRow label={t("settings.inlineCompletion")}>
-                  <Toggle value={settings.inlineCompletion} onChange={(v) => set("inlineCompletion", v)} />
-                </SettingRow>
+                <div className="settings-section-title" style={{ marginTop: 24 }}>⚙️ 自定义 API</div>
+                <CustomAPIForm />
               </>
             )}
 
@@ -274,6 +261,208 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
     <button className={`settings-toggle${value ? " on" : ""}`} onClick={() => onChange(!value)}>
       <span className="settings-toggle-thumb" />
     </button>
+  );
+}
+
+// ─── Provider Selector Component ────────────────────────────────────
+
+interface Provider {
+  id: string;
+  name: string;
+  type: "cli" | "desktop" | "api" | "local";
+  status: "available" | "unavailable" | "needs_login" | "error";
+  icon?: string;
+  color?: string;
+  hasQuota?: boolean;
+}
+
+function ProviderSelector() {
+  const { t } = useTranslation();
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [activeProvider, setActiveProvider] = useState<string>("");
+  const [discovering, setDiscovering] = useState(false);
+
+  useEffect(() => {
+    loadProviders();
+  }, []);
+
+  const loadProviders = async () => {
+    try {
+      // 调用后端发现 Provider
+      const list = await (window as any).go.ai.Service.ListProviders();
+      setProviders(list || []);
+
+      // 获取当前活跃的 Provider
+      const active = await (window as any).go.ai.Service.GetActiveProvider();
+      if (active) {
+        setActiveProvider(active.id);
+      }
+    } catch (e) {
+      console.error("Failed to load providers:", e);
+    }
+  };
+
+  const handleDiscover = async () => {
+    setDiscovering(true);
+    try {
+      await (window as any).go.ai.Service.DiscoverProviders();
+      await loadProviders();
+    } catch (e) {
+      console.error("Discovery failed:", e);
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const handleSelect = async (id: string) => {
+    try {
+      await (window as any).go.ai.Service.SetActiveProvider(id);
+      setActiveProvider(id);
+    } catch (e) {
+      console.error("Failed to set provider:", e);
+    }
+  };
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case "available": return "✓";
+      case "unavailable": return "✗";
+      case "needs_login": return "?";
+      default: return "○";
+    }
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case "available": return "#10b981";
+      case "unavailable": return "#ef4444";
+      case "needs_login": return "#f59e0b";
+      default: return "#6b7280";
+    }
+  };
+
+  return (
+    <div className="provider-selector">
+      <div className="provider-header">
+        <button className="settings-btn" onClick={handleDiscover} disabled={discovering}>
+          {discovering ? "🔍 " + t("settings.discovering") : "🔍 " + t("settings.discoverProviders")}
+        </button>
+      </div>
+
+      <div className="provider-list">
+        {providers.length === 0 ? (
+          <div className="provider-empty">
+            {t("settings.noProvidersFound")}
+          </div>
+        ) : (
+          providers.map((p) => (
+            <div
+              key={p.id}
+              className={`provider-item ${activeProvider === p.id ? "active" : ""}`}
+              onClick={() => p.status === "available" && handleSelect(p.id)}
+              style={{ opacity: p.status === "available" ? 1 : 0.5 }}
+            >
+              <div className="provider-icon" style={{ background: p.color || "#6366f1" }}>
+                {p.icon || "🤖"}
+              </div>
+              <div className="provider-info">
+                <div className="provider-name">{p.name}</div>
+                <div className="provider-type">{p.type}</div>
+              </div>
+              <div className="provider-status" style={{ color: getStatusColor(p.status) }}>
+                {getStatusIcon(p.status)} {p.status}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {activeProvider && (
+        <div className="provider-active-hint">
+          {t("settings.currentProvider")}: {providers.find(p => p.id === activeProvider)?.name}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Custom API Form Component ─────────────────────────────────────
+
+function CustomAPIForm() {
+  const { t } = useTranslation();
+  const [baseURL, setBaseURL] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [model, setModel] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  const handleTest = async () => {
+    if (!baseURL) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      await (window as any).go.ai.Service.AddCustomProvider(
+        "custom-" + Date.now(),
+        "Custom API",
+        baseURL,
+        apiKey,
+        model
+      );
+      setTestResult({ success: true, message: t("settings.connectionSuccess") });
+    } catch (e: any) {
+      setTestResult({ success: false, message: e.message || t("settings.connectionFailed") });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="custom-api-form">
+      <div className="custom-api-row">
+        <label>Base URL</label>
+        <input
+          type="text"
+          placeholder="https://api.openai.com/v1"
+          value={baseURL}
+          onChange={(e) => setBaseURL(e.target.value)}
+          className="settings-input"
+        />
+      </div>
+      <div className="custom-api-row">
+        <label>API Key</label>
+        <input
+          type="password"
+          placeholder="sk-..."
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          className="settings-input"
+        />
+      </div>
+      <div className="custom-api-row">
+        <label>Model</label>
+        <input
+          type="text"
+          placeholder="gpt-4o"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          className="settings-input"
+        />
+      </div>
+      <div className="custom-api-actions">
+        <button
+          className="settings-btn"
+          onClick={handleTest}
+          disabled={testing || !baseURL}
+        >
+          {testing ? t("settings.testing") : t("settings.testConnection")}
+        </button>
+        {testResult && (
+          <span className={`test-result ${testResult.success ? "success" : "error"}`}>
+            {testResult.message}
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

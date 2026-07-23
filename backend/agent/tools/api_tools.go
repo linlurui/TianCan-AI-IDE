@@ -94,7 +94,10 @@ func (t *APIRequestTool) Execute(ctx context.Context, args map[string]interface{
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return types.ToolResult{Content: fmt.Sprintf("Read response failed: %v", err), Success: false}, nil
+	}
 	if len(respBody) > 50000 {
 		respBody = respBody[:50000]
 	}

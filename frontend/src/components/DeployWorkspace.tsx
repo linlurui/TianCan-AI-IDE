@@ -10,11 +10,10 @@ import {
   AddConfig, UpdateConfig, RemoveConfig, ListConfigs,
   Deploy, GetTask, ListTasks,
   ServerConfig, DeployConfig, DeployTask,
+  AuthType, DeployType,
 } from "../bindings/deploy";
 
 type WorkTab = "servers" | "configs" | "logs";
-type DeployType = "shell" | "docker" | "k8s";
-type AuthType = "password" | "key";
 
 const DEPLOY_TYPE_KEYS: Record<string, string> = { shell: "deploy.shell", docker: "deploy.docker", k8s: "deploy.k8s" };
 const STATUS_ICON: Record<string, React.ReactNode> = {
@@ -27,12 +26,12 @@ const STATUS_ICON: Record<string, React.ReactNode> = {
 };
 
 function emptyServer(): ServerConfig {
-  return { id: "", name: "", host: "", port: 22, user: "root", authType: "password", password: "", keyPath: "", tags: [] };
+  return { id: "", name: "", host: "", port: 22, user: "root", authType: AuthType.AuthPassword, password: "", keyPath: "", tags: [] };
 }
 
 function emptyConfig(): DeployConfig {
   return {
-    id: "", name: "", type: "shell", serverIds: [],
+    id: "", name: "", type: DeployType.DeployShell, serverIds: [],
     buildCmd: "", localDir: "", remoteDir: "/app",
     script: "#!/bin/bash\necho \"Deploy started...\"\n# Add deploy commands here\necho \"Deploy complete!\"",
     dockerImage: "app:latest", dockerfile: "Dockerfile",

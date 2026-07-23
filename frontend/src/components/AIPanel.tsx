@@ -6,8 +6,10 @@ import {
   ListModels, IsLMStudioInstalled, InstallLMStudio, LaunchLMStudio,
   SetModel, ListAPIProviders, SetAPIProvider, GetAPIProvider,
   ListWebProviders, LoginWeb, SetWebAuth, GetWebAuth, IsWebProviderLoggedIn,
+  SmartRoute, RefreshModelStatuses,
 } from "../bindings/ai";
 import type { APIProviderConfig, WebProviderInfo } from "../bindings/ai";
+import SubAgentProgressPanel from "./SubAgentProgress";
 
 // ─── <think> block component ────────────────────────────────
 function ThinkBlock({ content, streaming }: { content: string; streaming?: boolean }) {
@@ -90,9 +92,9 @@ export interface Message {
   name?: string; // tool name for tool_call/tool_result
 }
 
-export type ModelSource = "local" | "api" | "web";
+export type ModelSource = "auto" | "local" | "api" | "web";
 
-type LMModel = { id: string; label: string };
+type LMModel = { id: string; label: string; available?: boolean; disable_reason?: string };
 
 const LOCAL_MODELS_FALLBACK: LMModel[] = [
   { id: "default", label: "LM Studio Default" },
@@ -107,8 +109,10 @@ interface AIPanelProps {
 
 export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPanelProps) {
   const [input, setInput] = React.useState("");
-  const [source, setSource] = useState<ModelSource>(() => (localStorage.getItem("ai_source") as ModelSource) || "local");
+  const [source, setSource] = useState<ModelSource>(() => (localStorage.getItem("ai_source") as ModelSource) || "auto");
+  const [routeInfo, setRouteInfo] = useState<{ tier: string; reason: string } | null>(null);
   const [localModels, setLocalModels] = useState<LMModel[]>(LOCAL_MODELS_FALLBACK);
+  const [lmStudioKillMsg, setLmStudioKillMsg] = useState<string | null>(null);
   const [model, setModel] = useState("default");
   const [lmInstalled, setLmInstalled] = useState<boolean | null>(null);
   const [installing, setInstalling] = useState(false);
@@ -144,6 +148,10 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
   const { t } = useTranslation();
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [inputAreaHeight, setInputAreaHeight] = useState(180); // px
+  const resizingRef = useRef(false);
+  const startYRef = useRef(0);
+  const startHeightRef = useRef(0);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -172,12 +180,54 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
     return () => { offSuccess(); offError(); offFallback(); };
   }, [t]);
 
+  // Listen for router-driven local model availability updates
+  useEffect(() => {
+    const offModels = Events.On("router:local-models-updated", (evt: any) => {
+      const statuses = Array.isArray(evt) ? evt : [];
+      const updated = statuses.map((s: any) => ({
+        id: s.id,
+        label: s.id,
+        available: s.available !== false,
+        disable_reason: s.disable_reason || "",
+      }));
+      if (updated.length > 0) {
+        setLocalModels([{ id: "default", label: "LM Studio Default", available: true }, ...updated]);
+      }
+    });
+    const offKill = Events.On("router:kill-lm-studio", (evt: any) => {
+      const msg = typeof evt === "string" ? evt : "所有本地模型均不可用，建议关闭 LM Studio 释放内存";
+      setLmStudioKillMsg(msg);
+      setLmInstalled(false);
+    });
+    return () => { offModels(); offKill(); };
+  }, []);
+
+  // Listen for SmartRouter routing decisions
+  useEffect(() => {
+    const offDecision = Events.On("router:decision", (evt: any) => {
+      if (evt && typeof evt === "object") {
+        setRouteInfo({ tier: evt.tier || "local", reason: evt.reason || "" });
+      }
+    });
+    const offFallback = Events.On("router:fallback", (evt: any) => {
+      if (evt && typeof evt === "object") {
+        setRouteInfo({ tier: evt.to || "local", reason: `降级: ${evt.from} → ${evt.to}` });
+      }
+    });
+    return () => { offDecision(); offFallback(); };
+  }, []);
+
   const refreshLocalModels = useCallback(async () => {
     try {
       const models = await ListModels();
       if (models && models.length > 0) {
-        const lmModels = models.map((m: any) => ({ id: m.id, label: m.id }));
-        setLocalModels([{ id: "default", label: "LM Studio Default" }, ...lmModels]);
+        const lmModels = models.map((m: any) => ({
+          id: m.id,
+          label: m.id,
+          available: m.available !== false,
+          disable_reason: m.disable_reason || "",
+        }));
+        setLocalModels([{ id: "default", label: "LM Studio Default", available: true }, ...lmModels]);
         return true;
       }
     } catch { /* server not running */ }
@@ -248,10 +298,10 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
         const storedID = localStorage.getItem("ai_web_provider") || "";
         if (saved) {
           // Backend has auth — prefer stored selection, fall back to auth provider
-          const preferred = list.some(p => p.id === storedID) ? storedID : saved;
+          const preferred = list.some((p: WebProviderInfo) => p.id === storedID) ? storedID : saved;
           setWebProviderID(preferred);
           setWebLoggedIn(true);
-        } else if (storedID && list.some(p => p.id === storedID)) {
+        } else if (storedID && list.some((p: WebProviderInfo) => p.id === storedID)) {
           // No auth yet but user previously selected a provider
           setWebProviderID(storedID);
         } else if (list.length > 0) {
@@ -381,6 +431,14 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
       <div className="ai-model-header">
         <div className="ai-source-toggle">
           <button
+            className={`ai-source-btn${source === "auto" ? " active" : ""}`}
+            onClick={() => handleSourceChange("auto")}
+            title="Smart Router: 自动选择最佳模型"
+          >
+            <span style={{ fontSize: 11 }}>⚡</span>
+            Auto
+          </button>
+          <button
             className={`ai-source-btn${source === "local" ? " active" : ""}`}
             onClick={() => handleSourceChange("local")}
             title={t("ai.localModelTitle")}
@@ -405,6 +463,11 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
             Web
           </button>
         </div>
+        {routeInfo && (
+          <span className="ai-route-badge" title={routeInfo.reason}>
+            → {routeInfo.tier}
+          </span>
+        )}
 
         {source === "local" && (
           <select
@@ -413,7 +476,14 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
             onChange={(e) => { setModel(e.target.value); SetModel(e.target.value).catch(() => {}); }}
           >
             {localModels.map((m) => (
-              <option key={m.id} value={m.id}>{m.label}</option>
+              <option
+                key={m.id}
+                value={m.id}
+                disabled={!m.available}
+                style={!m.available ? { color: "#888", fontStyle: "italic" } : undefined}
+              >
+                {m.label}{!m.available && m.disable_reason ? ` (⚠ ${m.disable_reason})` : ""}
+              </option>
             ))}
           </select>
         )}
@@ -471,6 +541,9 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
           <button className="ai-install-btn" onClick={handleInstallLMStudio} title={t("ai.oneClickInstall")}>
             <Download size={11} /> {t("ai.installLM")}
           </button>
+        )}
+        {source === "local" && lmStudioKillMsg && (
+          <span className="ai-install-status" style={{ color: "#e55", fontSize: 11 }}>⚠ {lmStudioKillMsg}</span>
         )}
         {source === "local" && lmInstalled === false && installing && (
           <span className="ai-install-status"><Loader2 size={11} className="spin" /> {t("ai.installing")}</span>
@@ -633,7 +706,38 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
         <div ref={bottomRef} />
       </div>
 
-      <div className="ai-input-area">
+      {/* Resize handle between messages and input */}
+      <div
+        className="ai-resize-handle"
+        onMouseDown={(e) => {
+          e.preventDefault();
+          resizingRef.current = true;
+          startYRef.current = e.clientY;
+          startHeightRef.current = inputAreaHeight;
+          document.body.style.cursor = "row-resize";
+          document.body.style.userSelect = "none";
+          const onMove = (ev: MouseEvent) => {
+            if (!resizingRef.current) return;
+            // Dragging UP → input area gets taller (delta negative → height increases)
+            const delta = startYRef.current - ev.clientY;
+            const newH = Math.max(100, Math.min(500, startHeightRef.current + delta));
+            setInputAreaHeight(newH);
+          };
+          const onUp = () => {
+            resizingRef.current = false;
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+          };
+          document.addEventListener("mousemove", onMove);
+          document.addEventListener("mouseup", onUp);
+        }}
+      />
+
+      <SubAgentProgressPanel />
+
+      <div className="ai-input-area" style={{ height: inputAreaHeight, minHeight: 100, maxHeight: 500 }}>
         <textarea
           ref={textareaRef}
           className="ai-input"
