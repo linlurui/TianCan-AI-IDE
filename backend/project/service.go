@@ -9,6 +9,32 @@ import (
 	"strings"
 )
 
+// ProjectRoot holds the current project root path (set from frontend).
+var ProjectRoot string
+
+// GetProjectRoot returns the current project root path.
+// Falls back to the parent directory of the binary or current working directory.
+func GetProjectRoot() string {
+	if ProjectRoot != "" {
+		return ProjectRoot
+	}
+	// Try to detect from environment
+	if envRoot := os.Getenv("TIANCAN_PROJECT_ROOT"); envRoot != "" {
+		return envRoot
+	}
+	// Fallback: use cwd
+	cwd, err := os.Getwd()
+	if err == nil {
+		return cwd
+	}
+	return ""
+}
+
+// SetProjectRoot sets the current project root path.
+func SetProjectRoot(path string) {
+	ProjectRoot = path
+}
+
 // DetectResult describes a detected project environment.
 type DetectResult struct {
 	Type        string `json:"type"`
@@ -22,7 +48,18 @@ type DetectResult struct {
 // Service provides project detection and setup.
 type Service struct{}
 
+// NewService creates a new project Service.
 func NewService() *Service { return &Service{} }
+
+// GetCurrentProjectRoot returns the current project root path.
+func (s *Service) GetCurrentProjectRoot() string {
+	return GetProjectRoot()
+}
+
+// SetCurrentProjectRoot sets the current project root path.
+func (s *Service) SetCurrentProjectRoot(path string) {
+	SetProjectRoot(path)
+}
 
 var allTypes = []DetectResult{
 	{Type: "maven", DisplayName: "Maven (Java)", Icon: "☕", Description: "mvn dependency:resolve 下载 JAR 依赖", SetupCmd: "mvn dependency:resolve -q"},

@@ -9,9 +9,11 @@ export {
 export {
     APIProviderConfig,
     AgentRunResult,
+    AgentRunResultV2,
     ChatMessage,
     ModelInfo,
     ProviderQuotaInfo,
     SmartRouteResult,
+    TaskAnalysisV2,
     WebProviderInfo
 } from "./models.js";

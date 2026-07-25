@@ -10,6 +10,217 @@ import { Create as $Create } from "/wails/runtime.js";
 import * as time$0 from "../../../../../../time/models.js";
 
 /**
+ * MCPConfig describes an MCP server configuration.
+ */
+export class MCPConfig {
+    "type": MCPTransportType;
+    "command"?: string;
+    "args"?: string[];
+    "url"?: string;
+    "env"?: { [_ in string]?: string };
+    "disabled"?: boolean;
+
+    /** Creates a new MCPConfig instance. */
+    constructor($$source: Partial<MCPConfig> = {}) {
+        if (!("type" in $$source)) {
+            this["type"] = MCPTransportType.$zero;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new MCPConfig instance from a string or object.
+     */
+    static createFrom($$source: any = {}): MCPConfig {
+        const $$createField2_0 = $$createType0;
+        const $$createField4_0 = $$createType1;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("args" in $$parsedSource) {
+            $$parsedSource["args"] = $$createField2_0($$parsedSource["args"]);
+        }
+        if ("env" in $$parsedSource) {
+            $$parsedSource["env"] = $$createField4_0($$parsedSource["env"]);
+        }
+        return new MCPConfig($$parsedSource as Partial<MCPConfig>);
+    }
+}
+
+/**
+ * MCPPromptInfo describes a prompt template exposed by an MCP server.
+ */
+export class MCPPromptInfo {
+    "name": string;
+    "description"?: string;
+    "serverName": string;
+
+    /** Creates a new MCPPromptInfo instance. */
+    constructor($$source: Partial<MCPPromptInfo> = {}) {
+        if (!("name" in $$source)) {
+            this["name"] = "";
+        }
+        if (!("serverName" in $$source)) {
+            this["serverName"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new MCPPromptInfo instance from a string or object.
+     */
+    static createFrom($$source: any = {}): MCPPromptInfo {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new MCPPromptInfo($$parsedSource as Partial<MCPPromptInfo>);
+    }
+}
+
+/**
+ * MCPResourceInfo describes a resource exposed by an MCP server.
+ */
+export class MCPResourceInfo {
+    "uri": string;
+    "name": string;
+    "description"?: string;
+    "mimeType"?: string;
+    "serverName": string;
+
+    /** Creates a new MCPResourceInfo instance. */
+    constructor($$source: Partial<MCPResourceInfo> = {}) {
+        if (!("uri" in $$source)) {
+            this["uri"] = "";
+        }
+        if (!("name" in $$source)) {
+            this["name"] = "";
+        }
+        if (!("serverName" in $$source)) {
+            this["serverName"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new MCPResourceInfo instance from a string or object.
+     */
+    static createFrom($$source: any = {}): MCPResourceInfo {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new MCPResourceInfo($$parsedSource as Partial<MCPResourceInfo>);
+    }
+}
+
+/**
+ * MCPServerConnType represents the connection state.
+ */
+export enum MCPServerConnType {
+    /**
+     * The Go zero value for the underlying type of the enum.
+     */
+    $zero = "",
+
+    MCPConnConnected = "connected",
+    MCPConnFailed = "failed",
+    MCPConnPending = "pending",
+    MCPConnDisabled = "disabled",
+    MCPConnNeedsAuth = "needs-auth",
+};
+
+/**
+ * MCPServerState tracks the state of an MCP server connection.
+ */
+export class MCPServerState {
+    "name": string;
+    "type": MCPServerConnType;
+    "config": MCPConfig;
+    "tools"?: MCPToolInfo[];
+    "error"?: string;
+
+    /** Creates a new MCPServerState instance. */
+    constructor($$source: Partial<MCPServerState> = {}) {
+        if (!("name" in $$source)) {
+            this["name"] = "";
+        }
+        if (!("type" in $$source)) {
+            this["type"] = MCPServerConnType.$zero;
+        }
+        if (!("config" in $$source)) {
+            this["config"] = (new MCPConfig());
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new MCPServerState instance from a string or object.
+     */
+    static createFrom($$source: any = {}): MCPServerState {
+        const $$createField2_0 = $$createType2;
+        const $$createField3_0 = $$createType4;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("config" in $$parsedSource) {
+            $$parsedSource["config"] = $$createField2_0($$parsedSource["config"]);
+        }
+        if ("tools" in $$parsedSource) {
+            $$parsedSource["tools"] = $$createField3_0($$parsedSource["tools"]);
+        }
+        return new MCPServerState($$parsedSource as Partial<MCPServerState>);
+    }
+}
+
+/**
+ * MCPToolInfo describes a tool exposed by an MCP server.
+ */
+export class MCPToolInfo {
+    "name": string;
+    "description": string;
+    "serverName": string;
+    "inputSchema"?: { [_ in string]?: any };
+    "readOnly"?: boolean;
+
+    /** Creates a new MCPToolInfo instance. */
+    constructor($$source: Partial<MCPToolInfo> = {}) {
+        if (!("name" in $$source)) {
+            this["name"] = "";
+        }
+        if (!("description" in $$source)) {
+            this["description"] = "";
+        }
+        if (!("serverName" in $$source)) {
+            this["serverName"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new MCPToolInfo instance from a string or object.
+     */
+    static createFrom($$source: any = {}): MCPToolInfo {
+        const $$createField3_0 = $$createType5;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("inputSchema" in $$parsedSource) {
+            $$parsedSource["inputSchema"] = $$createField3_0($$parsedSource["inputSchema"]);
+        }
+        return new MCPToolInfo($$parsedSource as Partial<MCPToolInfo>);
+    }
+}
+
+/**
+ * MCPTransportType defines the transport protocol for MCP.
+ */
+export enum MCPTransportType {
+    /**
+     * The Go zero value for the underlying type of the enum.
+     */
+    $zero = "",
+
+    MCPTransportStdio = "stdio",
+    MCPTransportHTTP = "http",
+    MCPTransportSSE = "sse",
+    MCPTransportWS = "ws",
+};
+
+/**
  * Message represents a single message in the conversation.
  */
 export class Message {
@@ -65,7 +276,7 @@ export class Message {
      * Creates a new Message instance from a string or object.
      */
     static createFrom($$source: any = {}): Message {
-        const $$createField6_0 = $$createType0;
+        const $$createField6_0 = $$createType5;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("toolArgs" in $$parsedSource) {
             $$parsedSource["toolArgs"] = $$createField6_0($$parsedSource["toolArgs"]);
@@ -124,7 +335,7 @@ export class RalphLoopResult {
      * Creates a new RalphLoopResult instance from a string or object.
      */
     static createFrom($$source: any = {}): RalphLoopResult {
-        const $$createField4_0 = $$createType2;
+        const $$createField4_0 = $$createType7;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("messages" in $$parsedSource) {
             $$parsedSource["messages"] = $$createField4_0($$parsedSource["messages"]);
@@ -148,6 +359,11 @@ export enum RalphVerdict {
 };
 
 // Private type creation functions
-const $$createType0 = $Create.Map($Create.Any, $Create.Any);
-const $$createType1 = Message.createFrom;
-const $$createType2 = $Create.Array($$createType1);
+const $$createType0 = $Create.Array($Create.Any);
+const $$createType1 = $Create.Map($Create.Any, $Create.Any);
+const $$createType2 = MCPConfig.createFrom;
+const $$createType3 = MCPToolInfo.createFrom;
+const $$createType4 = $Create.Array($$createType3);
+const $$createType5 = $Create.Map($Create.Any, $Create.Any);
+const $$createType6 = Message.createFrom;
+const $$createType7 = $Create.Array($$createType6);

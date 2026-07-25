@@ -31,11 +31,25 @@ export function DetectProjectTypes(dirPath: string): $CancellablePromise<$models
 }
 
 /**
+ * GetCurrentProjectRoot returns the current project root path.
+ */
+export function GetCurrentProjectRoot(): $CancellablePromise<string> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/project.Service.GetCurrentProjectRoot");
+}
+
+/**
  * RunSetup executes the setup command for a given project type in the specified directory.
  * Returns combined stdout+stderr output.
  */
 export function RunSetup(dirPath: string, projectType: string): $CancellablePromise<string> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/project.Service.RunSetup", dirPath, projectType);
+}
+
+/**
+ * SetCurrentProjectRoot sets the current project root path.
+ */
+export function SetCurrentProjectRoot(path: string): $CancellablePromise<void> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/project.Service.SetCurrentProjectRoot", path);
 }
 
 // Private type creation functions

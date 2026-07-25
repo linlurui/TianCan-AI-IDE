@@ -162,18 +162,20 @@ go build -tags production -o tiancan-ai-ide .
 - 多语言断点调试（Go / Python / JS / C++ / Java / Dart，DAP 协议）
 - Git 版本控制（提交、分支、Diff、历史、Stage/Unstage）
 - AI Agent TAOR 主循环 + RalphLoop 自纠错
+- AgentV2 增强版（分析/规划/执行分离）
 - 40+ 工具集（文件/搜索/LSP/Git/测试/DB/API/部署/沙箱）
 - TaskClassifier 意图分类 + 10 角色自动路由
-- Smart Router 基础框架（任务分类 + 失败降级）
+- Smart Router 硬件感知（任务分类 + 失败降级 + GPU 感知）
 - MCP Client/Server（Resources / Tools / Prompts）
 - Web AI Provider（DeepSeek / ChatGPT 等浏览器接入）
-- 进程级沙箱 + 容器级沙箱（Daytona / Docker）
+- 进程级沙箱 + 容器级沙箱（Daytona / Docker / E2B 可选）
+- 沙箱 Provider 抽象层（多后端切换）
 - Human Review（Diff 审查 + 高危操作确认）
 - AI 自我验证（generate_tests + assess_completion）
 - 配置系统（TIANCAN.md + @include + 规则目录）
 - 记忆系统（MemoryStore + ContextWindow + AdvancedCompactor）
 - 并行执行（DAGExecutor + ResultAggregator）
-- 回滚管理（RollbackManager）
+- 回滚管理（RollbackManager）+ 检查点系统
 - 技能系统（Skill Manager + `.skill.yaml`）
 - 数据库管理（SQLite / MySQL / PostgreSQL）
 - API 测试面板
@@ -189,14 +191,15 @@ go build -tags production -o tiancan-ai-ide .
 - 部署工具（SSH/SCP 上传）
 - 运行环境自动检测 + 多配置切换
 - 全局搜索面板
+- WebSearchTool 多引擎搜索（SearXNG/Bing/DuckDuckGo，分页/排序/时间范围）
+- 子 Agent Worktree 隔离（并行任务独立分支）
+- AutoResearch AI 驱动研究闭环（假设生成→实验→验证）
 
 ### 🚧 进行中 / 规划中
 
-- WebSearchTool 全搜索结果（当前仅 DuckDuckGo 即时答案，缺完整搜索、分页排序）
-- 技能市场（社区技能导入/导出/共享、技能验证沙箱、技能依赖解析）
-- 容器沙箱 E2B 集成 + 沙箱 Provider 抽象层（Daytona / Docker / E2B 可选）
 - 多窗口独立面板（编辑器 / 终端 / AI / 调试各自独立窗口）
 - 团队协作功能
+- 技能市场（社区技能导入/导出/共享）
 
 ---
 

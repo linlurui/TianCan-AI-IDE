@@ -5,6 +5,13 @@
 // @ts-ignore: Unused imports
 import { Create as $Create } from "/wails/runtime.js";
 
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore: Unused imports
+import * as agent$0 from "../agent/models.js";
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore: Unused imports
+import * as types$0 from "../agent/types/models.js";
+
 /**
  * APIProviderConfig stores credentials for a remote API provider.
  */
@@ -75,6 +82,57 @@ export class AgentRunResult {
             $$parsedSource["messages"] = $$createField0_0($$parsedSource["messages"]);
         }
         return new AgentRunResult($$parsedSource as Partial<AgentRunResult>);
+    }
+}
+
+/**
+ * AgentRunResultV2 是 AgentV2 执行结果的返回类型
+ */
+export class AgentRunResultV2 {
+    "messages": agent$0.Message[];
+    "done": boolean;
+    "error"?: string;
+    "durationMs": number;
+    "agentType"?: string;
+    "totalTokens": number;
+    "hasRollback": boolean;
+    "taskAnalysis"?: TaskAnalysisV2;
+
+    /** Creates a new AgentRunResultV2 instance. */
+    constructor($$source: Partial<AgentRunResultV2> = {}) {
+        if (!("messages" in $$source)) {
+            this["messages"] = [];
+        }
+        if (!("done" in $$source)) {
+            this["done"] = false;
+        }
+        if (!("durationMs" in $$source)) {
+            this["durationMs"] = 0;
+        }
+        if (!("totalTokens" in $$source)) {
+            this["totalTokens"] = 0;
+        }
+        if (!("hasRollback" in $$source)) {
+            this["hasRollback"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new AgentRunResultV2 instance from a string or object.
+     */
+    static createFrom($$source: any = {}): AgentRunResultV2 {
+        const $$createField0_0 = $$createType3;
+        const $$createField7_0 = $$createType4;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("messages" in $$parsedSource) {
+            $$parsedSource["messages"] = $$createField0_0($$parsedSource["messages"]);
+        }
+        if ("taskAnalysis" in $$parsedSource) {
+            $$parsedSource["taskAnalysis"] = $$createField7_0($$parsedSource["taskAnalysis"]);
+        }
+        return new AgentRunResultV2($$parsedSource as Partial<AgentRunResultV2>);
     }
 }
 
@@ -265,6 +323,46 @@ export class SmartRouteResult {
 }
 
 /**
+ * TaskAnalysisV2 包含 AgentV2 的任务分析结果
+ */
+export class TaskAnalysisV2 {
+    "primaryRole": string;
+    "complexity": string;
+    "estimatedTurns": number;
+    "isRoutable": boolean;
+    "subtaskCount": number;
+
+    /** Creates a new TaskAnalysisV2 instance. */
+    constructor($$source: Partial<TaskAnalysisV2> = {}) {
+        if (!("primaryRole" in $$source)) {
+            this["primaryRole"] = "";
+        }
+        if (!("complexity" in $$source)) {
+            this["complexity"] = "";
+        }
+        if (!("estimatedTurns" in $$source)) {
+            this["estimatedTurns"] = 0;
+        }
+        if (!("isRoutable" in $$source)) {
+            this["isRoutable"] = false;
+        }
+        if (!("subtaskCount" in $$source)) {
+            this["subtaskCount"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new TaskAnalysisV2 instance from a string or object.
+     */
+    static createFrom($$source: any = {}): TaskAnalysisV2 {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new TaskAnalysisV2($$parsedSource as Partial<TaskAnalysisV2>);
+    }
+}
+
+/**
  * WebProviderInfo is a simplified provider info for the frontend.
  */
 export class WebProviderInfo {
@@ -299,3 +397,6 @@ export class WebProviderInfo {
 // Private type creation functions
 const $$createType0 = ChatMessage.createFrom;
 const $$createType1 = $Create.Array($$createType0);
+const $$createType2 = types$0.Message.createFrom;
+const $$createType3 = $Create.Array($$createType2);
+const $$createType4 = TaskAnalysisV2.createFrom;

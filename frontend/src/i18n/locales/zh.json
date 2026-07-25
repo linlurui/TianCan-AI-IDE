@@ -15,7 +15,8 @@
     "extensions": "扩展",
     "outline": "大纲",
     "callhierarchy": "调用层次",
-    "remote": "远程"
+    "remote": "远程",
+    "changes": "AI 修改"
   },
   "action": {
     "openFolder": "打开文件夹",
@@ -479,7 +480,33 @@
     "currentProvider": "当前使用",
     "connectionSuccess": "连接成功",
     "connectionFailed": "连接失败",
-    "testConnection": "测试连接"
+    "testConnection": "测试连接",
+    "mcp": {
+      "title": "MCP 服务器",
+      "hint": "配置 MCP（Model Context Protocol）服务器以扩展 AI 功能，支持自定义工具、资源和提示词。",
+      "loading": "正在加载 MCP 服务器…",
+      "empty": "暂无 MCP 服务器配置。点击「添加服务器」来添加。",
+      "transport": "传输方式",
+      "command": "命令",
+      "args": "参数",
+      "url": "URL 地址",
+      "tools": "工具",
+      "error": "错误",
+      "connect": "连接",
+      "disconnect": "断开",
+      "enable": "启用服务器",
+      "disable": "禁用服务器",
+      "delete": "删除服务器",
+      "addServer": "添加服务器",
+      "add": "添加",
+      "cancel": "取消",
+      "serverName": "服务器名称",
+      "serverNamePlaceholder": "例如：filesystem、git、database",
+      "transportType": "传输类型",
+      "argsPlaceholder": "用空格分隔，例如：-y @modelcontextprotocol/server-filesystem ./data",
+      "quickActions": "快捷操作",
+      "refresh": "刷新服务器"
+    }
   },
   "lsp": {
     "installing": "正在安装 {{name}}…",

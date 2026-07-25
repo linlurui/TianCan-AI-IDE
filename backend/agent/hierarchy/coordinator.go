@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -221,6 +223,16 @@ func (c *Coordinator) SetProgressChannel(ch chan SubAgentProgress) {
 	c.progressCh = ch
 }
 
+// GetWorktreeManager 返回 worktree 管理器实例
+func (c *Coordinator) GetWorktreeManager() *WorktreeManager {
+	return c.worktreeManager
+}
+
+// SetWorktreeManager 设置自定义的 worktree 管理器
+func (c *Coordinator) SetWorktreeManager(wtm *WorktreeManager) {
+	c.worktreeManager = wtm
+}
+
 // emitProgress sends a progress update if a channel is configured.
 func (c *Coordinator) emitProgress(p SubAgentProgress) {
 	if c.progressCh != nil {
@@ -357,18 +369,18 @@ func (c *Coordinator) SpawnAgent(ctx context.Context, config AgentSpawnConfig) (
 	// Worktree isolation: create worktree if requested
 	worktreeDir := ""
 	worktreeBranch := ""
-	if config.Isolation == "worktree" {
+	if config.Isolation == "worktree" && c.worktreeManager != nil {
 		worktreeBranch = fmt.Sprintf("agent-%d", time.Now().UnixNano())
-		dir, err := c.CreateWorktree(worktreeBranch)
+		state, err := c.worktreeManager.CreateWorktree(agentID, worktreeBranch)
 		if err != nil {
 			// Worktree creation failed — proceed without isolation
 			worktreeBranch = ""
 		} else {
-			worktreeDir = dir
+			worktreeDir = state.Path
 			defer func() {
 				// Auto-cleanup worktree after agent finishes
-				if worktreeDir != "" {
-					c.RemoveWorktree(worktreeDir)
+				if worktreeDir != "" && c.worktreeManager != nil {
+					c.worktreeManager.RemoveWorktree(worktreeBranch, true)
 				}
 			}()
 		}
@@ -473,10 +485,28 @@ func (c *Coordinator) SpawnAgent(ctx context.Context, config AgentSpawnConfig) (
 	}
 
 	// If worktree was used, merge results back
-	if worktreeBranch != "" {
-		if err := c.MergeWorktree(worktreeBranch); err != nil {
-			// Merge failed — report but don't fail the agent
-			finalOutput += fmt.Sprintf("\n\n⚠ Worktree merge failed: %v", err)
+	if worktreeBranch != "" && c.worktreeManager != nil {
+		if err := c.worktreeManager.MergeWorktree(worktreeBranch); err != nil {
+			// Check if it's a conflict error
+			if conflictErr, ok := err.(*WorktreeConflictError); ok {
+				// 自动解决简单冲突：使用 worktree 版本
+				finalOutput += fmt.Sprintf("\n\n⚠ 检测到合并冲突: %v", conflictErr.Message)
+				finalOutput += "\n尝试自动解决冲突（使用 worktree 版本）..."
+
+				// 强制使用 worktree 版本
+				cmd := exec.Command("git", "checkout", "--theirs", ".")
+				cmd.Dir = c.rootPath
+				cmd.Run()
+
+				// 标记冲突文件为已解决
+				cmd = exec.Command("git", "add", "-A")
+				cmd.Dir = c.rootPath
+				cmd.Run()
+
+				finalOutput += "\n✓ 冲突已自动解决"
+			} else {
+				finalOutput += fmt.Sprintf("\n\n⚠ Worktree merge failed: %v", err)
+			}
 		}
 	}
 
@@ -650,19 +680,263 @@ type WorktreeState struct {
 
 // WorktreeManager 管理所有 worktree 的生命周期
 type WorktreeManager struct {
-	mu        sync.RWMutex
-	worktrees map[string]*WorktreeState
-	basePath  string
+	mu               sync.RWMutex
+	worktrees        map[string]*WorktreeState
+	gitRoot          string              // Git 仓库根目录
+	worktreeRoot     string              // Worktree 存储目录
+	maxParallel      int                 // 最大并行 worktree 数量
+	activeCount      int                 // 当前活跃的 worktree 数量
+	conflictResolver ConflictResolver    // 冲突解决策略
+}
+
+// ConflictResolver 定义冲突解决策略接口
+type ConflictResolver interface {
+	ResolveConflict(localContent, remoteContent, baseContent string) (string, error)
+}
+
+// DefaultConflictResolver 默认的冲突解决策略
+type DefaultConflictResolver struct{}
+
+// ResolveConflict 简单的三路合并
+func (d *DefaultConflictResolver) ResolveConflict(local, remote, base string) (string, error) {
+	// 如果 local 或 remote 与 base 相同，选择变化的那个
+	if local == base {
+		return remote, nil
+	}
+	if remote == base {
+		return local, nil
+	}
+	// 两者都有变化，返回 local（优先子 agent 的修改）
+	return local, nil
+}
+
+// AutoMergeConflictResolver 自动合并冲突解决策略
+type AutoMergeConflictResolver struct {
+	preference string // "local" 或 "remote"
+}
+
+// ResolveConflict 根据偏好解决冲突
+func (a *AutoMergeConflictResolver) ResolveConflict(local, remote, base string) (string, error) {
+	if a.preference == "remote" {
+		if remote != base {
+			return remote, nil
+		}
+		return local, nil
+	}
+	// 默认 local
+	if local != base {
+		return local, nil
+	}
+	return remote, nil
+}
+
+// SetConflictResolver 设置冲突解决策略
+func (wtm *WorktreeManager) SetConflictResolver(resolver ConflictResolver) {
+	wtm.mu.Lock()
+	defer wtm.mu.Unlock()
+	wtm.conflictResolver = resolver
 }
 
 // NewWorktreeManager 创建 worktree 管理器
 func NewWorktreeManager(basePath string) *WorktreeManager {
+	gitRoot := basePath // 假设 basePath 就是 git 根目录
 	worktreeRoot := filepath.Join(basePath, ".tiancan", "worktrees")
 	os.MkdirAll(worktreeRoot, 0755)
 	return &WorktreeManager{
-		worktrees: make(map[string]*WorktreeState),
-		basePath:  worktreeRoot,
+		worktrees:    make(map[string]*WorktreeState),
+		gitRoot:      gitRoot,
+		worktreeRoot: worktreeRoot,
+		maxParallel: 4, // 默认最多 4 个并行 worktree
 	}
+}
+
+// SetMaxParallel 设置最大并行 worktree 数量
+func (wtm *WorktreeManager) SetMaxParallel(max int) {
+	wtm.mu.Lock()
+	defer wtm.mu.Unlock()
+	if max > 0 && max <= 16 {
+		wtm.maxParallel = max
+	}
+}
+
+// CanCreateWorktree 检查是否可以创建新的 worktree
+func (wtm *WorktreeManager) CanCreateWorktree() bool {
+	wtm.mu.RLock()
+	defer wtm.mu.RUnlock()
+	return wtm.activeCount < wtm.maxParallel
+}
+
+// GetActiveCount 获取当前活跃的 worktree 数量
+func (wtm *WorktreeManager) GetActiveCount() int {
+	wtm.mu.RLock()
+	defer wtm.mu.RUnlock()
+	return wtm.activeCount
+}
+
+// SetGitRoot 设置 git 仓库根目录
+func (wtm *WorktreeManager) SetGitRoot(path string) {
+	wtm.mu.Lock()
+	defer wtm.mu.Unlock()
+	wtm.gitRoot = path
+	// 更新 worktree 根目录
+	wtm.worktreeRoot = filepath.Join(path, ".tiancan", "worktrees")
+	os.MkdirAll(wtm.worktreeRoot, 0755)
+}
+
+// WorktreeLifecycleManager 管理 worktree 生命周期
+type WorktreeLifecycleManager struct {
+	manager          *WorktreeManager
+	mu               sync.Mutex
+	lifecycles       map[string]*WorktreeLifecycle
+	cleanupInterval  time.Duration
+	maxAge           time.Duration
+	stopCh           chan struct{}
+	emulatorRunning  bool
+}
+
+// WorktreeLifecycle 跟踪单个 worktree 的生命周期
+type WorktreeLifecycle struct {
+	WorktreeID     string
+	AgentID        string
+	CreatedAt      time.Time
+	LastActivityAt time.Time
+	Status         string // "active", "idle", "cleanup_pending", "cleaned"
+	ResourceUsage  ResourceUsage
+}
+
+// ResourceUsage 资源使用情况
+type ResourceUsage struct {
+	FilesChanged int
+	LinesAdded   int
+	LinesRemoved int
+}
+
+// NewWorktreeLifecycleManager 创建生命周期管理器
+func NewWorktreeLifecycleManager(mgr *WorktreeManager) *WorktreeLifecycleManager {
+	return &WorktreeLifecycleManager{
+		manager:         mgr,
+		lifecycles:      make(map[string]*WorktreeLifecycle),
+		cleanupInterval: 30 * time.Second,
+		maxAge:          10 * time.Minute, // 10分钟无活动则清理
+		stopCh:          make(chan struct{}),
+	}
+}
+
+// Start 启动生命周期管理
+func (lcm *WorktreeLifecycleManager) Start() {
+	lcm.mu.Lock()
+	if lcm.emulatorRunning {
+		lcm.mu.Unlock()
+		return
+	}
+	lcm.emulatorRunning = true
+	lcm.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(lcm.cleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				lcm.cleanupIdleWorktrees()
+			case <-lcm.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+// Stop 停止生命周期管理
+func (lcm *WorktreeLifecycleManager) Stop() {
+	lcm.mu.Lock()
+	defer lcm.mu.Unlock()
+	if lcm.emulatorRunning {
+		close(lcm.stopCh)
+		lcm.emulatorRunning = false
+		lcm.stopCh = make(chan struct{})
+	}
+}
+
+// Register 注册一个新的 worktree 生命周期
+func (lcm *WorktreeLifecycleManager) Register(worktreeID, agentID string) {
+	lcm.mu.Lock()
+	defer lcm.mu.Unlock()
+	lcm.lifecycles[worktreeID] = &WorktreeLifecycle{
+		WorktreeID:     worktreeID,
+		AgentID:        agentID,
+		CreatedAt:      time.Now(),
+		LastActivityAt: time.Now(),
+		Status:         "active",
+	}
+}
+
+// UpdateActivity 更新 worktree 活动状态
+func (lcm *WorktreeLifecycleManager) UpdateActivity(worktreeID string) {
+	lcm.mu.Lock()
+	defer lcm.mu.Unlock()
+	if lc, ok := lcm.lifecycles[worktreeID]; ok {
+		lc.LastActivityAt = time.Now()
+		if lc.Status == "idle" {
+			lc.Status = "active"
+		}
+	}
+}
+
+// MarkIdle 标记 worktree 为空闲状态
+func (lcm *WorktreeLifecycleManager) MarkIdle(worktreeID string) {
+	lcm.mu.Lock()
+	defer lcm.mu.Unlock()
+	if lc, ok := lcm.lifecycles[worktreeID]; ok {
+		lc.Status = "idle"
+	}
+}
+
+// cleanupIdleWorktrees 清理空闲的 worktrees
+func (lcm *WorktreeLifecycleManager) cleanupIdleWorktrees() {
+	lcm.mu.Lock()
+	defer lcm.mu.Unlock()
+
+	now := time.Now()
+	var toClean []string
+
+	for id, lc := range lcm.lifecycles {
+		if lc.Status == "cleanup_pending" || (lc.Status == "idle" && now.Sub(lc.LastActivityAt) > lcm.maxAge) {
+			toClean = append(toClean, id)
+		}
+	}
+
+	for _, id := range toClean {
+		if err := lcm.manager.RemoveWorktree(id, true); err == nil {
+			delete(lcm.lifecycles, id)
+		}
+	}
+}
+
+// GetStats 返回生命周期统计信息
+func (lcm *WorktreeLifecycleManager) GetStats() map[string]interface{} {
+	lcm.mu.Lock()
+	defer lcm.mu.Unlock()
+
+	stats := map[string]interface{}{
+		"total":       len(lcm.lifecycles),
+		"active":      0,
+		"idle":        0,
+		"cleanup":     0,
+		"maxAge":      lcm.maxAge.String(),
+		"activeCount": lcm.manager.GetActiveCount(),
+	}
+
+	for _, lc := range lcm.lifecycles {
+		switch lc.Status {
+		case "active":
+			stats["active"] = stats["active"].(int) + 1
+		case "idle":
+			stats["idle"] = stats["idle"].(int) + 1
+		case "cleanup_pending":
+			stats["cleanup"] = stats["cleanup"].(int) + 1
+		}
+	}
+	return stats
 }
 
 // CreateWorktree 创建一个新的隔离 worktree
@@ -670,7 +944,12 @@ func (wtm *WorktreeManager) CreateWorktree(agentID, branchName string) (*Worktre
 	wtm.mu.Lock()
 	defer wtm.mu.Unlock()
 
-	worktreeDir := filepath.Join(wtm.basePath, branchName)
+	// 检查并行限制
+	if wtm.activeCount >= wtm.maxParallel {
+		return nil, fmt.Errorf("maximum parallel worktrees (%d) reached", wtm.maxParallel)
+	}
+
+	worktreeDir := filepath.Join(wtm.worktreeRoot, branchName)
 	state := &WorktreeState{
 		ID:        branchName,
 		Branch:    branchName,
@@ -680,20 +959,21 @@ func (wtm *WorktreeManager) CreateWorktree(agentID, branchName string) (*Worktre
 		ParentID:  agentID,
 	}
 
-	// Try git worktree add
+	// Try git worktree add - 从 git 根目录执行
 	cmd := exec.Command("git", "worktree", "add", worktreeDir, "-b", branchName)
-	cmd.Dir = wtm.basePath
+	cmd.Dir = wtm.gitRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// If branch already exists, try without -b
 		cmd = exec.Command("git", "worktree", "add", worktreeDir, branchName)
-		cmd.Dir = wtm.basePath
+		cmd.Dir = wtm.gitRoot
 		output, err = cmd.CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("git worktree add failed: %s", string(output[:min(len(output), 300)]))
 		}
 	}
 	wtm.worktrees[branchName] = state
+	wtm.activeCount++
 	return state, nil
 }
 
@@ -705,7 +985,7 @@ func (wtm *WorktreeManager) RemoveWorktree(branchName string, force bool) error 
 	state, ok := wtm.worktrees[branchName]
 	if !ok {
 		// Worktree not managed, try direct removal
-		worktreeDir := filepath.Join(wtm.basePath, branchName)
+		worktreeDir := filepath.Join(wtm.worktreeRoot, branchName)
 		return wtm.removeWorktreeDir(worktreeDir, force)
 	}
 
@@ -717,7 +997,57 @@ func (wtm *WorktreeManager) RemoveWorktree(branchName string, force bool) error 
 		return err
 	}
 	delete(wtm.worktrees, branchName)
+	if wtm.activeCount > 0 {
+		wtm.activeCount--
+	}
 	return nil
+}
+
+// PreMergeCheck 在合并前检查是否会产生冲突
+func (wtm *WorktreeManager) PreMergeCheck(branchName string) (bool, []string, error) {
+	wtm.mu.RLock()
+	_, ok := wtm.worktrees[branchName]
+	wtm.mu.RUnlock()
+
+	if !ok {
+		return false, nil, fmt.Errorf("worktree %s not found", branchName)
+	}
+
+	// 获取分支与 HEAD 的差异文件列表
+	cmd := exec.Command("git", "diff", "--name-only", "HEAD", branchName)
+	cmd.Dir = wtm.gitRoot
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to get diff: %s", string(output))
+	}
+
+	changedFiles := strings.Split(strings.TrimSpace(string(output)), "\n")
+
+	// 检查这些文件在当前 HEAD 中是否有未提交的更改
+	cmd = exec.Command("git", "diff", "--name-only", "HEAD")
+	cmd.Dir = wtm.gitRoot
+	localOutput, err := cmd.CombinedOutput()
+	if err == nil {
+		localChanges := strings.Split(strings.TrimSpace(string(localOutput)), "\n")
+		localChangeSet := make(map[string]bool)
+		for _, f := range localChanges {
+			localChangeSet[f] = true
+		}
+
+		// 找出可能冲突的文件
+		var potentialConflicts []string
+		for _, f := range changedFiles {
+			if f != "" && localChangeSet[f] {
+				potentialConflicts = append(potentialConflicts, f)
+			}
+		}
+
+		if len(potentialConflicts) > 0 {
+			return true, potentialConflicts, nil
+		}
+	}
+
+	return false, nil, nil
 }
 
 // removeWorktreeDir 执行实际的 worktree 移除
@@ -727,7 +1057,7 @@ func (wtm *WorktreeManager) removeWorktreeDir(worktreeDir string, force bool) er
 		args = append(args, "--force")
 	}
 	cmd := exec.Command("git", args...)
-	cmd.Dir = wtm.basePath
+	cmd.Dir = wtm.gitRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git worktree remove failed: %s", string(output[:min(len(output), 300)]))
@@ -746,7 +1076,7 @@ func (wtm *WorktreeManager) MergeWorktree(branchName string) error {
 
 	// 检查是否有冲突
 	cmd := exec.Command("git", "merge", "--no-commit", "--no-ff", branchName)
-	cmd.Dir = wtm.basePath
+	cmd.Dir = wtm.gitRoot
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -768,7 +1098,7 @@ func (wtm *WorktreeManager) MergeWorktree(branchName string) error {
 
 	// 完成合并
 	cmd = exec.Command("git", "commit", "-m", fmt.Sprintf("Merge worktree %s", branchName))
-	cmd.Dir = wtm.basePath
+	cmd.Dir = wtm.gitRoot
 	if _, err := cmd.CombinedOutput(); err != nil {
 		// 如果没有实际更改，abort 合并
 		exec.Command("git", "merge", "--abort").Run()
@@ -783,8 +1113,198 @@ func (wtm *WorktreeManager) MergeWorktree(branchName string) error {
 	wtm.mu.Unlock()
 
 	// 移除 worktree
-	wtm.RemoveWorktree(branchName, true)
+	wtm.RemoveWorktree(branchName, false)
 	return nil
+}
+
+// AutoMergeWithConflictResolution 尝试自动合并并解决冲突
+func (wtm *WorktreeManager) AutoMergeWithConflictResolution(branchName string) (bool, []string, error) {
+	wtm.mu.Lock()
+	state, ok := wtm.worktrees[branchName]
+	if ok {
+		state.Status = "merging"
+	}
+	wtm.mu.Unlock()
+
+	// 尝试合并
+	cmd := exec.Command("git", "merge", "--no-commit", "--no-ff", branchName)
+	cmd.Dir = wtm.gitRoot
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		// 检查是否是冲突
+		if strings.Contains(string(output), "conflict") || strings.Contains(string(output), "CONFLICT") {
+			// 获取冲突文件列表
+			conflictFiles, _ := wtm.GetCurrentConflictedFiles()
+
+			// 尝试自动解决冲突
+			resolvedFiles, resolveErr := wtm.AutoResolveConflicts(conflictFiles)
+			if resolveErr != nil {
+				// 自动解决失败，abort
+				exec.Command("git", "merge", "--abort").Run()
+				return false, conflictFiles, resolveErr
+			}
+
+			// 尝试完成合并
+			cmd = exec.Command("git", "commit", "-m", fmt.Sprintf("Merge worktree %s (auto-resolved conflicts)", branchName))
+			cmd.Dir = wtm.gitRoot
+			if _, commitErr := cmd.CombinedOutput(); commitErr != nil {
+				exec.Command("git", "merge", "--abort").Run()
+				return false, conflictFiles, fmt.Errorf("auto-resolve failed: %s", commitErr)
+			}
+
+			return true, resolvedFiles, nil
+		}
+		return false, nil, fmt.Errorf("merge failed: %s", string(output[:min(len(output), 300)]))
+	}
+
+	// 无冲突完成合并
+	cmd = exec.Command("git", "commit", "-m", fmt.Sprintf("Merge worktree %s", branchName))
+	cmd.Dir = wtm.gitRoot
+	if _, err := cmd.CombinedOutput(); err != nil {
+		exec.Command("git", "merge", "--abort").Run()
+		return false, nil, fmt.Errorf("commit failed: %s", err)
+	}
+
+	// 清理 worktree
+	wtm.RemoveWorktree(branchName, false)
+	return true, nil, nil
+}
+
+// GetCurrentConflictedFiles 获取当前工作目录中有冲突的文件列表
+func (wtm *WorktreeManager) GetCurrentConflictedFiles() ([]string, error) {
+	cmd := exec.Command("git", "diff", "--nameOnly", "--diff-filter=U")
+	cmd.Dir = wtm.gitRoot
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get conflicted files: %s", string(output))
+	}
+
+	files := strings.Split(strings.TrimSpace(string(output)), "\n")
+	var result []string
+	for _, f := range files {
+		if f != "" {
+			result = append(result, f)
+		}
+	}
+	return result, nil
+}
+
+// AutoResolveConflicts 尝试自动解决冲突文件
+func (wtm *WorktreeManager) AutoResolveConflicts(conflictFiles []string) ([]string, error) {
+	var resolved []string
+	for _, file := range conflictFiles {
+		if err := wtm.resolveConflictFile(file); err == nil {
+			resolved = append(resolved, file)
+		}
+	}
+	if len(resolved) == 0 && len(conflictFiles) > 0 {
+		return nil, fmt.Errorf("failed to auto-resolve any conflicts")
+	}
+	return resolved, nil
+}
+
+// resolveConflictFile 解决单个冲突文件
+func (wtm *WorktreeManager) resolveConflictFile(filePath string) error {
+	filePath = filepath.Join(wtm.gitRoot, filePath)
+
+	// 读取冲突文件
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	// 简单的冲突标记解析
+	resolved := wtm.extractResolvedContent(string(content))
+
+	// 写入解决后的内容
+	return os.WriteFile(filePath, []byte(resolved), 0644)
+}
+
+// extractResolvedContent 从冲突文件中提取解决后的内容
+func (wtm *WorktreeManager) extractResolvedContent(content string) string {
+	// 使用默认冲突解决策略
+	resolver := wtm.conflictResolver
+	if resolver == nil {
+		resolver = &DefaultConflictResolver{}
+	}
+
+	var result strings.Builder
+	lines := strings.Split(content, "\n")
+	inConflict := false
+	var localLines, remoteLines, baseLines []string
+	var currentSection string
+
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "<<<<<<<"):
+			inConflict = true
+			currentSection = "local"
+			localLines = nil
+		case strings.HasPrefix(line, "|||||||"):
+			currentSection = "base"
+			baseLines = nil
+		case strings.HasPrefix(line, "======="):
+			currentSection = "remote"
+		case strings.HasPrefix(line, ">>>>>>>"):
+			// 解决冲突
+			resolved, err := resolver.ResolveConflict(
+				strings.Join(localLines, "\n"),
+				strings.Join(remoteLines, "\n"),
+				strings.Join(baseLines, "\n"),
+			)
+			if err == nil {
+				result.WriteString(resolved)
+			} else {
+				// 回退：使用 ours (local)
+				result.WriteString(strings.Join(localLines, "\n"))
+			}
+			inConflict = false
+		default:
+			if inConflict {
+				switch currentSection {
+				case "local":
+					localLines = append(localLines, line)
+				case "base":
+					baseLines = append(baseLines, line)
+				case "remote":
+					remoteLines = append(remoteLines, line)
+				}
+			} else {
+				result.WriteString(line)
+				result.WriteString("\n")
+			}
+		}
+	}
+
+	return result.String()
+}
+
+// ResolveConflicts 尝试解决 worktree 合并时的冲突
+// 返回解决的冲突数和是否成功
+func (wtm *WorktreeManager) ResolveConflicts(branchName string) (int, bool, error) {
+	conflictFiles, err := wtm.GetCurrentConflictedFiles()
+	if err != nil {
+		return 0, false, err
+	}
+
+	if len(conflictFiles) == 0 {
+		return 0, true, nil // 没有冲突
+	}
+
+	resolved, err := wtm.AutoResolveConflicts(conflictFiles)
+	if err != nil {
+		return 0, false, err
+	}
+
+	// 添加已解决的冲突文件到 git
+	for _, f := range resolved {
+		cmd := exec.Command("git", "add", f)
+		cmd.Dir = wtm.gitRoot
+		cmd.Run()
+	}
+
+	return len(resolved), len(resolved) == len(conflictFiles), nil
 }
 
 // GetWorktreeState 获取 worktree 状态
@@ -807,6 +1327,144 @@ func (wtm *WorktreeManager) ListWorktrees() []*WorktreeState {
 	return states
 }
 
+// WorktreeConflictError 描述 worktree 合并冲突
+type WorktreeConflictError struct {
+	BranchName string
+	Output     string
+	Message    string
+}
+
+func (e *WorktreeConflictError) Error() string {
+	return fmt.Sprintf("worktree conflict in %s: %s", e.BranchName, e.Message)
+}
+
+// GetConflicts 获取冲突文件列表
+func (e *WorktreeConflictError) GetConflicts() []string {
+	var conflicts []string
+	for _, line := range strings.Split(e.Output, "\n") {
+		if strings.Contains(line, "CONFLICT") || strings.Contains(line, "<<<<<<<") {
+			// 提取冲突文件路径
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				conflicts = append(conflicts, strings.TrimSpace(parts[len(parts)-1]))
+			}
+		}
+	}
+	return conflicts
+}
+
+// GetConflictedFiles 获取冲突文件列表
+func (wtm *WorktreeManager) AbortMerge(branchName string) error {
+	wtm.mu.Lock()
+	defer wtm.mu.Unlock()
+
+	// 中止 git 合并
+	cmd := exec.Command("git", "merge", "--abort")
+	cmd.Dir = wtm.gitRoot
+	if _, err := cmd.CombinedOutput(); err != nil {
+		// 合并可能已经中止，这通常是正常的
+	}
+
+	state, ok := wtm.worktrees[branchName]
+	if ok {
+		state.Status = "active"
+	}
+	return nil
+}
+
+// GetWorktreeChanges 获取 worktree 相对于主分支的更改统计
+func (wtm *WorktreeManager) GetWorktreeChanges(branchName string) (int, int, error) {
+	wtm.mu.RLock()
+	_, ok := wtm.worktrees[branchName]
+	wtm.mu.RUnlock()
+
+	if !ok {
+		return 0, 0, fmt.Errorf("worktree %s not found", branchName)
+	}
+
+	// 获取文件变更统计
+	cmd := exec.Command("git", "diff", "--stat", "HEAD", branchName)
+	cmd.Dir = wtm.gitRoot
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get diff stat: %s", string(output))
+	}
+
+	// 解析输出获取文件数量和行数
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	var filesChanged, insertions, deletions int
+
+	for _, line := range lines {
+		// 解析 " path | N insertions(+), M deletions(-)" 格式
+		if strings.Contains(line, " insertions(+),") || strings.Contains(line, " deletions(-)") {
+			parts := strings.Split(line, "|")
+			if len(parts) >= 2 {
+				stats := strings.TrimSpace(parts[1])
+				// 提取数字
+				re := regexp.MustCompile(`(\d+)`)
+				nums := re.FindAllString(stats, -1)
+				if len(nums) >= 2 {
+					filesChanged++
+					if v, _ := strconv.Atoi(nums[0]); v > 0 {
+						insertions += v
+					}
+					if len(nums) >= 2 {
+						if v, _ := strconv.Atoi(nums[1]); v > 0 {
+							deletions += v
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return filesChanged, insertions + deletions, nil
+}
+
+// CleanupStaleWorktrees 清理孤立的 worktree 目录
+func (wtm *WorktreeManager) CleanupStaleWorktrees() ([]string, error) {
+	wtm.mu.Lock()
+	defer wtm.mu.Unlock()
+
+	var cleaned []string
+
+	// 列出所有 worktree 目录
+	entries, err := os.ReadDir(wtm.worktreeRoot)
+	if err != nil {
+		return cleaned, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		branchName := entry.Name()
+		// 检查是否在管理列表中
+		if _, managed := wtm.worktrees[branchName]; managed {
+			continue
+		}
+
+		// 检查目录是否孤立（不在 git worktree list 中）
+		worktreeDir := filepath.Join(wtm.worktreeRoot, branchName)
+		cmd := exec.Command("git", "worktree", "list")
+		cmd.Dir = wtm.gitRoot
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			continue
+		}
+
+		if !strings.Contains(string(output), worktreeDir) {
+			// 孤立的 worktree，尝试清理
+			if err := os.RemoveAll(worktreeDir); err == nil {
+				cleaned = append(cleaned, branchName)
+			}
+		}
+	}
+
+	return cleaned, nil
+}
+
 // ListConflicted 返回所有有冲突的 worktrees
 func (wtm *WorktreeManager) ListConflicted() []*WorktreeState {
 	wtm.mu.RLock()
@@ -821,8 +1479,8 @@ func (wtm *WorktreeManager) ListConflicted() []*WorktreeState {
 	return conflicted
 }
 
-// ResolveConflicts 解决 worktree 合并冲突
-func (wtm *WorktreeManager) ResolveConflicts(branchName string, resolution string) error {
+// ResolveConflictsManually 手动解决 worktree 合并冲突（接受 ours/theirs/abort）
+func (wtm *WorktreeManager) ResolveConflictsManually(branchName string, resolution string) error {
 	wtm.mu.Lock()
 	state, ok := wtm.worktrees[branchName]
 	if !ok {
@@ -838,19 +1496,19 @@ func (wtm *WorktreeManager) ResolveConflicts(branchName string, resolution strin
 	switch resolution {
 	case "accept-ours":
 		cmd := exec.Command("git", "checkout", "--ours", ".")
-		cmd.Dir = wtm.basePath
+		cmd.Dir = wtm.gitRoot
 		if _, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to accept ours: %s", err)
 		}
 	case "accept-theirs":
 		cmd := exec.Command("git", "checkout", "--theirs", ".")
-		cmd.Dir = wtm.basePath
+		cmd.Dir = wtm.gitRoot
 		if _, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to accept theirs: %s", err)
 		}
 	case "abort":
 		cmd := exec.Command("git", "merge", "--abort")
-		cmd.Dir = wtm.basePath
+		cmd.Dir = wtm.gitRoot
 		if _, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to abort merge: %s", err)
 		}
@@ -862,13 +1520,13 @@ func (wtm *WorktreeManager) ResolveConflicts(branchName string, resolution strin
 
 	// 标记冲突解决
 	cmd := exec.Command("git", "add", "-A")
-	cmd.Dir = wtm.basePath
+	cmd.Dir = wtm.gitRoot
 	if _, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to stage resolved files: %s", err)
 	}
 
 	cmd = exec.Command("git", "commit", "-m", fmt.Sprintf("Merge worktree %s (resolved)", branchName))
-	cmd.Dir = wtm.basePath
+	cmd.Dir = wtm.gitRoot
 	if _, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to commit resolution: %s", err)
 	}
@@ -883,21 +1541,10 @@ func (wtm *WorktreeManager) ResolveConflicts(branchName string, resolution strin
 	return nil
 }
 
-// WorktreeConflictError 表示合并冲突错误
-type WorktreeConflictError struct {
-	BranchName string
-	Output     string
-	Message    string
-}
-
-func (e *WorktreeConflictError) Error() string {
-	return e.Message
-}
-
-// GetConflictedFiles 获取冲突文件列表
-func (wtm *WorktreeManager) GetConflictedFiles(branchName string) ([]string, error) {
+// GetConflictedFilesForBranch 获取指定分支的冲突文件列表
+func (wtm *WorktreeManager) GetConflictedFilesForBranch(branchName string) ([]string, error) {
 	cmd := exec.Command("git", "diff", "--name-only", "--diff-filter=U")
-	cmd.Dir = wtm.basePath
+	cmd.Dir = wtm.gitRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get conflicted files: %s", err)
@@ -997,11 +1644,6 @@ func (c *Coordinator) MergeWorktree(branchName string) error {
 		return fmt.Errorf("git merge failed: %s", string(output[:min(len(output), 300)]))
 	}
 	return nil
-}
-
-// GetWorktreeManager 获取 worktree 管理器
-func (c *Coordinator) GetWorktreeManager() *WorktreeManager {
-	return c.worktreeManager
 }
 
 func min(a, b int) int {

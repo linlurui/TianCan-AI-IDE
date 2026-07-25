@@ -188,7 +188,7 @@ type ModifiedFileInfo struct {
 	Checkpoint     string    `json:"checkpoint"`    // 所属检查点
 }
 
-// GetFileDiff 获取文件与指定快照的差异
+// GetFileDiff 获取文件与指定快照的差异，返回 unified diff 格式
 func (rm *RollbackManager) GetFileDiff(path string, snapshotIndex int) (string, error) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -204,7 +204,7 @@ func (rm *RollbackManager) GetFileDiff(path string, snapshotIndex int) (string, 
 	}
 
 	if snapshotIndex < 0 || snapshotIndex >= len(snaps) {
-		return "", fmt.Errorf("snapshot index out of range: %d", snapshotIndex)
+		return "", fmt.Errorf("snapshot index out of range: %d (available: 0-%d)", snapshotIndex, len(snaps)-1)
 	}
 
 	// 获取当前文件内容
@@ -214,10 +214,260 @@ func (rm *RollbackManager) GetFileDiff(path string, snapshotIndex int) (string, 
 	}
 
 	snapshot := snaps[snapshotIndex]
+	snapshotTime := snapshot.ModTime.Format("2006-01-02 15:04:05")
 
-	return fmt.Sprintf("File: %s\nSnapshot at: %s\n\n--- Current ---\n%s\n\n--- Snapshot #%d ---\n%s",
-		path, snapshot.ModTime.Format(time.RFC3339),
-		currentContent, snapshotIndex, snapshot.Content), nil
+	// 生成 unified diff
+	diff := rm.generateUnifiedDiff(path, snapshot.Content, currentContent, snapshotTime)
+
+	return diff, nil
+}
+
+// GetFileDiffBetweenSnapshots 获取两个快照之间的差异
+func (rm *RollbackManager) GetFileDiffBetweenSnapshots(path string, fromIndex, toIndex int) (string, error) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	absPath := path
+	if !filepath.IsAbs(path) {
+		absPath = filepath.Join(rm.rootPath, path)
+	}
+
+	snaps, ok := rm.snapshots[absPath]
+	if !ok || len(snaps) == 0 {
+		return "", fmt.Errorf("no snapshots for %s", path)
+	}
+
+	if fromIndex < 0 || fromIndex >= len(snaps) {
+		return "", fmt.Errorf("fromIndex out of range: %d", fromIndex)
+	}
+	if toIndex < 0 || toIndex >= len(snaps) {
+		return "", fmt.Errorf("toIndex out of range: %d", toIndex)
+	}
+
+	fromSnap := snaps[fromIndex]
+	toSnap := snaps[toIndex]
+
+	return rm.generateUnifiedDiff(
+		path,
+		fromSnap.Content,
+		toSnap.Content,
+		fmt.Sprintf("%s → %s", fromSnap.ModTime.Format("15:04:05"), toSnap.ModTime.Format("15:04:05")),
+	), nil
+}
+
+// GetAllDiffs 获取所有已修改文件的差异
+func (rm *RollbackManager) GetAllDiffs() (string, error) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	var result strings.Builder
+	files := rm.GetModifiedFilesUnlocked()
+
+	if len(files) == 0 {
+		return "没有已修改的文件", nil
+	}
+
+	result.WriteString(fmt.Sprintf("=== 所有文件差异 (共 %d 个文件) ===\n\n", len(files)))
+
+	for _, f := range files {
+		snaps := rm.snapshots[f.Path]
+		if len(snaps) == 0 {
+			continue
+		}
+
+		currentContent := ""
+		if data, err := os.ReadFile(f.Path); err == nil {
+			currentContent = string(data)
+		}
+
+		snapshot := snaps[len(snaps)-1] // 最新快照
+		diff := rm.generateUnifiedDiff(f.Path, snapshot.Content, currentContent, snapshot.ModTime.Format("15:04:05"))
+
+		result.WriteString(fmt.Sprintf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+		result.WriteString(fmt.Sprintf("📄 %s\n", f.Path))
+		result.WriteString(fmt.Sprintf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"))
+		result.WriteString(diff)
+		result.WriteString("\n\n")
+	}
+
+	return result.String(), nil
+}
+
+// GetModifiedFilesUnlocked 返回当前已修改的文件列表（内部使用，不加锁）
+func (rm *RollbackManager) GetModifiedFilesUnlocked() []ModifiedFileInfo {
+	var files []ModifiedFileInfo
+	for path, snaps := range rm.snapshots {
+		if len(snaps) == 0 {
+			continue
+		}
+		latest := snaps[len(snaps)-1]
+
+		currentExists := true
+		currentContent := ""
+		if data, err := os.ReadFile(path); err == nil {
+			currentContent = string(data)
+		} else {
+			currentExists = false
+		}
+
+		modified := currentExists != latest.Exists ||
+			(currentExists && currentContent != latest.Content)
+
+		files = append(files, ModifiedFileInfo{
+			Path:           path,
+			Modified:       modified,
+			SnapshotCount:  len(snaps),
+			FirstSnapshot:  snaps[0].ModTime,
+			LatestSnapshot: latest.ModTime,
+			Checkpoint:     latest.Checkpoint,
+		})
+	}
+	return files
+}
+
+// generateUnifiedDiff 生成 unified diff 格式的差异
+func (rm *RollbackManager) generateUnifiedDiff(path, oldContent, newContent, timeLabel string) string {
+	oldLines := strings.Split(oldContent, "\n")
+	newLines := strings.Split(newContent, "\n")
+
+	var diff strings.Builder
+	diff.WriteString(fmt.Sprintf("--- a/%s\t%s\n", path, timeLabel))
+	diff.WriteString(fmt.Sprintf("+++ b/%s\t(current)\n", path))
+
+	// 简单的行比较算法
+	lcs := rm.computeLCS(oldLines, newLines)
+
+	i, j, k := 0, 0, 0
+	hunkStart := -1
+
+	addLine := func(line string) {
+		if hunkStart == -1 {
+			hunkStart = j
+		}
+		diff.WriteString(fmt.Sprintf("+%s\n", line))
+		j++
+	}
+
+	delLine := func(line string) {
+		if hunkStart == -1 {
+			hunkStart = i
+		}
+		diff.WriteString(fmt.Sprintf("-%s\n", line))
+		i++
+	}
+
+	contextLine := func(line string, isOld bool) {
+		if hunkStart == -1 {
+			hunkStart = i
+		}
+		if isOld {
+			i++
+		} else {
+			j++
+		}
+		diff.WriteString(fmt.Sprintf(" %s\n", line))
+	}
+
+	flushHunk := func() {
+		if hunkStart == -1 {
+			return
+		}
+		// 输出 hunk header
+		diff.WriteString(fmt.Sprintf("@@ -%d,%d +%d,%d @@\n", i-(j-hunkStart), j-hunkStart, j-(j-hunkStart), j-hunkStart))
+		hunkStart = -1
+	}
+
+	for k < len(lcs) {
+		lcsItem := lcs[k]
+
+		// 输出删除行（old 中有，new 中没有）
+		for i < lcsItem.OldIdx {
+			delLine(oldLines[i])
+		}
+		// 输出添加行（new 中有，old 中没有）
+		for j < lcsItem.NewIdx {
+			addLine(newLines[j])
+		}
+		// 输出共同行
+		if i < lcsItem.OldIdx {
+			contextLine(oldLines[i], true)
+		}
+		if j < lcsItem.NewIdx {
+			contextLine(newLines[j], false)
+		}
+		k++
+	}
+
+	// 处理剩余行
+	for i < len(oldLines) {
+		delLine(oldLines[i])
+	}
+	for j < len(newLines) {
+		addLine(newLines[j])
+	}
+
+	flushHunk()
+
+	if diff.Len() == 0 {
+		diff.WriteString(" (文件内容相同)\n")
+	}
+
+	return diff.String()
+}
+
+// LCS item for diff computation
+type lcsItem struct {
+	OldIdx int
+	NewIdx int
+}
+
+// computeLCS 计算最长公共子序列
+func (rm *RollbackManager) computeLCS(old, new []string) []lcsItem {
+	m, n := len(old), len(new)
+	// 简化版本：只返回匹配的索引对
+	var result []lcsItem
+
+	// 使用简单的动态规划找 LCS
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if old[i-1] == new[j-1] {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else {
+				if dp[i-1][j] > dp[i][j-1] {
+					dp[i][j] = dp[i-1][j]
+				} else {
+					dp[i][j] = dp[i][j-1]
+				}
+			}
+		}
+	}
+
+	// 回溯找 LCS
+	i, j := m, n
+	var pairs []lcsItem
+	for i > 0 && j > 0 {
+		if old[i-1] == new[j-1] {
+			pairs = append(pairs, lcsItem{OldIdx: i - 1, NewIdx: j - 1})
+			i--
+			j--
+		} else if dp[i-1][j] > dp[i][j-1] {
+			i--
+		} else {
+			j--
+		}
+	}
+
+	// 反转结果
+	for i := len(pairs) - 1; i >= 0; i-- {
+		result = append(result, pairs[i])
+	}
+
+	return result
 }
 
 // Rollback 回滚到上一次快照

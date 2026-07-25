@@ -4,6 +4,8 @@ import (
 	"log"
 	"os"
 
+	"github.com/rocky233/tiancan-ai-ide/backend/agent"
+	"github.com/rocky233/tiancan-ai-ide/backend/agent/mcp"
 	"github.com/rocky233/tiancan-ai-ide/backend/ai"
 	"github.com/rocky233/tiancan-ai-ide/backend/config"
 	"github.com/rocky233/tiancan-ai-ide/backend/database"
@@ -50,6 +52,11 @@ func main() {
 			application.NewService(pwService),
 			application.NewService(aiService),
 			application.NewService(winManager),
+			application.NewService(mcp.NewService()),
+			// Rollback service - exposes checkpoint/rollback APIs to frontend
+			application.NewService(agent.NewRollbackBindings(project.GetProjectRoot())),
+			// Task service - exposes task tracking and apply/reject APIs to frontend
+			application.NewService(agent.NewTaskBindings()),
 		},
 		Assets: application.AssetOptions{
 			Handler: buildAssetHandler(),

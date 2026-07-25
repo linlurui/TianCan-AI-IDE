@@ -2,11 +2,11 @@ import React, { useCallback, useRef, useEffect } from "react";
 import { useTranslation } from "./i18n";
 import WindowRouter from "./components/WindowRouter";
 import {
-  BrainCircuit, Code2, Files, FolderPlus, GitBranch, Globe,
+  Code2, Files, FolderPlus, GitBranch, Globe,
   LocateFixed, RefreshCw, Save, Settings, Wrench, Terminal, Bug,
   Plus, X, Puzzle, Search, Download, Trash2, Store, PackageCheck,
   ListTree, Database, FlaskConical, Rocket, ScrollText, Server,
-  Network,
+  Network, History, ArrowLeftRight,
 } from "lucide-react";
 
 import FileTree from "./components/FileTree";
@@ -14,6 +14,8 @@ import SplitEditorArea from "./components/SplitEditorArea";
 import AIPanel, { Message } from "./components/AIPanel";
 import StatusBar from "./components/StatusBar";
 import GitPanel from "./components/GitPanel";
+import { AIChangesPanel, AgentTask, TaskFile } from "./components/AIChangesPanel";
+import { Task } from "./bindings/task";
 // OutlinePanel and CallHierarchyPanel moved into AnalysisPanel accordion
 import RemotePanel from "./components/RemotePanel";
 
@@ -47,6 +49,7 @@ import ApiTestPanel from "./components/ApiTestPanel";
 import PlaywrightPanel from "./components/PlaywrightPanel";
 import DeployWorkspace from "./components/DeployWorkspace";
 import DeployPanel from "./components/DeployPanel";
+import ModelStatusIndicator from "./components/ModelStatusIndicator";
 import GitDiffViewer from "./components/GitDiffViewer";
 import GitCommitDetail from "./components/GitCommitDetail";
 import RunEnvConfigModal from "./components/RunEnvConfigModal";
@@ -121,6 +124,9 @@ export default function App() {
   const [analysisContent, setAnalysisContent] = React.useState<string | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
 
+  // AI Changes Panel state
+  const [agentTasks, setAgentTasks] = React.useState<AgentTask[]>([]);
+
   const debugPanelRef = useRef<DebugPanelHandle>(null);
   const monacoGlobalRef = useRef<any>(null);
   const [monacoInstance, setMonacoInstance] = React.useState<any>(null);
@@ -128,6 +134,36 @@ export default function App() {
   const openedPathsRef = useRef<Set<string>>(new Set());
   const dismissedRecs = useRef<Set<string>>(new Set());
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── Keyboard shortcuts for AI Changes navigation ─────────────────────────
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Only handle when changes panel is open
+      if (ui.activeToolTab !== "changes" || !ui.toolPanelOpen) return;
+
+      // Check for Ctrl/Cmd + arrow keys
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          const success = ui.navigateToPrevFileModification();
+          if (success) {
+            // Refresh the tasks to update the UI
+            Task.GetAgentTasks().then(setAgentTasks).catch(console.error);
+          }
+        } else if (e.key === "ArrowRight") {
+          e.preventDefault();
+          const success = ui.navigateToNextFileModification();
+          if (success) {
+            // Refresh the tasks to update the UI
+            Task.GetAgentTasks().then(setAgentTasks).catch(console.error);
+          }
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [ui, setAgentTasks]);
 
   // ── Initialization ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -265,6 +301,14 @@ export default function App() {
 
   const openFile = useCallback(async (node: FileNode) => {
     if (node.isDir) return;
+
+    // Smart mode: don't switch to editor mode when clicking files
+    // Stay in AI mode, just open the file in the editor
+    if (ui.appMode === "ai") {
+      // Force switch to editor mode for file operations
+      ui.setAppMode("editor");
+    }
+
     if (openedPathsRef.current.has(node.path)) { editor.setActiveTab(node.path); return; }
     const ext = extOf(node.path);
     openedPathsRef.current.add(node.path);
@@ -388,8 +432,9 @@ export default function App() {
           <span className="titlebar-title">{titlebarText}</span>
         </div>
         <div className="titlebar-section titlebar-section-right">
+          {/* Model indicator - shows current AI model/router status */}
+          <ModelStatusIndicator />
           <div className="mode-switch" title={ui.appMode === "editor" ? t("mode.switchToAi") : t("mode.switchToEditor")}>
-            <span className="mode-label active">{ui.appMode === "editor" ? t("mode.editor") : t("mode.ai")}</span>
             <button
               className={`switch-track${ui.appMode === "ai" ? " switch-on" : ""}`}
               onClick={() => ui.setAppMode(ui.appMode === "editor" ? "ai" : "editor")}
@@ -399,7 +444,6 @@ export default function App() {
           </div>
           <button className="titlebar-icon-btn" onClick={toggleLang} title={i18n.language === "zh" ? t("langSwitch.toEn") : t("langSwitch.toZh")}>
             <Globe size={13} />
-            <span>{i18n.language === "zh" ? "EN" : "中"}</span>
           </button>
         </div>
       </div>
@@ -525,6 +569,13 @@ export default function App() {
                 >
                   <Wrench size={12} />
                   <span>{project.activeProject.type ?? t("tool.configEnv")}</span>
+                </button>
+                <button
+                  className="sidebar-footer-btn"
+                  onClick={() => { ui.setToolPanelOpen(true); ui.setActiveToolTab("changes"); }}
+                >
+                  <History size={12} />
+                  <span>AI 修改</span>
                 </button>
               </div>
             )}
@@ -963,14 +1014,20 @@ export default function App() {
           <>
             <div className="resize-handle" onMouseDown={handleToolPanelResize} />
             <div className="tool-panel" style={{ width: ui.toolPanelWidth }}>
-              <div className="tool-panel-header">
-                <span className="tool-panel-title">
-                  {ui.activeToolTab === "terminal" ? t("terminal.title") :
-                   ui.activeToolTab === "analysis" ? t("tool.analysis") :
-                   ui.activeToolTab === "debug" ? t("tool.debug") :
-                   ui.activeToolTab === "modify" ? t("tool.runOutput") :
-                   installedExtensions.find((ext) => ext.id === ui.activeToolTab)?.name ?? t("tool.modify")}
-                </span>
+              <div className="tool-panel-header" style={{ display: 'none' }}>
+                <div className="tool-panel-tabs">
+                  {(["terminal", "analysis", "debug", "modify", "changes"] as const).map((tab) => (
+                    <button key={tab} className={`tool-panel-tab${ui.activeToolTab === tab ? " active" : ""}`}
+                      onClick={() => ui.setActiveToolTab(tab)}>
+                      {tab === "terminal" ? t("terminal.title") :
+                       tab === "analysis" ? t("tool.analysis") :
+                       tab === "debug" ? t("tool.debug") :
+                       tab === "modify" ? t("tool.runOutput") :
+                       tab === "changes" ? t("sidebar.changes") :
+                       installedExtensions.find((ext) => ext.id === tab)?.name ?? tab}
+                    </button>
+                  ))}
+                </div>
                 <button className="tool-panel-close" onClick={() => ui.setToolPanelOpen(false)} title={t("tool.close")}>
                   <X size={14} />
                 </button>
@@ -1038,6 +1095,28 @@ export default function App() {
                     <OutputPanel projectRootPath={project.activeProject?.rootPath ?? null} />
                   </div>
                 )}
+                {ui.activeToolTab === "changes" && (
+                  <div className="tool-tab-content" style={{ overflowY: "auto", padding: 0 }}>
+                    <AIChangesPanel
+                      tasks={agentTasks}
+                      onApplyTask={(taskId) => {
+                        console.log("Apply task:", taskId);
+                      }}
+                      onRejectTask={(taskId) => {
+                        console.log("Reject task:", taskId);
+                      }}
+                      onApplyFile={(taskId, filePath) => {
+                        console.log("Apply file:", taskId, filePath);
+                      }}
+                      onRejectFile={(taskId, filePath) => {
+                        console.log("Reject file:", taskId, filePath);
+                      }}
+                      onRefresh={() => {
+                        console.log("Refresh tasks");
+                      }}
+                    />
+                  </div>
+                )}
               </div>
               <div className="tool-panel-footer">
                 <button className={`tool-footer-tab${ui.activeToolTab === "analysis" ? " active" : ""}`}
@@ -1051,6 +1130,10 @@ export default function App() {
                 <button className={`tool-footer-tab${ui.activeToolTab === "terminal" ? " active" : ""}`}
                   onClick={() => ui.setActiveToolTab("terminal")} title={t("terminal.title")}>
                   <Terminal size={16} />
+                </button>
+                <button className={`tool-footer-tab${ui.activeToolTab === "changes" ? " active" : ""}`}
+                  onClick={() => ui.setActiveToolTab("changes")} title={t("sidebar.changes")}>
+                  <History size={16} />
                 </button>
               </div>
             </div>

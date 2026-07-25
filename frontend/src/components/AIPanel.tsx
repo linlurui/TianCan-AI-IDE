@@ -124,6 +124,9 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [customBaseUrl, setCustomBaseUrl] = useState("");
   const [customModel, setCustomModel] = useState("");
+  // API test state
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   // Web mode state
   const [webProviders, setWebProviders] = useState<WebProviderInfo[]>([]);
   const [webProviderID, setWebProviderIDState] = useState(() => localStorage.getItem("ai_web_provider") || "");
@@ -612,9 +615,42 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
               onChange={(e) => { setModel(e.target.value); if (activeProvider.name === "custom") setCustomModel(e.target.value); }}
             />
           </div>
-          <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
-            <button className="btn-ghost" onClick={() => setShowApiKeyInput(false)}>{t("ai.cancel")}</button>
-            <button className="btn-primary" onClick={handleSaveApiKey}>{t("ai.save")}</button>
+          <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", alignItems: "center" }}>
+            <button
+              className="btn-secondary"
+              onClick={async () => {
+                if (!apiKeyInput && !customBaseUrl) return;
+                setTesting(true);
+                setTestResult(null);
+                try {
+                  const testModel = activeProvider.name === "custom" ? customModel : model;
+                  const testBaseUrl = activeProvider.name === "custom" ? customBaseUrl : activeProvider.baseUrl;
+                  // Call backend to test connection
+                  await (window as any).go.ai.Service.AddCustomProvider(
+                    "test-" + Date.now(),
+                    "Test",
+                    testBaseUrl,
+                    apiKeyInput,
+                    testModel
+                  );
+                  setTestResult({ success: true, message: t("settings.connectionSuccess") });
+                } catch (e: any) {
+                  setTestResult({ success: false, message: e.message || t("settings.connectionFailed") });
+                } finally {
+                  setTesting(false);
+                }
+              }}
+              disabled={testing || (!apiKeyInput && !customBaseUrl)}
+            >
+              {testing ? t("settings.testing") : t("settings.testConnection")}
+            </button>
+            {testResult && (
+              <span className={`test-result ${testResult.success ? "success" : "error"}`}>
+                {testResult.message}
+              </span>
+            )}
+            <button className="btn-ghost" onClick={() => { setShowApiKeyInput(false); setTestResult(null); }}>{t("ai.cancel")}</button>
+            <button className="btn-primary" onClick={() => { handleSaveApiKey(); setShowApiKeyInput(false); }}>{t("ai.save")}</button>
           </div>
         </div>
       )}

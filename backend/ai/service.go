@@ -1518,6 +1518,11 @@ func (s *Service) SandboxStop(id string) error {
 	return s.sandboxMgr.Stop(context.Background(), id)
 }
 
+// GetRootPath returns the current project root path (exported for Wails bindings).
+func (s *Service) GetRootPath() string {
+	return s.rootPath()
+}
+
 // SetRootPath sets the current project root path.
 func (s *Service) SetRootPath(path string) {
 	s.mu.Lock()
@@ -2150,6 +2155,120 @@ func (s *Service) SmartAgentRun(userMessage string, rootPath string, maxIteratio
 	return result
 }
 
+// SmartAgentRunV2 使用增强版 AgentV2 执行任务
+// AgentV2 包含：增强记忆、高级压缩、Rollback、并行执行、MCP 集成
+func (s *Service) SmartAgentRunV2(userMessage string, rootPath string, maxIterations int) AgentRunResultV2 {
+	if maxIterations <= 0 {
+		maxIterations = 20
+	}
+
+	// 创建 AgentV2 实例，注入 LLM 调用函数
+	// AgentV2.NewAgentV2 接收 compact.ChatFunc: func(prompt string) (string, error)
+	chatFn := func(prompt string) (string, error) {
+		// 发送一个简单的提示给 LLM
+		messages := []ChatMessage{{Role: "user", Content: prompt}}
+		return s.ChatWithModel(messages)
+	}
+
+	// 创建 AgentV2
+	agentV2 := agent.NewAgentV2(rootPath, chatFn)
+
+	// 分析任务类型
+	analysis := agentV2.GetAnalysis(userMessage)
+
+	// 根据任务类型选择执行方式
+	var result agent.AgentRunResult
+	if analysis.IsRoutable && len(analysis.Subtasks) > 0 {
+		// 可路由任务使用并行执行
+		result = agentV2.RunParallelV2(context.Background(), userMessage, func(sp string, msgs []agent.Message) (string, error) {
+			return chatFn(sp + "\n\nUser: " + userMessage)
+		})
+	} else if shouldUseRalphLoop(userMessage) {
+		// 复杂编程任务使用 Ralph V2 自纠错循环
+		result = agentV2.RunRalphV2(context.Background(), userMessage, func(sp string, msgs []agent.Message) (string, error) {
+			return chatFn(sp + "\n\nUser: " + userMessage)
+		})
+	} else {
+		// 普通任务使用标准 V2 循环
+		result = agentV2.RunV2(context.Background(), userMessage, maxIterations, func(sp string, msgs []agent.Message) (string, error) {
+			return chatFn(sp + "\n\nUser: " + userMessage)
+		})
+	}
+
+	// 转换结果
+	return AgentRunResultV2{
+		Messages:     result.Messages,
+		Done:         result.Done,
+		Error:        result.Error,
+		DurationMs:   result.DurationMs,
+		AgentType:    result.AgentType,
+		TotalTokens:  result.TotalTokens,
+		HasRollback:  true, // AgentV2 总是支持 rollback
+		TaskAnalysis: TaskAnalysisV2{
+			PrimaryRole:     string(analysis.PrimaryRole),
+			Complexity:      string(analysis.Complexity),
+			EstimatedTurns:  analysis.EstimatedTurns,
+			IsRoutable:     analysis.IsRoutable,
+			SubtaskCount:   len(analysis.Subtasks),
+		},
+	}
+}
+
+// AgentRunResultV2 是 AgentV2 执行结果的返回类型
+type AgentRunResultV2 struct {
+	Messages     []agent.Message `json:"messages"`
+	Done         bool            `json:"done"`
+	Error        string          `json:"error,omitempty"`
+	DurationMs   int64           `json:"durationMs"`
+	AgentType    string          `json:"agentType,omitempty"`
+	TotalTokens  int             `json:"totalTokens"`
+	HasRollback  bool            `json:"hasRollback"`
+	TaskAnalysis TaskAnalysisV2  `json:"taskAnalysis,omitempty"`
+}
+
+// TaskAnalysisV2 包含 AgentV2 的任务分析结果
+type TaskAnalysisV2 struct {
+	PrimaryRole     string `json:"primaryRole"`
+	Complexity      string `json:"complexity"`
+	EstimatedTurns  int    `json:"estimatedTurns"`
+	IsRoutable      bool   `json:"isRoutable"`
+	SubtaskCount    int    `json:"subtaskCount"`
+}
+
+// shouldUseRalphLoop 判断是否应该使用 Ralph 自纠错循环
+func shouldUseRalphLoop(task string) bool {
+	if os.Getenv("TIANCAN_DISABLE_RALPH") == "1" {
+		return false
+	}
+	indicators := []string{
+		"implement", "refactor", "migrate", "fix bug", "add feature",
+		"create", "build", "port", "debug", "optimize",
+		"实现", "重构", "迁移", "修复", "添加", "创建", "构建", "移植", "调试", "优化",
+	}
+	lower := strings.ToLower(task)
+	for _, ind := range indicators {
+		if strings.Contains(lower, ind) {
+			return true
+		}
+	}
+	return false
+}
+
+// ChatWithModel 是内部方法，用于 AgentV2 的 LLM 调用
+func (s *Service) ChatWithModel(messages []ChatMessage) (string, error) {
+	if s.activeProvider == "lm-studio" || s.activeProvider == "local" {
+		return s.ChatAPI(messages)
+	}
+	return s.ChatWithProvider(s.activeProvider, messages)
+}
+
+// SmartAgentStreamV2 使用增强版 AgentV2 的流式执行
+func (s *Service) SmartAgentStreamV2(userMessage string, rootPath string, maxIterations int) (<-chan AgentStreamEvent, error) {
+	// 对于流式执行，暂时回退到标准 AgentStream
+	// AgentV2 的流式支持需要更多集成工作
+	return s.AgentStream(userMessage, rootPath, maxIterations)
+}
+
 // runOnTier executes the agent loop on a specific tier.
 func (s *Service) runOnTier(tier router.ModelTier, userMessage string, rootPath string, maxIterations int) AgentRunResult {
 	switch tier {
@@ -2369,7 +2488,7 @@ func (s *Service) agentStreamWeb(userMessage string, rootPath string, maxIterati
 				userMsg = lastActions
 			}
 
-			resp, newConvID, err := s.chatWebConv(userMsg, convID)
+			resp, newConvID, err := s.chatWebConv(userMsg, convID, "")
 			if err != nil {
 				ch <- AgentStreamEvent{Type: "error", Content: fmt.Sprintf("Web 请求失败: %v", err)}
 				return
@@ -2842,6 +2961,32 @@ func (s *Service) IsWebProviderLoggedIn(providerID string) bool {
 	return auth != nil && auth.IsAuthenticated()
 }
 
+// GetLoggedInWebProviders returns all web providers that have valid authentication.
+// This is used for fallback when the primary provider fails.
+func (s *Service) GetLoggedInWebProviders() []WebProviderInfo {
+	all := types.AllProviders()
+	result := []WebProviderInfo{}
+	for _, p := range all {
+		// Check in-memory state first
+		s.mu.Lock()
+		isCurrentProvider := s.webID == p.ID && s.webAuth != nil && s.webAuth.IsAuthenticated()
+		s.mu.Unlock()
+
+		// Also check disk-persisted tokens
+		auth := tokenstore.GetProviderToken(p.ID)
+		hasDiskAuth := auth != nil && auth.IsAuthenticated()
+
+		if isCurrentProvider || hasDiskAuth {
+			result = append(result, WebProviderInfo{
+				ID:          p.ID,
+				DisplayName: p.DisplayName,
+				LoginURL:    p.LoginURL,
+			})
+		}
+	}
+	return result
+}
+
 // ChatWeb sends a chat message to the active web provider.
 func (s *Service) ChatWeb(message string) (string, error) {
 	s.mu.Lock()
@@ -2973,14 +3118,161 @@ func agentMsgsToChatMsgs(systemPrompt string, msgs []agent.Message) []ChatMessag
 
 // chatWebConv sends a message to the web provider, supporting conversation_id for multi-turn.
 // Returns (responseContent, newConversationID, error).
-func (s *Service) chatWebConv(message string, convID string) (string, string, error) {
+// chatWebConv sends a message to a specific web provider.
+// If providerID is empty, uses the currently selected provider.
+// This function tries the specified provider, and if it fails with a transient error,
+// it attempts fallback to other available providers.
+func (s *Service) chatWebConv(message string, convID string, providerID string) (string, string, error) {
+	// Get all logged-in providers for fallback
+	availableProviders := s.getLoggedInProviders()
+
+	// If no specific provider requested, use current selection
+	if providerID == "" {
+		s.mu.Lock()
+		providerID = s.webID
+		s.mu.Unlock()
+	}
+
+	// Build ordered list: specified provider first, then others
+	orderedProviders := []string{providerID}
+	for _, p := range availableProviders {
+		if p != providerID {
+			orderedProviders = append(orderedProviders, p)
+		}
+	}
+
+	var lastErr error
+	for _, pid := range orderedProviders {
+		resp, newConvID, err := s.chatWithProvider(message, convID, pid)
+		if err == nil {
+			return resp, newConvID, nil
+		}
+
+		// Check if error is transient (network, rate limit, etc.) or permanent (auth)
+		isTransient := s.isTransientError(err)
+		log.Printf("chatWebConv: provider %s failed: %v (transient=%v)", pid, err, isTransient)
+
+		if !isTransient {
+			// Auth errors don't benefit from fallback - return immediately
+			return "", "", fmt.Errorf("Web AI 请求失败 (%s): %v", pid, err)
+		}
+		lastErr = err
+
+		// Clear convID for new provider (each provider has its own conversation)
+		convID = ""
+	}
+
+	// All providers failed
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可用的 Web AI 提供商")
+	}
+	return "", "", fmt.Errorf("Web AI 请求失败: %v", lastErr)
+}
+
+// getLoggedInProviders returns provider IDs that have valid auth
+func (s *Service) getLoggedInProviders() []string {
+	var result []string
+	all := types.AllProviders()
+
+	for _, p := range all {
+		// Check in-memory state
+		s.mu.Lock()
+		isCurrent := s.webID == p.ID && s.webAuth != nil && s.webAuth.IsAuthenticated()
+		s.mu.Unlock()
+
+		// Check disk
+		auth := tokenstore.GetProviderToken(p.ID)
+		hasAuth := auth != nil && auth.IsAuthenticated()
+
+		if isCurrent || hasAuth {
+			result = append(result, p.ID)
+		}
+	}
+	return result
+}
+
+// isTransientError determines if an error is transient and warrants retry
+func (s *Service) isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+
+	// Non-transient errors (auth, config issues)
+	nonTransient := []string{
+		"未登录",
+		"not logged in",
+		"authentication",
+		"unauthorized",
+		"401",
+		"403",
+		"未授权",
+		"invalid credentials",
+		"cookie",
+		"token",
+		"需要浏览器",
+		"requires browser",
+		"浏览器交互",
+		"not supported",
+		"不支持",
+	}
+	for _, n := range nonTransient {
+		if strings.Contains(errStr, strings.ToLower(n)) {
+			return false
+		}
+	}
+
+	// Transient errors that may succeed on retry
+	transient := []string{
+		"timeout",
+		"超时",
+		"connection",
+		"连接",
+		"network",
+		"网络",
+		"reset",
+		"refused",
+		"rate limit",
+		"限流",
+		"429",
+		"500",
+		"502",
+		"503",
+		"504",
+		"empty response",
+		"空响应",
+		"context deadline",
+		"deadline exceeded",
+	}
+	for _, t := range transient {
+		if strings.Contains(errStr, strings.ToLower(t)) {
+			return true
+		}
+	}
+
+	// Default to transient for unknown errors (better to retry)
+	return true
+}
+
+// chatWithProvider sends a message to a specific provider (no fallback)
+func (s *Service) chatWithProvider(message string, convID string, providerID string) (string, string, error) {
+	// Get auth for this specific provider
 	s.mu.Lock()
-	auth := s.webAuth
-	providerID := s.webID
+	isCurrentProvider := s.webID == providerID
+	currentAuth := s.webAuth
 	s.mu.Unlock()
 
+	// Try in-memory auth first (current provider)
+	var auth *types.AuthResult
+	if isCurrentProvider && currentAuth != nil && currentAuth.IsAuthenticated() {
+		auth = currentAuth
+	} else {
+		// Try disk-persisted token
+		auth = tokenstore.GetProviderToken(providerID)
+	}
+
 	if auth == nil || !auth.IsAuthenticated() {
-		return "", "", fmt.Errorf("Web 提供商未登录")
+		return "", "", fmt.Errorf("提供商 %s 未登录", providerID)
 	}
 
 	req := types.ChatRequest{
@@ -3162,7 +3454,7 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 			sendMsg = firstMessage
 		}
 
-		resp, newConvID, err := s.chatWebConv(sendMsg, convID)
+		resp, newConvID, err := s.chatWebConv(sendMsg, convID, "")
 		if err != nil {
 			result.Error = fmt.Sprintf("Web AI 请求失败: %v", err)
 			result.Done = true

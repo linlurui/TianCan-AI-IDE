@@ -15,7 +15,8 @@
     "extensions": "Extensions",
     "outline": "Outline",
     "callhierarchy": "Call Hierarchy",
-    "remote": "Remote"
+    "remote": "Remote",
+    "changes": "AI Changes"
   },
   "action": {
     "openFolder": "Open Folder",
@@ -472,7 +473,33 @@
     "resetTitle": "Reset to defaults",
     "reset": "Reset Defaults",
     "saved": "Saved",
-    "save": "Save"
+    "save": "Save",
+    "mcp": {
+      "title": "MCP Servers",
+      "hint": "Configure MCP (Model Context Protocol) servers to extend AI capabilities with custom tools, resources, and prompts.",
+      "loading": "Loading MCP servers…",
+      "empty": "No MCP servers configured. Click 'Add Server' to add one.",
+      "transport": "Transport",
+      "command": "Command",
+      "args": "Arguments",
+      "url": "URL",
+      "tools": "Tools",
+      "error": "Error",
+      "connect": "Connect",
+      "disconnect": "Disconnect",
+      "enable": "Enable server",
+      "disable": "Disable server",
+      "delete": "Delete server",
+      "addServer": "Add Server",
+      "add": "Add",
+      "cancel": "Cancel",
+      "serverName": "Server Name",
+      "serverNamePlaceholder": "e.g. filesystem, git, database",
+      "transportType": "Transport Type",
+      "argsPlaceholder": "Space-separated, e.g. -y @modelcontextprotocol/server-filesystem ./data",
+      "quickActions": "Quick Actions",
+      "refresh": "Refresh Servers"
+    }
   },
   "lsp": {
     "installing": "Installing {{name}}…",

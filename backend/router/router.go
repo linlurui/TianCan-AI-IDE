@@ -57,6 +57,39 @@ const (
 	StrategySingleLarge ModelSelectionStrategy = "single_large" // Use one large model (high RAM)
 )
 
+// TaskComplexityLevel represents the complexity level of a task
+type TaskComplexityLevel int
+
+const (
+	ComplexityLow    TaskComplexityLevel = iota // Simple, single-file changes
+	ComplexityMedium                           // Multi-file, requires understanding
+	ComplexityHigh                             // Complex refactoring, architecture decisions
+	ComplexityExpert                           // Expert-level: security, performance optimization
+)
+
+func (c TaskComplexityLevel) String() string {
+	switch c {
+	case ComplexityLow:
+		return "low"
+	case ComplexityMedium:
+		return "medium"
+	case ComplexityHigh:
+		return "high"
+	case ComplexityExpert:
+		return "expert"
+	default:
+		return "unknown"
+	}
+}
+
+// TaskComplexityConfig 控制不同复杂度任务的路由行为
+type TaskComplexityConfig struct {
+	Low    TierRecommendation `json:"low"`    // 低复杂度任务推荐
+	Medium TierRecommendation `json:"medium"` // 中复杂度任务推荐
+	High   TierRecommendation `json:"high"`   // 高复杂度任务推荐
+	Expert TierRecommendation `json:"expert"` // 专家级任务推荐
+}
+
 // HardwareProfile 系统硬件配置
 type HardwareProfile struct {
 	CPUCores       int     `json:"cpuCores"`
@@ -79,6 +112,7 @@ type HardwareMonitor struct {
 	monitoringActive bool
 	stopCh           chan struct{}
 	updateInterval   time.Duration
+	app              *application.App // Wails 应用实例
 }
 
 // NewHardwareMonitor 创建新的硬件监控器
@@ -88,6 +122,13 @@ func NewHardwareMonitor() *HardwareMonitor {
 		updateInterval: 5 * time.Second,
 		stopCh:         make(chan struct{}),
 	}
+}
+
+// SetApp 设置 Wails 应用实例用于事件发射
+func (hm *HardwareMonitor) SetApp(app *application.App) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	hm.app = app
 }
 
 // StartMonitoring 启动后台硬件监控
@@ -135,8 +176,8 @@ func (hm *HardwareMonitor) GetProfile() *HardwareProfile {
 // refreshProfile 刷新硬件配置
 func (hm *HardwareMonitor) refreshProfile() {
 	hm.mu.Lock()
-	defer hm.mu.Unlock()
 
+	oldProfile := hm.profile
 	hm.lastCheck = time.Now()
 
 	// CPU 检测
@@ -156,6 +197,40 @@ func (hm *HardwareMonitor) refreshProfile() {
 
 	hm.profile.CPUCores = runtime.NumCPU()
 	hm.profile.OS = runtime.GOOS
+
+	// 检测重大变化并发射事件
+	shouldEmit := false
+	if oldProfile != nil {
+		// 内存变化超过 10%
+		memChange := abs(oldProfile.AvailableRAMGB - hm.profile.AvailableRAMGB)
+		if memChange > oldProfile.AvailableRAMGB*0.1 {
+			shouldEmit = true
+		}
+		// CPU 变化超过 20%
+		if abs(oldProfile.CPUPercent-hm.profile.CPUPercent) > 20 {
+			shouldEmit = true
+		}
+		// GPU 可用性变化
+		if oldProfile.HasGPU != hm.profile.HasGPU {
+			shouldEmit = true
+		}
+	}
+
+	app := hm.app
+	profile := hm.profile // 复制当前状态
+	hm.mu.Unlock()
+
+	// 发射事件
+	if shouldEmit && app != nil {
+		app.Event.Emit("router:hardware-changed", profile)
+	}
+}
+
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // detectGPU 增强的 GPU 检测逻辑
@@ -225,6 +300,44 @@ type TaskComplexity struct {
 	Score        float64 `json:"score"`        // 0-100
 	TokensNeeded int     `json:"tokensNeeded"` // 预估 token 消耗
 	Reason       string  `json:"reason"`
+}
+
+// ToComplexityLevel 将 TaskComplexity 转换为 TaskComplexityLevel
+func (tc *TaskComplexity) ToComplexityLevel() TaskComplexityLevel {
+	switch tc.Level {
+	case "simple":
+		return ComplexityLow
+	case "moderate":
+		return ComplexityMedium
+	case "complex":
+		return ComplexityHigh
+	default:
+		return ComplexityMedium
+	}
+}
+
+// IsComplex 返回是否为复杂任务
+func (tc *TaskComplexity) IsComplex() bool {
+	return tc.Level == "complex" || tc.Score >= 60
+}
+
+// IsSimple 返回是否为简单任务
+func (tc *TaskComplexity) IsSimple() bool {
+	return tc.Level == "simple" || tc.Score < 30
+}
+
+// RecommendTierForComplexity 根据复杂度推荐最佳层级
+func (tc *TaskComplexity) RecommendTierForComplexity() ModelTier {
+	switch tc.Level {
+	case "simple":
+		return TierLocal // 简单任务用本地模型即可
+	case "moderate":
+		return TierAPI   // 中等任务用 API
+	case "complex":
+		return TierAPI   // 复杂任务用最强的 API
+	default:
+		return TierAPI
+	}
 }
 
 // AssessTaskComplexity 评估任务复杂度以决定最优模型
@@ -540,6 +653,187 @@ type TierRecommendation struct {
 	Warnings   []string  `json:"warnings,omitempty"`
 }
 
+// TaskComplexityLevel 任务复杂度枚举（已在文件开头定义）
+
+// RouteWithContext 增强版路由，考虑任务复杂度
+func (sr *SmartRouter) RouteWithContext(userMessage string, providerScores map[string]float64, complexity TaskComplexityLevel) *TierRecommendation {
+	sr.mu.RLock()
+	defer sr.mu.RUnlock()
+
+	category := classifyTask(userMessage)
+	hw := sr.getHardwareProfile()
+
+	// 1. 基础层级分数计算
+	tierScores := sr.calculateTierScores(category, hw, providerScores)
+
+	// 2. 根据任务复杂度调整
+	tierScores = sr.adjustForComplexity(tierScores, complexity, hw)
+
+	// 3. 找到最佳层级
+	bestTier := sr.selectBestTier(tierScores)
+
+	// 4. 生成警告和建议
+	warnings := sr.generateWarnings(bestTier, hw, category)
+
+	// 5. 检查失败历史
+	bestTier = sr.checkFailureHistory(bestTier)
+
+	reason := sr.generateReason(bestTier, category, hw)
+	score := tierScores[bestTier]
+
+	return &TierRecommendation{
+		Tier:     bestTier,
+		Reason:   reason,
+		Score:    score,
+		Warnings: warnings,
+	}
+}
+
+// calculateTierScores 计算各层级基础分数
+func (sr *SmartRouter) calculateTierScores(category TaskCategory, hw *HardwareProfile, providerScores map[string]float64) map[ModelTier]float64 {
+	tierScores := map[ModelTier]float64{
+		TierLocal: 30, // 基础分数
+		TierAPI:   50,
+		TierWeb:   40,
+	}
+
+	// 本地模型可用性检查
+	localAvailable := sr.isLocalModelViable()
+	if localAvailable {
+		// 内存余量加成
+		memRatio := hw.AvailableRAMGB / hw.TotalRAMGB
+		tierScores[TierLocal] += memRatio * 25
+
+		// GPU 加成
+		if hw.HasGPU {
+			tierScores[TierLocal] += 20
+			// GPU 利用率调整
+			if hw.GPUUtilization > 0 && hw.GPUUtilization < 80 {
+				tierScores[TierLocal] += 10 // GPU 空闲时更有价值
+			}
+		}
+	}
+
+	// Provider 可用性调整
+	for providerID, score := range providerScores {
+		switch {
+		case strings.Contains(providerID, "claude"):
+			tierScores[TierAPI] += score * 0.25
+		case strings.Contains(providerID, "lm-studio"), strings.Contains(providerID, "ollama"):
+			tierScores[TierLocal] += score * 0.25
+		case strings.Contains(providerID, "deepseek"), strings.Contains(providerID, "openai"):
+			tierScores[TierAPI] += score * 0.2
+		}
+	}
+
+	// 任务类型权重
+	switch category {
+	case CategoryCodeEdit, CategoryDebug:
+		tierScores[TierAPI] *= 1.2 // API 模型更擅长代码
+		tierScores[TierLocal] *= 1.0
+	case CategoryResearch:
+		tierScores[TierLocal] *= 1.1
+		tierScores[TierWeb] *= 1.2 // Web 搜索研究更强
+	case CategoryCodeReview:
+		tierScores[TierLocal] *= 1.2 // 本地模型适合代码审查
+	case CategoryChat:
+		tierScores[TierLocal] *= 1.3 // 对话任务本地模型足够
+	}
+
+	return tierScores
+}
+
+// adjustForComplexity 根据复杂度调整分数
+func (sr *SmartRouter) adjustForComplexity(scores map[ModelTier]float64, complexity TaskComplexityLevel, hw *HardwareProfile) map[ModelTier]float64 {
+	switch complexity {
+	case 1: // ComplexityLow
+		// 简单任务：优先本地
+		scores[TierLocal] *= 1.3
+		scores[TierAPI] *= 0.9
+	case 2: // ComplexityMedium
+		// 中等任务：平衡
+		scores[TierAPI] *= 1.1
+	case 3: // ComplexityHigh
+		// 复杂任务：需要更强的模型
+		scores[TierAPI] *= 1.3
+		if !hw.HasGPU {
+			scores[TierLocal] *= 0.7 // 无 GPU 的本地模型不适合复杂任务
+		}
+	case 4: // ComplexityExpert
+		// 专家任务：只使用最强模型
+		scores[TierLocal] *= 0.5 // 本地模型通常不够
+		scores[TierAPI] *= 1.5
+		scores[TierWeb] *= 1.2
+	}
+
+	return scores
+}
+
+// selectBestTier 选择最佳层级
+func (sr *SmartRouter) selectBestTier(scores map[ModelTier]float64) ModelTier {
+	bestTier := TierAPI
+	bestScore := scores[TierAPI]
+
+	for tier, score := range scores {
+		if score > bestScore {
+			bestScore = score
+			bestTier = tier
+		}
+	}
+
+	return bestTier
+}
+
+// generateWarnings 生成警告信息
+func (sr *SmartRouter) generateWarnings(tier ModelTier, hw *HardwareProfile, category TaskCategory) []string {
+	var warnings []string
+
+	if tier == TierLocal {
+		if !hw.HasGPU {
+			warnings = append(warnings, "本地 CPU 模型运行较慢，建议用于简单任务")
+		}
+		if hw.UsedRAMPercent > 80 {
+			warnings = append(warnings, fmt.Sprintf("系统内存使用率较高 (%.0f%%)", hw.UsedRAMPercent))
+		}
+		if hw.CPUPercent > 80 {
+			warnings = append(warnings, fmt.Sprintf("CPU 使用率较高 (%.0f%%)", hw.CPUPercent))
+		}
+	}
+
+	if tier == TierAPI {
+		if sr.HasRecentFailure(TierAPI) {
+			warnings = append(warnings, "API 服务最近出现错误，可能不稳定")
+		}
+	}
+
+	if category == CategoryCodeEdit && tier == TierLocal {
+		warnings = append(warnings, "代码编辑任务建议使用更强的模型")
+	}
+
+	return warnings
+}
+
+// checkFailureHistory 检查失败历史并降级
+func (sr *SmartRouter) checkFailureHistory(tier ModelTier) ModelTier {
+	if !sr.HasRecentFailure(tier) {
+		return tier
+	}
+
+	// 按优先级尝试降级
+	order := []ModelTier{TierAPI, TierWeb, TierLocal}
+	if tier == TierLocal {
+		order = []ModelTier{TierAPI, TierWeb}
+	}
+
+	for _, fallback := range order {
+		if fallback != tier && !sr.HasRecentFailure(fallback) {
+			return fallback
+		}
+	}
+
+	return tier // 无可用降级
+}
+
 // SmartRouterConfig holds the configuration for the Smart Router.
 type SmartRouterConfig struct {
 	AutoDowngrade       bool                   `json:"autoDowngrade"`       // Enable auto-downgrade on failure (API/Web fallback)
@@ -588,13 +882,14 @@ type FailureRecord struct {
 // When ALL local models are unavailable: kill LM Studio to free resources.
 // For API/Web tiers: simple failure-based fallback only.
 type SmartRouter struct {
-	mu             sync.RWMutex
-	config         SmartRouterConfig
-	failures       []FailureRecord     // recent failure records (last 10)
-	modelStatuses  []LocalModelStatus // cached model availability from last check
-	hwMonitor      *HardwareMonitor    // 实时硬件监控
-	loadHistory    []LoadSnapshot      // 历史负载数据用于预测
-	providerLatency map[string]float64 // 各 provider 的延迟记录
+	mu              sync.RWMutex
+	config          SmartRouterConfig
+	failures        []FailureRecord      // recent failure records (last 10)
+	modelStatuses   []LocalModelStatus   // cached model availability from last check
+	hwMonitor       *HardwareMonitor     // 实时硬件监控
+	loadHistory     []LoadSnapshot       // 历史负载数据用于预测
+	providerLatency map[string]float64   // 各 provider 的延迟记录
+	app             *application.App     // Wails 应用实例
 }
 
 // LoadSnapshot 负载历史快照
@@ -854,6 +1149,282 @@ func (sr *SmartRouter) RouteWithProviders(userMessage string, providerScores map
 		Reason:   reason,
 		Score:    bestScore,
 		Warnings: warnings,
+	}
+}
+
+// RouteWithComplexityByLevel 根据任务复杂度级别智能路由请求
+// 这是核心方法，综合考虑任务复杂度、硬件配置和 Provider 可用性
+func (sr *SmartRouter) RouteWithComplexityByLevel(userMessage string, providerScores map[string]float64, complexity TaskComplexityLevel) *TierRecommendation {
+	sr.mu.RLock()
+	defer sr.mu.RUnlock()
+
+	_ = classifyTask(userMessage) // 保留用于未来扩展
+	hw := sr.getHardwareProfile()
+
+	// 1. 分析任务复杂度（如果未指定，自动分析）
+	if complexity == 0 {
+		complexity = sr.analyzeTaskComplexity(userMessage)
+	}
+
+	// 2. 评估各 Provider 可用性和分数
+	providerScoresResult := sr.evaluateProviders(providerScores, hw)
+
+	// 3. 根据复杂度选择最佳 Provider
+	var tier ModelTier
+	var score float64
+	var reason string
+	var warnings []string
+
+	switch complexity {
+	case ComplexityLow:
+		// 简单任务：优先本地/小模型
+		tier, score, reason, warnings = sr.selectForLowComplexity(providerScoresResult, hw)
+	case ComplexityMedium:
+		// 中等任务：平衡质量和资源
+		tier, score, reason, warnings = sr.selectForMediumComplexity(providerScoresResult, hw)
+	case ComplexityHigh:
+		// 复杂任务：优先高质量
+		tier, score, reason, warnings = sr.selectForHighComplexity(providerScoresResult, hw)
+	case ComplexityExpert:
+		// 专家级任务：必须使用最强模型
+		tier, score, reason, warnings = sr.selectForExpertComplexity(providerScoresResult, hw)
+	}
+
+	// 4. 应用硬件约束
+	if tier == TierLocal && !sr.isLocalModelViable() {
+		warnings = append(warnings, "本地模型不可用，降级到 API")
+		tier = TierAPI
+		score = 40
+		reason = "硬件限制，切换到 API"
+	}
+
+	// 5. 检查失败历史
+	if sr.HasRecentFailure(tier) {
+		for _, fallback := range sr.config.FallbackOrder {
+			if fallback != tier && !sr.HasRecentFailure(fallback) {
+				warnings = append(warnings, fmt.Sprintf("%s 最近失败，自动切换", tier))
+				tier = fallback
+				reason += " (自动降级)"
+				break
+			}
+		}
+	}
+
+	return &TierRecommendation{
+		Tier:     tier,
+		Reason:   fmt.Sprintf("[%s] %s", complexity.String(), reason),
+		Score:    score,
+		Warnings: warnings,
+	}
+}
+
+// ProviderScore 描述每个 Provider 的评估结果
+type ProviderScore struct {
+	ProviderID string
+	Tier       ModelTier
+	Score      float64
+	LatencyMs  float64
+	Available  bool
+}
+
+// evaluateProviders 评估所有 Provider 的状态
+func (sr *SmartRouter) evaluateProviders(providerScores map[string]float64, hw *HardwareProfile) map[ModelTier]*ProviderScore {
+	result := map[ModelTier]*ProviderScore{
+		TierLocal: {Tier: TierLocal, Score: 0, Available: false},
+		TierAPI:   {Tier: TierAPI, Score: 50, Available: true},
+		TierWeb:   {Tier: TierWeb, Score: 30, Available: true},
+	}
+
+	// 评估本地模型
+	if sr.isLocalModelViable() {
+		result[TierLocal].Available = true
+		result[TierLocal].Score = 50 + (hw.AvailableRAMGB/hw.TotalRAMGB)*30
+		if hw.HasGPU {
+			result[TierLocal].Score += 20
+		}
+		// 从 providerScores 获取本地模型评分
+		for id, s := range providerScores {
+			if strings.Contains(id, "lm-studio") || strings.Contains(id, "ollama") {
+				result[TierLocal].Score += s * 0.5
+				result[TierLocal].ProviderID = id
+			}
+		}
+	}
+
+	// 评估 API
+	for id, s := range providerScores {
+		if strings.Contains(id, "openai") || strings.Contains(id, "anthropic") ||
+			strings.Contains(id, "deepseek") || strings.Contains(id, "claude") {
+			result[TierAPI].Score += s * 0.5
+			if result[TierAPI].ProviderID == "" {
+				result[TierAPI].ProviderID = id
+			}
+		}
+	}
+
+	// 评估 Web
+	for id, s := range providerScores {
+		if strings.Contains(id, "web") || strings.Contains(id, "browser") {
+			result[TierWeb].Score += s * 0.5
+			if result[TierWeb].ProviderID == "" {
+				result[TierWeb].ProviderID = id
+			}
+		}
+	}
+
+	// 应用延迟惩罚
+	for tier, p := range result {
+		if latency := sr.providerLatency[p.ProviderID]; latency > 0 {
+			latencyPenalty := min(latency/1000, 0.3) // 最多 30% 惩罚
+			result[tier].Score *= (1 - latencyPenalty)
+		}
+	}
+
+	return result
+}
+
+// selectForLowComplexity 低复杂度任务选择
+func (sr *SmartRouter) selectForLowComplexity(providers map[ModelTier]*ProviderScore, hw *HardwareProfile) (ModelTier, float64, string, []string) {
+	if providers[TierLocal].Available && providers[TierLocal].Score > 50 {
+		return TierLocal, providers[TierLocal].Score,
+			"简单任务使用本地模型响应更快", nil
+	}
+	return TierAPI, providers[TierAPI].Score,
+		"本地模型不可用，使用 API", nil
+}
+
+// selectForMediumComplexity 中等复杂度任务选择
+func (sr *SmartRouter) selectForMediumComplexity(providers map[ModelTier]*ProviderScore, hw *HardwareProfile) (ModelTier, float64, string, []string) {
+	var warnings []string
+
+	// 本地模型足够好就用
+	if providers[TierLocal].Available && providers[TierLocal].Score > 60 {
+		return TierLocal, providers[TierLocal].Score,
+			"中等复杂度任务使用本地模型", warnings
+	}
+
+	// 否则用 API
+	if !providers[TierAPI].Available {
+		warnings = append(warnings, "API 不可用，考虑使用 Web")
+	}
+	return TierAPI, providers[TierAPI].Score,
+		"中等复杂度使用 API 质量更稳定", warnings
+}
+
+// selectForHighComplexity 高复杂度任务选择
+func (sr *SmartRouter) selectForHighComplexity(providers map[ModelTier]*ProviderScore, hw *HardwareProfile) (ModelTier, float64, string, []string) {
+	var warnings []string
+
+	// 高复杂度优先 API
+	if providers[TierAPI].Score > providers[TierLocal].Score {
+		return TierAPI, providers[TierAPI].Score,
+			"高复杂度任务需要高质量模型", warnings
+	}
+
+	// 本地 GPU 足够强也行
+	if hw.HasGPU && hw.GPUMemoryGB >= 8 {
+		return TierLocal, providers[TierLocal].Score,
+			"本地 GPU 足够强，高复杂度任务使用本地模型", warnings
+	}
+
+	warnings = append(warnings, "建议使用云端 API 以获得最佳效果")
+	return TierAPI, providers[TierAPI].Score,
+		"高复杂度任务使用 API", warnings
+}
+
+// selectForExpertComplexity 专家级任务选择
+func (sr *SmartRouter) selectForExpertComplexity(providers map[ModelTier]*ProviderScore, hw *HardwareProfile) (ModelTier, float64, string, []string) {
+	var warnings []string
+
+	// 专家级任务必须使用最强模型
+	// 检查是否有高端 API
+	if providers[TierAPI].ProviderID != "" {
+		return TierAPI, providers[TierAPI].Score + 20,
+			"专家级任务使用最强 API 模型", warnings
+	}
+
+	// Web 可能更好（Claude Web 等）
+	if providers[TierWeb].Available {
+		warnings = append(warnings, "API 不可用，降级到 Web")
+		return TierWeb, providers[TierWeb].Score,
+			"专家级任务使用 Web AI", warnings
+	}
+
+	// 最后检查本地
+	if providers[TierLocal].Available && hw.HasGPU && hw.GPUMemoryGB >= 16 {
+		return TierLocal, providers[TierLocal].Score,
+			"本地 GPU 足够强，专家级任务使用本地模型", warnings
+	}
+
+	warnings = append(warnings, "警告：当前硬件可能无法满足专家级任务需求")
+	return TierAPI, 20,
+		"硬件限制，建议升级硬件以获得最佳效果", warnings
+}
+
+// analyzeTaskComplexity 自动分析任务复杂度
+func (sr *SmartRouter) analyzeTaskComplexity(message string) TaskComplexityLevel {
+	lower := strings.ToLower(message)
+
+	// 专家级关键词
+	expertKeywords := []string{"安全", "安全漏洞", "security", "漏洞", "vulnerability",
+		"性能优化", "performance optimization", "架构设计", "architecture",
+		"重构大型系统", "迁移", "migration"}
+	for _, kw := range expertKeywords {
+		if strings.Contains(lower, kw) {
+			return ComplexityExpert
+		}
+	}
+
+	// 高复杂度关键词
+	highKeywords := []string{"重构", "refactor", "重写", "rewrite",
+		"复杂", "complex", "多文件", "multi-file",
+		"设计模式", "design pattern", "算法", "algorithm",
+		"并发", "concurrency", "分布式", "distributed"}
+	for _, kw := range highKeywords {
+		if strings.Contains(lower, kw) {
+			return ComplexityHigh
+		}
+	}
+
+	// 中等复杂度关键词
+	mediumKeywords := []string{"修改", "fix", "修复", "add", "添加",
+		"实现", "implement", "创建", "create",
+		"多个", "several", "多个文件"}
+	for _, kw := range mediumKeywords {
+		if strings.Contains(lower, kw) {
+			return ComplexityMedium
+		}
+	}
+
+	// 默认低复杂度
+	return ComplexityLow
+}
+
+// GetRecommendedModelsForComplexity 返回适合特定复杂度的模型推荐
+func (sr *SmartRouter) GetRecommendedModelsForComplexity(complexity TaskComplexityLevel) []string {
+	switch complexity {
+	case ComplexityLow:
+		return []string{
+			"llama3.2:1b", "qwen2.5:0.5b", "phi3-mini",
+			"gpt-4o-mini", "claude-3-haiku",
+		}
+	case ComplexityMedium:
+		return []string{
+			"llama3.1:8b", "qwen2.5:7b", "mistral-nemo",
+			"gpt-4o", "claude-3-sonnet",
+		}
+	case ComplexityHigh:
+		return []string{
+			"llama3.1:70b", "qwen2.5-coder:32b", "codellama:34b",
+			"gpt-4o", "claude-3.5-sonnet",
+		}
+	case ComplexityExpert:
+		return []string{
+			"claude-opus-4", "gpt-4-turbo", "gemini-pro",
+			"claude-3.5-sonnet", "deepseek-coder-v2",
+		}
+	default:
+		return []string{"claude-3-sonnet", "gpt-4o"}
 	}
 }
 
@@ -1211,8 +1782,8 @@ func (sr *SmartRouter) GetDetailedHardwareStatus() map[string]interface{} {
 	}
 }
 
-// RouteWithContext 带完整上下文信息的路由（用于调试和展示）
-func (sr *SmartRouter) RouteWithContext(userMessage string, providerScores map[string]float64) map[string]interface{} {
+// RouteWithDetails 带完整上下文信息的路由（用于调试和展示）
+func (sr *SmartRouter) RouteWithDetails(userMessage string, providerScores map[string]float64) map[string]interface{} {
 	result := sr.RouteWithProviders(userMessage, providerScores)
 	complexity := sr.AssessTaskComplexity(userMessage)
 	hw := sr.GetRealTimeHardware()

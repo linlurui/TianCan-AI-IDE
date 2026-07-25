@@ -158,26 +158,25 @@ func TestGetMemoryPressureLevel(t *testing.T) {
 
 func TestRouteWithContext(t *testing.T) {
 	sr := &SmartRouter{}
+	cfg := DefaultConfig()
+	sr.config = cfg
+
+	complexity := TaskComplexity{
+		Level:        "moderate",
+		Score:        40,
+		TokensNeeded: 1500,
+		Reason:       "中等复杂度任务",
+	}
 
 	result := sr.RouteWithContext("帮我写一个排序函数", map[string]float64{
 		"claude-code": 0.8,
-	})
+	}, ComplexityMedium)
 
 	if result == nil {
 		t.Fatal("RouteWithContext returned nil")
 	}
 
-	route, ok := result["route"]
-	if !ok {
-		t.Fatal("route key missing")
-	}
-
-	complexity, ok := result["complexity"]
-	if !ok {
-		t.Fatal("complexity key missing")
-	}
-
-	t.Logf("Route: %+v", route)
+	t.Logf("Route: Tier=%s, Reason=%s, Score=%.2f", result.Tier, result.Reason, result.Score)
 	t.Logf("Complexity: %+v", complexity)
 }
 

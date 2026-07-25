@@ -129,6 +129,13 @@ export function ChatWeb(message: string): $CancellablePromise<string> {
 }
 
 /**
+ * ChatWithModel 是内部方法，用于 AgentV2 的 LLM 调用
+ */
+export function ChatWithModel(messages: $models.ChatMessage[]): $CancellablePromise<string> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ChatWithModel", messages);
+}
+
+/**
  * ChatWithProvider sends a chat request using a specific provider.
  */
 export function ChatWithProvider(providerID: string, messages: $models.ChatMessage[]): $CancellablePromise<string> {
@@ -240,6 +247,16 @@ export function GetHardwareProfile(): $CancellablePromise<router$0.HardwareProfi
 }
 
 /**
+ * GetLoggedInWebProviders returns all web providers that have valid authentication.
+ * This is used for fallback when the primary provider fails.
+ */
+export function GetLoggedInWebProviders(): $CancellablePromise<$models.WebProviderInfo[]> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.GetLoggedInWebProviders").then(($result: any) => {
+        return $$createType12($result);
+    });
+}
+
+/**
  * GetProviderQuota 获取指定 Provider 的配额
  */
 export function GetProviderQuota(providerID: string): $CancellablePromise<providers$0.Quota | null> {
@@ -253,8 +270,15 @@ export function GetProviderQuota(providerID: string): $CancellablePromise<provid
  */
 export function GetProviderQuotaInfo(): $CancellablePromise<$models.ProviderQuotaInfo[]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.GetProviderQuotaInfo").then(($result: any) => {
-        return $$createType12($result);
+        return $$createType14($result);
     });
+}
+
+/**
+ * GetRootPath returns the current project root path (exported for Wails bindings).
+ */
+export function GetRootPath(): $CancellablePromise<string> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.GetRootPath");
 }
 
 /**
@@ -262,7 +286,7 @@ export function GetProviderQuotaInfo(): $CancellablePromise<$models.ProviderQuot
  */
 export function GetRouterConfig(): $CancellablePromise<router$0.SmartRouterConfig> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.GetRouterConfig").then(($result: any) => {
-        return $$createType13($result);
+        return $$createType15($result);
     });
 }
 
@@ -271,7 +295,7 @@ export function GetRouterConfig(): $CancellablePromise<router$0.SmartRouterConfi
  */
 export function GetSkillDetail(name: string): $CancellablePromise<skills$0.Skill | null> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.GetSkillDetail", name).then(($result: any) => {
-        return $$createType15($result);
+        return $$createType17($result);
     });
 }
 
@@ -280,7 +304,7 @@ export function GetSkillDetail(name: string): $CancellablePromise<skills$0.Skill
  */
 export function GetSkillMarketInfo(name: string): $CancellablePromise<skills$0.MarketEntry | null> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.GetSkillMarketInfo", name).then(($result: any) => {
-        return $$createType17($result);
+        return $$createType19($result);
     });
 }
 
@@ -289,7 +313,7 @@ export function GetSkillMarketInfo(name: string): $CancellablePromise<skills$0.M
  */
 export function GetSystemStatus(): $CancellablePromise<{ [_ in string]?: any }> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.GetSystemStatus").then(($result: any) => {
-        return $$createType18($result);
+        return $$createType20($result);
     });
 }
 
@@ -366,7 +390,7 @@ export function LaunchLMStudio(): $CancellablePromise<void> {
  */
 export function ListAPIProviders(): $CancellablePromise<$models.APIProviderConfig[]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ListAPIProviders").then(($result: any) => {
-        return $$createType19($result);
+        return $$createType21($result);
     });
 }
 
@@ -375,7 +399,7 @@ export function ListAPIProviders(): $CancellablePromise<$models.APIProviderConfi
  */
 export function ListModels(): $CancellablePromise<$models.ModelInfo[]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ListModels").then(($result: any) => {
-        return $$createType21($result);
+        return $$createType23($result);
     });
 }
 
@@ -386,7 +410,7 @@ export function ListModels(): $CancellablePromise<$models.ModelInfo[]> {
  */
 export function ListModelsAvailable(): $CancellablePromise<$models.ModelInfo[]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ListModelsAvailable").then(($result: any) => {
-        return $$createType21($result);
+        return $$createType23($result);
     });
 }
 
@@ -395,7 +419,7 @@ export function ListModelsAvailable(): $CancellablePromise<$models.ModelInfo[]> 
  */
 export function ListProviders(): $CancellablePromise<(providers$0.ProviderInfo | null)[]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ListProviders").then(($result: any) => {
-        return $$createType24($result);
+        return $$createType26($result);
     });
 }
 
@@ -404,7 +428,7 @@ export function ListProviders(): $CancellablePromise<(providers$0.ProviderInfo |
  */
 export function ListSkills(): $CancellablePromise<skills$0.SkillInfo[]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ListSkills").then(($result: any) => {
-        return $$createType26($result);
+        return $$createType28($result);
     });
 }
 
@@ -413,7 +437,7 @@ export function ListSkills(): $CancellablePromise<skills$0.SkillInfo[]> {
  */
 export function ListWebProviders(): $CancellablePromise<$models.WebProviderInfo[]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ListWebProviders").then(($result: any) => {
-        return $$createType28($result);
+        return $$createType12($result);
     });
 }
 
@@ -434,7 +458,7 @@ export function LoginWeb(providerID: string): $CancellablePromise<void> {
  */
 export function ParseToolCalls(response: string): $CancellablePromise<[string, { [_ in string]?: any }, boolean]> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ParseToolCalls", response).then(($result: any) => {
-        $result[1] = $$createType18($result[1]);
+        $result[1] = $$createType20($result[1]);
         return $result;
     });
 }
@@ -633,10 +657,27 @@ export function SmartAgentRun(userMessage: string, rootPath: string, maxIteratio
 }
 
 /**
+ * SmartAgentRunV2 使用增强版 AgentV2 执行任务
+ * AgentV2 包含：增强记忆、高级压缩、Rollback、并行执行、MCP 集成
+ */
+export function SmartAgentRunV2(userMessage: string, rootPath: string, maxIterations: number): $CancellablePromise<$models.AgentRunResultV2> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.SmartAgentRunV2", userMessage, rootPath, maxIterations).then(($result: any) => {
+        return $$createType37($result);
+    });
+}
+
+/**
  * SmartAgentStream uses the SmartRouter to auto-select the best tier for streaming.
  */
 export function SmartAgentStream(userMessage: string, rootPath: string, maxIterations: number): $CancellablePromise<any> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.SmartAgentStream", userMessage, rootPath, maxIterations);
+}
+
+/**
+ * SmartAgentStreamV2 使用增强版 AgentV2 的流式执行
+ */
+export function SmartAgentStreamV2(userMessage: string, rootPath: string, maxIterations: number): $CancellablePromise<any> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.SmartAgentStreamV2", userMessage, rootPath, maxIterations);
 }
 
 /**
@@ -646,7 +687,7 @@ export function SmartAgentStream(userMessage: string, rootPath: string, maxItera
  */
 export function SmartRoute(userMessage: string): $CancellablePromise<$models.SmartRouteResult> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.SmartRoute", userMessage).then(($result: any) => {
-        return $$createType37($result);
+        return $$createType38($result);
     });
 }
 
@@ -685,7 +726,7 @@ export function TestProvider(id: string): $CancellablePromise<void> {
  */
 export function ValidateAllSkills(): $CancellablePromise<{ [_ in string]?: string }> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ValidateAllSkills").then(($result: any) => {
-        return $$createType38($result);
+        return $$createType39($result);
     });
 }
 
@@ -708,23 +749,23 @@ const $$createType7 = $Create.Map($Create.Any, $$createType6);
 const $$createType8 = $Create.Array($Create.Any);
 const $$createType9 = router$0.HardwareProfile.createFrom;
 const $$createType10 = $Create.Nullable($$createType9);
-const $$createType11 = $models.ProviderQuotaInfo.createFrom;
+const $$createType11 = $models.WebProviderInfo.createFrom;
 const $$createType12 = $Create.Array($$createType11);
-const $$createType13 = router$0.SmartRouterConfig.createFrom;
-const $$createType14 = skills$0.Skill.createFrom;
-const $$createType15 = $Create.Nullable($$createType14);
-const $$createType16 = skills$0.MarketEntry.createFrom;
+const $$createType13 = $models.ProviderQuotaInfo.createFrom;
+const $$createType14 = $Create.Array($$createType13);
+const $$createType15 = router$0.SmartRouterConfig.createFrom;
+const $$createType16 = skills$0.Skill.createFrom;
 const $$createType17 = $Create.Nullable($$createType16);
-const $$createType18 = $Create.Map($Create.Any, $Create.Any);
-const $$createType19 = $Create.Array($$createType3);
-const $$createType20 = $models.ModelInfo.createFrom;
-const $$createType21 = $Create.Array($$createType20);
-const $$createType22 = providers$0.ProviderInfo.createFrom;
-const $$createType23 = $Create.Nullable($$createType22);
-const $$createType24 = $Create.Array($$createType23);
-const $$createType25 = skills$0.SkillInfo.createFrom;
+const $$createType18 = skills$0.MarketEntry.createFrom;
+const $$createType19 = $Create.Nullable($$createType18);
+const $$createType20 = $Create.Map($Create.Any, $Create.Any);
+const $$createType21 = $Create.Array($$createType3);
+const $$createType22 = $models.ModelInfo.createFrom;
+const $$createType23 = $Create.Array($$createType22);
+const $$createType24 = providers$0.ProviderInfo.createFrom;
+const $$createType25 = $Create.Nullable($$createType24);
 const $$createType26 = $Create.Array($$createType25);
-const $$createType27 = $models.WebProviderInfo.createFrom;
+const $$createType27 = skills$0.SkillInfo.createFrom;
 const $$createType28 = $Create.Array($$createType27);
 const $$createType29 = router$0.TierRecommendation.createFrom;
 const $$createType30 = $Create.Nullable($$createType29);
@@ -733,6 +774,7 @@ const $$createType32 = $Create.Nullable($$createType31);
 const $$createType33 = $Create.Array($$createType32);
 const $$createType34 = sandbox$0.ProviderStatus.createFrom;
 const $$createType35 = $Create.Array($$createType34);
-const $$createType36 = $Create.Array($$createType16);
-const $$createType37 = $models.SmartRouteResult.createFrom;
-const $$createType38 = $Create.Map($Create.Any, $Create.Any);
+const $$createType36 = $Create.Array($$createType18);
+const $$createType37 = $models.AgentRunResultV2.createFrom;
+const $$createType38 = $models.SmartRouteResult.createFrom;
+const $$createType39 = $Create.Map($Create.Any, $Create.Any);

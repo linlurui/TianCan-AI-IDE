@@ -144,9 +144,9 @@ export default function SkillPanel() {
       if (!file) return;
       const text = await file.text();
       try {
-        let result: string;
+        let result: string = "ok";
         if (file.name.endsWith(".yaml") || file.name.endsWith(".yml")) {
-          result = await InstallSkill(text);
+          await InstallSkill(text);
         } else {
           result = await ImportSkillsFromFile(file.name);
         }
