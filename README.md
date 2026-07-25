@@ -162,7 +162,7 @@ go build -tags production -o tiancan-ai-ide .
 - 多语言断点调试（Go / Python / JS / C++ / Java / Dart，DAP 协议）
 - Git 版本控制（提交、分支、Diff、历史、Stage/Unstage）
 - AI Agent TAOR 主循环 + RalphLoop 自纠错
-- AgentV2 增强版（分析/规划/执行分离）
+- AgentV2 增强版（分析/规划/执行分离，默认启用，支持并行/Rollback/MCP）
 - 40+ 工具集（文件/搜索/LSP/Git/测试/DB/API/部署/沙箱）
 - TaskClassifier 意图分类 + 10 角色自动路由
 - Smart Router 硬件感知（任务分类 + 失败降级 + GPU 感知）
@@ -198,8 +198,11 @@ go build -tags production -o tiancan-ai-ide .
 ### 🚧 进行中 / 规划中
 
 - 多窗口独立面板（编辑器 / 终端 / AI / 调试各自独立窗口）
-- 团队协作功能
-- 技能市场（社区技能导入/导出/共享）
+- 团队协作功能（[设计中 - 见 docs/TEAM_COLLABORATION.md](docs/TEAM_COLLABORATION.md)）
+  - 账号体系与 ccait.cn 打通
+  - 项目邀请链接系统
+  - AI 记忆云端同步
+  - Agent 能力发现网络
 
 ---
 
