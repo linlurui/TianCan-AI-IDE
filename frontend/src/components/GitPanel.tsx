@@ -1,16 +1,17 @@
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import { useTranslation } from "../i18n";
-import { ChevronDown, ChevronRight, GitBranch, RefreshCw, Check, X, FilePlus, RotateCcw, MinusCircle, FolderOpen, History, Undo2, Trash2, FileCode } from "lucide-react";
+import { ChevronDown, ChevronRight, GitBranch, RefreshCw, Check, X, FilePlus, RotateCcw, MinusCircle, FolderOpen, History, Undo2, Upload, Loader2 } from "lucide-react";
 import { RepoStatus, CommitInfo, CommitFileInfo, GetFileDiff, StageFile, UnstageFile, DiscardFile, GetLog, RevertCommit, GetCommitFiles, GetCommitFileDiff, RestoreFileFromCommit } from "@bindings/git";
 import { DeleteFile } from "@bindings/filesystem";
 
 interface GitPanelProps {
   status: RepoStatus | null;
   workingDir: string | null;
-  onInitRepo: () => void;
-  onStageAll: () => void;
-  onCommit: (message: string) => void;
-  onRefresh: () => void;
+  onInitRepo: () => void | Promise<void>;
+  onStageAll: () => void | Promise<void>;
+  onCommit: (message: string) => void | Promise<void>;
+  onPush?: () => void | Promise<void>;
+  onRefresh: () => void | Promise<void>;
   onOpenFile?: (path: string) => void;
   onCommitClick?: (commit: CommitInfo) => void;
 }
@@ -46,7 +47,7 @@ function DiffViewer({ diff }: { diff: string }) {
 }
 
 export default function GitPanel({
-  status, workingDir, onInitRepo, onStageAll, onCommit, onRefresh, onOpenFile, onCommitClick,
+  status, workingDir, onInitRepo, onStageAll, onCommit, onPush, onRefresh, onOpenFile, onCommitClick,
 }: GitPanelProps) {
   const [commitMsg, setCommitMsg] = useState("");
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -58,6 +59,8 @@ export default function GitPanel({
   const [commits, setCommits] = useState<CommitInfo[]>([]);
   const [logLoading, setLogLoading] = useState(false);
   const [revertingHash, setRevertingHash] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [gitError, setGitError] = useState<string | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
   const { t } = useTranslation();
 
@@ -87,11 +90,12 @@ export default function GitPanel({
     if (!workingDir) return;
     if (!window.confirm(t("git.confirmRevert", { msg: msg.split("\n")[0] }))) return;
     setRevertingHash(hash);
+    setGitError(null);
     try {
       await RevertCommit(workingDir, hash);
-      onRefresh();
-      loadLog();
-    } catch (err) { alert(String(err)); }
+      await onRefresh();
+      await loadLog();
+    } catch (err) { setGitError(String(err)); alert(String(err)); }
     finally { setRevertingHash(null); }
   }, [workingDir, onRefresh, loadLog]);
 
@@ -105,6 +109,8 @@ export default function GitPanel({
     if (!workingDir || !fileCtxMenu) return;
     const fp = fileCtxMenu.filePath;
     setFileCtxMenu(null);
+    setBusyAction(`${action}:${fp}`);
+    setGitError(null);
     try {
       if (action === "stage")   await StageFile(workingDir, fp);
       if (action === "unstage") await UnstageFile(workingDir, fp);
@@ -116,8 +122,9 @@ export default function GitPanel({
         if (!window.confirm(t("git.confirmDelete", { file: fp }))) return;
         await DeleteFile(workingDir + "/" + fp);
       }
-      onRefresh();
-    } catch (err) { alert(String(err)); }
+      await onRefresh();
+    } catch (err) { setGitError(String(err)); alert(String(err)); }
+    finally { setBusyAction(null); }
   }, [workingDir, fileCtxMenu, onRefresh]);
 
   const handleFileClick = useCallback(async (filePath: string) => {
@@ -168,12 +175,51 @@ export default function GitPanel({
     (f) => f.worktree === "?" && f.staging === "?"
   ) ?? [];
 
-  const handleCommit = () => {
+  const handleCommit = async () => {
     if (!commitMsg.trim()) return;
-    onStageAll();
-    onCommit(commitMsg.trim());
-    setCommitMsg("");
+    setBusyAction("commit");
+    setGitError(null);
+    try {
+      await onStageAll();
+      await onCommit(commitMsg.trim());
+      setCommitMsg("");
+      await onRefresh();
+    } catch (err) {
+      setGitError(String(err));
+      alert(String(err));
+    } finally {
+      setBusyAction(null);
+    }
   };
+
+  const handleRefresh = async () => {
+    setBusyAction("refresh");
+    setGitError(null);
+    try {
+      await onRefresh();
+    } catch (err) {
+      setGitError(String(err));
+      alert(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handlePush = async () => {
+    if (!onPush) return;
+    setBusyAction("push");
+    setGitError(null);
+    try {
+      await onPush();
+      await onRefresh();
+    } catch (err) {
+      setGitError(String(err));
+      alert(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+  const busy = busyAction !== null;
 
   return (
     <div className="git-panel">
@@ -182,10 +228,14 @@ export default function GitPanel({
           <GitBranch size={13} />
           {status.branch}
         </div>
-        <button className="sidebar-header-btn sidebar-header-btn-always" onClick={onRefresh} title={t("git.refreshStatus")}>
-          <RefreshCw size={12} />
+        <button className="sidebar-header-btn sidebar-header-btn-always" onClick={handleRefresh} disabled={busy} title={t("git.refreshStatus")}>
+          {busyAction === "refresh" ? <Loader2 size={12} className="spin" /> : <RefreshCw size={12} />}
         </button>
       </div>
+
+      {gitError && (
+        <div className="git-error-banner">{gitError}</div>
+      )}
 
       {changedFiles.length === 0 && untrackedFiles.length === 0 ? (
         <div style={{ fontSize: "12px", color: "var(--success)", padding: "4px 0", display: "flex", alignItems: "center", gap: 4 }}>
@@ -277,29 +327,43 @@ export default function GitPanel({
         </>
       )}
 
-      {changedFiles.length > 0 && (
+      {(changedFiles.length > 0 || onPush) && (
         <div className="commit-area">
-          <textarea
-            className="commit-input"
-            placeholder={t("git.commitPlaceholder")}
-            value={commitMsg}
-            onChange={(e) => setCommitMsg(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault();
-                handleCommit();
-              }
-            }}
-            rows={2}
-          />
-          <button
-            className="btn-primary"
-            style={{ width: "100%" }}
-            disabled={!commitMsg.trim()}
-            onClick={handleCommit}
-          >
-            {t("git.stageAndCommit")}
-          </button>
+          {changedFiles.length > 0 && (
+            <>
+              <textarea
+                className="commit-input"
+                placeholder={t("git.commitPlaceholder")}
+                value={commitMsg}
+                onChange={(e) => setCommitMsg(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    handleCommit();
+                  }
+                }}
+                rows={2}
+              />
+              <button
+                className="btn-primary"
+                style={{ width: "100%" }}
+                disabled={!commitMsg.trim() || busy}
+                onClick={handleCommit}
+              >
+                {busyAction === "commit" ? <><Loader2 size={12} className="spin" /> {t("git.committing")}</> : t("git.stageAndCommit")}
+              </button>
+            </>
+          )}
+          {onPush && (
+            <button
+              className="btn-ghost git-push-btn"
+              style={{ width: "100%" }}
+              disabled={busy}
+              onClick={handlePush}
+            >
+              {busyAction === "push" ? <><Loader2 size={12} className="spin" /> {t("git.pushing")}</> : <><Upload size={12} /> {t("git.push")}</>}
+            </button>
+          )}
         </div>
       )}
       {fileCtxMenu && (

@@ -104,6 +104,13 @@ export function InitRepo(path: string): $CancellablePromise<void> {
 }
 
 /**
+ * Push pushes the current branch to its configured upstream.
+ */
+export function Push(repoPath: string): $CancellablePromise<void> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/git.Service.Push", repoPath);
+}
+
+/**
  * RestoreFileFromCommit restores a single file to its state at the given commit.
  */
 export function RestoreFileFromCommit(repoPath: string, hash: string, filePath: string): $CancellablePromise<void> {

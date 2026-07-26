@@ -26,6 +26,7 @@ import (
 	"github.com/rocky233/tiancan-ai-ide/backend/agent/tools"
 	agenttypes "github.com/rocky233/tiancan-ai-ide/backend/agent/types"
 	aiprovider "github.com/rocky233/tiancan-ai-ide/backend/ai/providers"
+	"github.com/rocky233/tiancan-ai-ide/backend/memory"
 	"github.com/rocky233/tiancan-ai-ide/backend/router"
 	"github.com/rocky233/tiancan-ai-ide/backend/sandbox"
 	"github.com/rocky233/tiancan-ai-ide/backend/skills"
@@ -1928,6 +1929,8 @@ func (s *Service) toolDescriptions(rootPath string) string {
 
 	// Add use_skill virtual tool
 	b.WriteString("- **use_skill**: 调用预定义技能包，按步骤自动执行\n  参数 Schema: {\"skill\": \"技能名称\"}\n\n")
+	b.WriteString("- **project_memory_remember**: 保存一条重要、长期有效的项目记忆，适合架构决策、约定、踩坑、用户偏好。不要保存可直接从代码读取的普通内容\n  参数 Schema: {\"content\":\"记忆内容\",\"type\":\"architecture|workflow|preference|bug|pattern|fact\",\"files\":[\"相关文件\"],\"concepts\":[\"关键词\"]}\n\n")
+	b.WriteString("- **project_memory_recall**: 读取当前项目的精简记忆，用于在少量 token 内恢复关键上下文\n  参数 Schema: {\"query\":\"可选查询\",\"limit\":8}\n\n")
 
 	// List available skills
 	sm := skills.NewManager(rootPath)
@@ -1953,6 +1956,31 @@ func (s *Service) ExecuteTool(name string, args map[string]interface{}, rootPath
 	if name == "use_skill" {
 		return s.executeSkill(args, rootPath)
 	}
+	if name == "project_memory_remember" {
+		content, _ := args["content"].(string)
+		memType, _ := args["type"].(string)
+		mem, err := memory.Remember(rootPath, content, memType, stringSliceArg(args["files"]), stringSliceArg(args["concepts"]))
+		if err != nil {
+			return fmt.Sprintf("保存项目记忆失败: %s", err)
+		}
+		return fmt.Sprintf("已保存项目记忆: %s", mem.Title)
+	}
+	if name == "project_memory_recall" {
+		query, _ := args["query"].(string)
+		limit := intArg(args["limit"], 8)
+		memories, err := memory.Recall(rootPath, query, limit)
+		if err != nil {
+			return fmt.Sprintf("读取项目记忆失败: %s", err)
+		}
+		if len(memories) == 0 {
+			return "当前项目暂无记忆"
+		}
+		var lines []string
+		for _, m := range memories {
+			lines = append(lines, fmt.Sprintf("- [%s] %s", m.Type, m.Content))
+		}
+		return strings.Join(lines, "\n")
+	}
 
 	r := s.getRegistry(rootPath)
 	result, err := r.Execute(context.Background(), name, args)
@@ -1975,6 +2003,49 @@ func (s *Service) ExecuteTool(name string, args map[string]interface{}, rootPath
 		return result.Content
 	}
 	return fmt.Sprintf("工具 %s 执行失败: %s", name, result.Content)
+}
+
+func stringSliceArg(v interface{}) []string {
+	items, ok := v.([]interface{})
+	if !ok {
+		if ss, ok := v.([]string); ok {
+			return ss
+		}
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
+}
+
+func intArg(v interface{}, fallback int) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case float64:
+		return int(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return fallback
+}
+
+func (s *Service) projectMemoryContext(rootPath, query string) string {
+	return memory.RenderContext(rootPath, query, 1200)
+}
+
+func (s *Service) withProjectMemory(rootPath, query, prompt string) string {
+	ctx := s.projectMemoryContext(rootPath, query)
+	if ctx == "" {
+		return prompt
+	}
+	return prompt + "\n\n" + ctx
 }
 
 // executeSkill runs a skill by name, executing each step sequentially.
@@ -2627,6 +2698,7 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 - 不要猜测文件内容，先用 read_file 查看
 - 修改代码前先读取原文件
 - 完成任务后直接回复用户，不要再调用工具`, rootPath, s.toolDescriptions(rootPath))
+	systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
 
 	messages := []ChatMessage{
 		{Role: "system", Content: systemPrompt},
@@ -2706,6 +2778,7 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 - 不要猜测文件内容，先用 read_file 查看
 - 修改代码前先读取原文件
 - 完成任务后直接回复用户，不要再调用工具`, rootPath, s.toolDescriptions(rootPath))
+	systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
 
 	messages := []ChatMessage{
 		{Role: "system", Content: systemPrompt},
@@ -2854,6 +2927,7 @@ func (s *Service) SmartAgentRunV2(userMessage string, rootPath string, maxIterat
 	if maxIterations <= 0 {
 		maxIterations = 20
 	}
+	userMessageWithMemory := s.withProjectMemory(rootPath, userMessage, userMessage)
 
 	// 创建 AgentV2 实例，注入 LLM 调用函数
 	// AgentV2.NewAgentV2 接收 compact.ChatFunc: func(prompt string) (string, error)
@@ -2871,11 +2945,11 @@ func (s *Service) SmartAgentRunV2(userMessage string, rootPath string, maxIterat
 	agentV2 := agent.NewAgentV2(rootPath, chatFn)
 
 	// 分析任务类型
-	analysis := agentV2.GetAnalysis(userMessage)
+	analysis := agentV2.GetAnalysis(userMessageWithMemory)
 
 	// 统一走标准 V2 工具循环，确保所有 provider 都能持续收到工具执行结果。
 	// Parallel/Ralph V2 目前只完成了单轮工具执行，不适合作为 Auto 默认路径。
-	result := agentV2.RunV2(context.Background(), userMessage, maxIterations, agentChatFn)
+	result := agentV2.RunV2(context.Background(), userMessageWithMemory, maxIterations, agentChatFn)
 
 	// 转换结果
 	return AgentRunResultV2{
@@ -3263,6 +3337,7 @@ func (s *Service) agentStreamAPI(userMessage string, rootPath string, maxIterati
 - 不要猜测文件内容，先用 read_file 查看
 - 修改代码前先读取原文件
 - 完成任务后直接回复用户，不要再调用工具`, rootPath, s.toolDescriptions(rootPath))
+		systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
 
 		messages := []ChatMessage{
 			{Role: "system", Content: systemPrompt},
@@ -3471,6 +3546,7 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
   * 涉及删除或覆盖操作但未确认目标
 - 澄清时，给出具体的选项让用户选择，例如"你是指 A 还是 B？"
 - 如果需求足够明确，直接执行，不要不必要地提问`, rootPath, s.toolDescriptions(rootPath))
+		systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
 
 		messages := []ChatMessage{
 			{Role: "system", Content: systemPrompt},
@@ -3876,17 +3952,20 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 	a := agent.NewAgent(rootPath)
 	a.Registry().SetSandboxManager(s.sandboxMgr)
 	a.Registry().SetRollbackManager(a.GetRollbackManager())
+	userMessageWithMemory := s.withProjectMemory(rootPath, userMessage, userMessage)
 
 	// Build chat function based on mode
 	var chatFn agent.ChatFunc
 	switch mode {
 	case "local":
 		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
+			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
 			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
 			return s.Chat(chatMsgs)
 		}
 	case "api":
 		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
+			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
 			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
 			return s.ChatAPI(chatMsgs)
 		}
@@ -3894,6 +3973,8 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
 			// For web mode, concatenate all messages into a single prompt
 			var sb strings.Builder
+			sb.WriteString(s.withProjectMemory(rootPath, userMessage, systemPrompt))
+			sb.WriteString("\n")
 			for _, m := range msgs {
 				sb.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
 			}
@@ -3901,6 +3982,7 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 		}
 	default:
 		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
+			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
 			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
 			return s.Chat(chatMsgs)
 		}
@@ -3922,7 +4004,7 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 		}
 	})
 
-	return a.Run(context.Background(), userMessage, maxIterations, chatFn)
+	return a.Run(context.Background(), userMessageWithMemory, maxIterations, chatFn)
 }
 
 // ConnectMCPServer connects to an MCP server via the agent subsystem.
@@ -4166,7 +4248,7 @@ func (s *Service) buildWebToolPrompt(rootPath string) string {
 	b.WriteString("- When the user asks you to delete/remove a file, call bash with rm immediately. Do not just list files.\n\n")
 	b.WriteString("Available tools:\n\n")
 	b.WriteString(s.toolDescriptions(rootPath))
-	return b.String()
+	return s.withProjectMemory(rootPath, "", b.String())
 }
 
 // formatWebToolResults formats tool results for the next web prompt.
@@ -4260,8 +4342,12 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 		// Follow-up message: inject previous turn context so the model remembers
 		// what was requested and what was already done.
 		var contextBlock string
-		if lastRequest != "" || lastActions != "" {
+		projectMemory := s.projectMemoryContext(rootPath, userMessage)
+		if lastRequest != "" || lastActions != "" || projectMemory != "" {
 			contextBlock = "\n<previous_context>\n"
+			if projectMemory != "" {
+				contextBlock += projectMemory + "\n"
+			}
 			if lastRequest != "" {
 				contextBlock += fmt.Sprintf("Previous user request: %s\n", lastRequest)
 			}

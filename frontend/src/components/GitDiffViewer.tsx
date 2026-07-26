@@ -4,6 +4,7 @@ import { useTranslation } from "../i18n";
 import { Loader2, GitCompare } from "lucide-react";
 import { GetHeadFileContent } from "@bindings/git";
 import { ReadFile } from "@bindings/filesystem";
+import { registerDartLanguage } from "../monaco/dart";
 
 interface GitDiffViewerProps {
   repoPath: string;
@@ -21,7 +22,7 @@ export default function GitDiffViewer({ repoPath, relPath }: GitDiffViewerProps)
   const LANG_MAP: Record<string, string> = {
     ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
     go: "go", py: "python", rs: "rust", java: "java", cpp: "cpp", c: "c",
-    cs: "csharp", rb: "ruby", php: "php", kt: "kotlin",
+    cs: "csharp", rb: "ruby", php: "php", kt: "kotlin", dart: "dart",
     json: "json", yaml: "yaml", yml: "yaml", toml: "toml", xml: "xml",
     html: "html", css: "css", scss: "scss", less: "less",
     vue: "html", md: "markdown", sh: "shell", bash: "shell",
@@ -85,6 +86,7 @@ export default function GitDiffViewer({ repoPath, relPath }: GitDiffViewerProps)
           original={original ?? ""}
           modified={modified ?? ""}
           language={lang}
+          beforeMount={registerDartLanguage}
           theme="vs-dark"
           options={{
             readOnly: true,

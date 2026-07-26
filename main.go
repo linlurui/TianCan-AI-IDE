@@ -15,6 +15,7 @@ import (
 	"github.com/rocky233/tiancan-ai-ide/backend/filesystem"
 	"github.com/rocky233/tiancan-ai-ide/backend/git"
 	"github.com/rocky233/tiancan-ai-ide/backend/lsp"
+	"github.com/rocky233/tiancan-ai-ide/backend/memory"
 	"github.com/rocky233/tiancan-ai-ide/backend/playwright"
 	"github.com/rocky233/tiancan-ai-ide/backend/process"
 	"github.com/rocky233/tiancan-ai-ide/backend/project"
@@ -45,6 +46,7 @@ func main() {
 			application.NewService(terminal.NewService()),
 			application.NewService(project.NewService()),
 			application.NewService(lspService),
+			application.NewService(memory.NewService()),
 			application.NewService(database.NewService()),
 			application.NewService(deploy.NewService()),
 			application.NewService(debug.NewService()),

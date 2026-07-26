@@ -8,6 +8,7 @@ export {
   GetLog,
   GetFileDiff,
   GetHeadFileContent,
+  Push,
   StageFile,
   UnstageFile,
   DiscardFile,

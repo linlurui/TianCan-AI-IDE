@@ -3,6 +3,7 @@ import { DiffEditor } from "@monaco-editor/react";
 import { useTranslation } from "../i18n";
 import { Loader2, RotateCcw } from "lucide-react";
 import { GetCommitFileDiff, RestoreFileFromCommit } from "@bindings/git";
+import { registerDartLanguage } from "../monaco/dart";
 
 interface CommitFileDiffViewerProps {
   repoPath: string;
@@ -22,7 +23,7 @@ export default function CommitFileDiffViewer({ repoPath, commitHash, filePath }:
   const LANG_MAP: Record<string, string> = {
     ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
     go: "go", py: "python", rs: "rust", java: "java", cpp: "cpp", c: "c",
-    cs: "csharp", rb: "ruby", php: "php", kt: "kotlin",
+    cs: "csharp", rb: "ruby", php: "php", kt: "kotlin", dart: "dart",
     json: "json", yaml: "yaml", yml: "yaml", toml: "toml", xml: "xml",
     html: "html", css: "css", scss: "scss", less: "less",
     vue: "html", md: "markdown", sh: "shell", bash: "shell",
@@ -152,6 +153,7 @@ export default function CommitFileDiffViewer({ repoPath, commitHash, filePath }:
         <DiffEditor
           height="100%"
           language={lang}
+          beforeMount={registerDartLanguage}
           original={original}
           modified={modified}
           theme="vs-dark"

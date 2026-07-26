@@ -6,6 +6,7 @@
 import React, { useEffect, useRef, useCallback } from "react";
 import { ChevronUp, X, Check, XCircle } from "lucide-react";
 import type * as Monaco from "monaco-editor";
+import { registerDartLanguage } from "../monaco/dart";
 
 interface MonacoDiffViewerProps {
   originalContent: string;
@@ -25,6 +26,7 @@ const LANG_MAP: Record<string, string> = {
   ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
   go: "go", py: "python", rs: "rust", java: "java", cpp: "cpp", c: "c",
   cs: "csharp", rb: "ruby", php: "php", swift: "swift", kt: "kotlin",
+  dart: "dart",
   json: "json", yaml: "yaml", yml: "yaml", toml: "toml", xml: "xml",
   html: "html", css: "css", scss: "scss", less: "less",
   vue: "html",
@@ -83,6 +85,7 @@ export default function MonacoDiffViewer({
 
     try {
       const monaco = await getMonaco();
+      registerDartLanguage(monaco);
 
       // 定义主题（如果还没有）
       const currentTheme = (monaco.editor as any).getTheme?.() || "";

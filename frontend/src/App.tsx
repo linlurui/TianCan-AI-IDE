@@ -20,7 +20,7 @@ import { Task } from "./bindings/task";
 import RemotePanel from "./components/RemotePanel";
 
 import { ReadFile, WriteFile, GetDirectoryTree, SelectDirectory, FileNode } from "./bindings/filesystem";
-import { GetStatus, InitRepo, StageAll, Commit } from "./bindings/git";
+import { GetStatus, InitRepo, StageAll, Commit, Push } from "./bindings/git";
 import {
   SearchExtensions, GetInstalledExtensions, InstallExtension, UninstallExtension,
   InstallLocalVSIX, GetExtensionIcon, GetExtensionContributes,
@@ -82,6 +82,7 @@ const LANG_MAP: Record<string, string> = {
   ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
   go: "go", py: "python", rs: "rust", java: "java", cpp: "cpp", c: "c",
   cs: "csharp", rb: "ruby", php: "php", swift: "swift", kt: "kotlin",
+  dart: "dart",
 };
 
 function langOf(path: string): string {
@@ -93,7 +94,7 @@ function langOf(path: string): string {
 const BINARY_EXTS = new Set(["pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx"]);
 const ANALYSIS_EXTS = new Set([
   "html", "htm", "xml", "css", "scss", "less", "sass",
-  "ts", "tsx", "js", "jsx", "go", "py", "java", "kt", "scala",
+  "ts", "tsx", "js", "jsx", "go", "py", "java", "kt", "dart", "scala",
   "rs", "c", "cpp", "cc", "h", "hpp", "php", "rb", "vue", "md", "mdx", "json",
 ]);
 
@@ -688,9 +689,10 @@ export default function App() {
               status={project.activeProject?.gitStatus ?? null}
               workingDir={project.activeProject?.rootPath ?? null}
               onInitRepo={handleInitRepo}
-              onStageAll={() => project.activeProject && StageAll(project.activeProject.rootPath)}
+              onStageAll={async () => { if (project.activeProject) await StageAll(project.activeProject.rootPath); }}
               onCommit={handleCommit}
-              onRefresh={() => project.activeProject && project.refreshProject(project.activeProject.id)}
+              onPush={async () => { if (project.activeProject) await Push(project.activeProject.rootPath); }}
+              onRefresh={async () => { if (project.activeProject) await project.refreshProject(project.activeProject.id); }}
               onCommitClick={(commit) => {
                 if (!project.activeProject) return;
                 const tabPath = `__commit_detail__:${project.activeProject.rootPath}:${commit.hash}`;

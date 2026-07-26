@@ -5,6 +5,7 @@ import MonacoEditor, { OnMount } from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
 import { getLspClient, disposeLspClient } from "../lsp/client";
 import LspInstallBanner, { useLspCheck } from "./LspInstallBanner";
+import { registerDartLanguage } from "../monaco/dart";
 
 interface Tab {
   path: string;
@@ -45,6 +46,7 @@ const LANG_MAP: Record<string, string> = {
   ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
   go: "go", py: "python", rs: "rust", java: "java", cpp: "cpp", c: "c",
   cs: "csharp", rb: "ruby", php: "php", swift: "swift", kt: "kotlin",
+  dart: "dart",
   json: "json", yaml: "yaml", yml: "yaml", toml: "toml", xml: "xml",
   html: "html", css: "css", scss: "scss", less: "less",
   vue: "html",
@@ -86,6 +88,10 @@ export default function Editor({
   const handleMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
+    registerDartLanguage(monaco);
+    if (activeTabData?.path) {
+      monaco.editor.setModelLanguage(editor.getModel()!, langOf(activeTabData.path));
+    }
     onMonacoMount?.(monaco);
     onEditorMount?.(editor);
 

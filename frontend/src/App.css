@@ -1599,6 +1599,26 @@ body {
 
 .git-log-revert-btn:disabled { opacity: 0.4; cursor: default; }
 
+.git-error-banner {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(248, 81, 73, 0.35);
+  background: rgba(248, 81, 73, 0.08);
+  color: var(--error);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.git-push-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
 .git-log-msg {
   font-size: 11px;
   color: var(--text-primary);

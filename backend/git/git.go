@@ -3,6 +3,7 @@ package git
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -227,13 +228,32 @@ func (s *Service) UnstageFile(repoPath, filePath string) error {
 	return nil
 }
 
-// DiscardFile discards working-tree changes for a file (git checkout -- <file>).
-// For untracked files it removes the file entirely.
+// DiscardFile discards all uncommitted changes for a file.
+// Existing files are restored in both the index and worktree. Files added after
+// HEAD are removed, matching the user's "restore this file" expectation.
 func (s *Service) DiscardFile(repoPath, filePath string) error {
-	cmd := exec.Command("git", "checkout", "--", filePath)
-	cmd.Dir = repoPath
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("discard file: %w: %s", err, out)
+	if strings.TrimSpace(filePath) == "" {
+		return fmt.Errorf("discard file: empty file path")
+	}
+
+	existsInHead := exec.Command("git", "cat-file", "-e", "HEAD:"+filePath)
+	existsInHead.Dir = repoPath
+	if err := existsInHead.Run(); err == nil {
+		cmd := exec.Command("git", "restore", "--staged", "--worktree", "--", filePath)
+		cmd.Dir = repoPath
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("discard file: %w: %s", err, out)
+		}
+		return nil
+	}
+
+	rm := exec.Command("git", "rm", "-f", "--", filePath)
+	rm.Dir = repoPath
+	if out, err := rm.CombinedOutput(); err != nil {
+		abs := filepath.Join(repoPath, filePath)
+		if removeErr := os.Remove(abs); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("discard new file: %w: %s; remove: %v", err, out, removeErr)
+		}
 	}
 	return nil
 }
@@ -303,6 +323,16 @@ func (s *Service) RevertCommit(repoPath, hash string) error {
 	cmd.Dir = repoPath
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("revert commit: %w: %s", err, out)
+	}
+	return nil
+}
+
+// Push pushes the current branch to its configured upstream.
+func (s *Service) Push(repoPath string) error {
+	cmd := exec.Command("git", "push")
+	cmd.Dir = repoPath
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("push: %w: %s", err, out)
 	}
 	return nil
 }
