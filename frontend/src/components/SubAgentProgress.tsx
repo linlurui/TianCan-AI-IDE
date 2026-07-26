@@ -14,7 +14,7 @@ import {
   Target, ArrowRight, Clock, AlertCircle
 } from "lucide-react";
 import { useAgentProgressStore } from "../hooks/useAgentProgress";
-import { AgentTask } from "../bindings/task";
+import { AgentTask } from "@bindings/task";
 
 interface SubAgentStep {
   agentId: string;

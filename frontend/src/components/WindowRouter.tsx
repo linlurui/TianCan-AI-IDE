@@ -1,9 +1,9 @@
 import React, { useEffect, useState, useRef, useCallback } from "react";
-import { StartAndGetPort } from "../bindings/terminal";
-import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, SmartAgentRun } from "../bindings/ai";
-import { ReadFile, WriteFile, SelectDirectory } from "../bindings/filesystem";
+import { StartAndGetPort } from "@bindings/terminal";
+import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, SmartAgentRun } from "@bindings/ai";
+import { ReadFile, WriteFile, SelectDirectory } from "@bindings/filesystem";
 import { Events } from "@wailsio/runtime";
-import AIPanel, { type Message, type ModelSource } from "./AIPanel";
+import AIPanel, { type Message, type ModelSource, type ActivityItem } from "./AIPanel";
 import DebugPanel from "./DebugPanel";
 import SplitEditorArea from "./SplitEditorArea";
 import { useEditorStore } from "../store/editorStore";
@@ -13,6 +13,35 @@ import "../App.css";
 function getWindowMode(): string {
   const params = new URLSearchParams(window.location.search);
   return params.get("window") || "main";
+}
+
+function normalizeAgentMessages(rawMessages: any[], pushActivity?: (kind: ActivityItem["kind"], text: string, detail?: string) => void): Message[] {
+  const rawMsgs = (rawMessages ?? []).filter((m: any) => m?.role !== "user");
+  const agentMsgs: Message[] = [];
+
+  for (let i = 0; i < rawMsgs.length; i++) {
+    const m = rawMsgs[i] ?? {};
+    const next = rawMsgs[i + 1] ?? {};
+    const role = String(m.role || "assistant");
+    const content = String(m.content ?? "");
+    const name = m.name || m.toolName || "";
+
+    if (!content.trim() && role !== "tool_call") continue;
+
+    if (role === "assistant" && next && (next.role === "tool_call" || next.role === "tool_result" || next.role === "tool")) {
+      pushActivity?.("thinking", "模型正在规划下一步", "检测到模型准备使用工具，等待工具执行结果");
+    } else if (role === "tool_call") {
+      pushActivity?.("tool", `调用工具 ${name || "tool"}`);
+    } else if (role === "tool_result" || role === "tool") {
+      pushActivity?.("result", `工具返回 ${name || "结果"}`, content.slice(0, 160));
+    } else if (role === "thinking") {
+      pushActivity?.("thinking", "模型正在分析上下文", "已收到模型中间分析信号，继续等待最终回复");
+    } else {
+      agentMsgs.push({ role: "assistant", content });
+    }
+  }
+
+  return agentMsgs;
 }
 
 // ─── Terminal Window ──────────────────────────────────────────────────────
@@ -52,7 +81,31 @@ function TerminalWindow() {
 function AIWindow() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(false);
+  const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const streamRef = useRef<any>(null);
+
+  const pushActivity = useCallback((kind: ActivityItem["kind"], text: string, detail?: string) => {
+    setActivityItems([{ id: Date.now() + Math.random(), kind, text, detail }]);
+  }, []);
+
+  useEffect(() => {
+    const off = Events.On("ai:provider", (evt: any) => {
+      const data = evt?.data ?? evt;
+      const provider = data?.provider || "模型";
+      const detail = data?.detail || "";
+      const status = data?.status || "attempt";
+      if (status === "success") {
+        pushActivity("thinking", "正在整理回复", "模型已返回内容，正在转换为聊天消息");
+      } else if (status === "error") {
+        pushActivity("thinking", "正在切换可用模型", detail || `当前通道 ${provider} 没有可用回复，继续尝试下一个`);
+      } else if (status === "skip") {
+        pushActivity("thinking", "继续寻找可用模型", `${provider} 暂不可用，跳过并检查后续通道`);
+      } else {
+        pushActivity("thinking", "正在等待模型推理", `已把当前请求交给 ${provider}`);
+      }
+    });
+    return () => { off(); };
+  }, [pushActivity]);
 
   // Cleanup streaming listener on unmount
   useEffect(() => {
@@ -65,31 +118,30 @@ function AIWindow() {
     if (text === "__clear__") {
       if (streamRef.current) { Events.Off("agent:stream"); streamRef.current = null; }
       setMessages([]);
+      setActivityItems([]);
       return;
     }
-    setMessages((p) => [...p, { role: "user", content: text }]);
+    setMessages((p) => [
+      ...p,
+      { role: "user", content: text },
+    ]);
     setLoading(true);
+    setActivityItems([]);
 
     const rootPath = ""; // AI window doesn't have a project context; tools will use default
+    pushActivity("thinking", "准备上下文", source === "auto" ? "Auto 将按可用模型自动尝试" : `使用 ${source} 模式处理当前请求`);
 
     try {
       if (source === "auto") {
+        pushActivity("route", "选择 Auto 路由", "独立 AI 窗口暂无项目目录");
         const result = await SmartAgentRun(text, rootPath, 20);
-        const rawMsgs = (result.messages ?? []).filter((m: any) => m.role !== "user");
-        const agentMsgs: Message[] = [];
-        for (let i = 0; i < rawMsgs.length; i++) {
-          const m = rawMsgs[i];
-          const next = rawMsgs[i + 1];
-          if (m.role === "assistant" && next && (next.role === "tool_call" || next.role === "tool_result")) {
-            agentMsgs.push({ role: "thinking", content: m.content });
-          } else {
-            agentMsgs.push({ role: m.role as Message["role"], content: m.content, name: m.name });
-          }
-        }
+        const agentMsgs = normalizeAgentMessages(result.messages ?? [], pushActivity);
         setMessages((p) => [...p, ...agentMsgs]);
+        pushActivity(result.error ? "error" : "success", result.error ? "执行结束但有错误" : "已生成回复");
       } else if (source === "local") {
         // Streaming for local
         if (streamRef.current) { Events.Off("agent:stream"); streamRef.current = null; }
+        pushActivity("route", "连接本地模型", "等待流式响应");
         setMessages((p) => [...p, { role: "assistant", content: "" }]);
 
         const handler = (evt: any) => {
@@ -108,20 +160,22 @@ function AIWindow() {
               });
               break;
             case "tool_call":
+              pushActivity("tool", `调用工具 ${data?.name || "tool"}`, eContent);
               setMessages((p) => {
                 const updated = [...p];
                 const last = updated[updated.length - 1];
                 if (last && last.role === "assistant") {
                   updated[updated.length - 1] = { ...last, role: "thinking", content: last.content };
                 }
-                return [...updated, { role: "tool_call", content: eContent, name: data?.name }];
+                return updated;
               });
               break;
             case "tool_result":
-              setMessages((p) => [...p, { role: "tool_result", content: eContent, name: data?.name }]);
+              pushActivity("result", `工具完成 ${data?.name || "tool"}`, eContent.slice(0, 120));
               setMessages((p) => [...p, { role: "assistant", content: "" }]);
               break;
             case "done":
+              pushActivity("success", "任务完成");
               setMessages((p) => {
                 const updated = [...p];
                 const last = updated[updated.length - 1];
@@ -136,11 +190,13 @@ function AIWindow() {
               streamRef.current = null;
               break;
             case "stream_end":
+              pushActivity("success", "响应结束");
               setLoading(false);
               Events.Off("agent:stream");
               streamRef.current = null;
               break;
             case "error":
+              pushActivity("error", "执行失败", eContent);
               setMessages((p) => [...p, { role: "assistant", content: `❌ ${eContent}` }]);
               setLoading(false);
               Events.Off("agent:stream");
@@ -155,32 +211,26 @@ function AIWindow() {
         // API / Web blocking
         let result;
         if (source === "web") {
+          pushActivity("route", "使用 Web AI", "等待网页登录态响应");
           result = await AgentRunWeb(text, rootPath, 20);
         } else {
+          pushActivity("route", "使用 API", "等待接口响应");
           result = await AgentRunAPI(text, rootPath, 20);
         }
-        const rawMsgs = (result.messages ?? []).filter((m: any) => m.role !== "user");
-        const agentMsgs: Message[] = [];
-        for (let i = 0; i < rawMsgs.length; i++) {
-          const m = rawMsgs[i];
-          const next = rawMsgs[i + 1];
-          if (m.role === "assistant" && next && (next.role === "tool_call" || next.role === "tool_result")) {
-            agentMsgs.push({ role: "thinking", content: m.content });
-          } else {
-            agentMsgs.push({ role: m.role as Message["role"], content: m.content, name: m.name });
-          }
-        }
+        const agentMsgs = normalizeAgentMessages(result.messages ?? [], pushActivity);
         setMessages((p) => [...p, ...agentMsgs]);
+        pushActivity(result.error ? "error" : "success", result.error ? "执行结束但有错误" : "已生成回复");
       }
     } catch (err: any) {
+      pushActivity("error", "请求失败", err?.message ?? String(err));
       setMessages((p) => [...p, { role: "assistant", content: `❌ ${err?.message ?? err}` }]);
     }
     setLoading(false);
-  }, []);
+  }, [pushActivity]);
 
   return (
     <div className="ide-root" style={{ height: "100vh" }}>
-      <AIPanel messages={messages} onSend={handleSend} isLoading={loading} fullWidth />
+      <AIPanel messages={messages} onSend={handleSend} isLoading={loading} activityItems={activityItems} fullWidth />
     </div>
   );
 }

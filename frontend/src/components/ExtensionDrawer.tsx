@@ -2,7 +2,7 @@ import React from "react";
 import { useTranslation } from "../i18n";
 import { X } from "lucide-react";
 import ExtensionPanel from "./ExtensionPanel";
-import type { Extension } from "../bindings/extension";
+import type { Extension } from "@bindings/extension";
 import type * as Monaco from "monaco-editor";
 
 interface Props {

@@ -499,6 +499,29 @@
       "argsPlaceholder": "Space-separated, e.g. -y @modelcontextprotocol/server-filesystem ./data",
       "quickActions": "Quick Actions",
       "refresh": "Refresh Servers"
+    },
+    "sandbox": {
+      "title": "Sandbox Management",
+      "hint": "Choose a sandbox provider to isolate AI operations. Supports Docker, Daytona and E2B cloud sandbox",
+      "loading": "Loading...",
+      "providers": "Sandbox Providers",
+      "providerDocker": "Docker Container",
+      "providerDaytona": "Daytona",
+      "providerE2B": "E2B Cloud Sandbox",
+      "statusAvailable": "Available",
+      "statusNotRunning": "Not Running",
+      "statusNotInstalled": "Not Installed",
+      "install": "Auto Install",
+      "installing": "Installing...",
+      "setAsDefault": "Set as Default",
+      "e2bConfig": "E2B Configuration",
+      "e2bApiKey": "E2B API Key",
+      "e2bApiKeyPlaceholder": "sk-...",
+      "e2bSaved": "Saved",
+      "e2bGetKey": "Get API Key",
+      "activeSandboxes": "Active Sandboxes",
+      "stop": "Stop",
+      "refresh": "Refresh Status"
     }
   },
   "lsp": {

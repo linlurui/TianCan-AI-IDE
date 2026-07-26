@@ -48,7 +48,7 @@ func TestWorktreeConflictError(t *testing.T) {
 		Message:    "Merge conflict detected",
 	}
 
-	expected := "Merge conflict detected"
+	expected := "worktree conflict in feature/test: Merge conflict detected"
 	if err.Error() != expected {
 		t.Errorf("Expected error message '%s', got '%s'", expected, err.Error())
 	}

@@ -1,8 +1,8 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "../i18n";
 import { X, FolderOpen, ChevronRight, CheckCircle2, XCircle, Loader2, Terminal } from "lucide-react";
-import { DetectProjectTypes, RunSetup } from "../bindings/project";
-import type { DetectResult } from "../bindings/project";
+import { DetectProjectTypes, RunSetup } from "@bindings/project";
+import type { DetectResult } from "@bindings/project";
 
 type Step = "select-type" | "running" | "done";
 

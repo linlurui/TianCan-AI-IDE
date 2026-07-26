@@ -194,15 +194,21 @@ go build -tags production -o tiancan-ai-ide .
 - WebSearchTool 多引擎搜索（SearXNG/Bing/DuckDuckGo，分页/排序/时间范围）
 - 子 Agent Worktree 隔离（并行任务独立分支）
 - AutoResearch AI 驱动研究闭环（假设生成→实验→验证）
+- 多项目会话隔离（切换项目时聊天记录和任务自动切换，数据本地持久化）
 
 ### 🚧 进行中 / 规划中
 
-- 多窗口独立面板（编辑器 / 终端 / AI / 调试各自独立窗口）
 - 团队协作功能（[设计中 - 见 docs/TEAM_COLLABORATION.md](docs/TEAM_COLLABORATION.md)）
   - 账号体系与 ccait.cn 打通
   - 项目邀请链接系统
   - AI 记忆云端同步
   - Agent 能力发现网络
+
+### ✅ 沙箱 Provider 抽象层完成
+
+- **Daytona** - 本地容器隔离（完整功能）
+- **Docker** - 本地 Docker 容器（fallback）
+- **E2B** - 云端微虚拟机（已更新 v1 API，支持文件上传下载）
 
 ---
 

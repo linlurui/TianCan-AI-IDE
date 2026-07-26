@@ -19,6 +19,7 @@ import (
 	"github.com/rocky233/tiancan-ai-ide/backend/process"
 	"github.com/rocky233/tiancan-ai-ide/backend/project"
 	"github.com/rocky233/tiancan-ai-ide/backend/remote"
+	"github.com/rocky233/tiancan-ai-ide/backend/sandbox"
 	"github.com/rocky233/tiancan-ai-ide/backend/terminal"
 	"github.com/rocky233/tiancan-ai-ide/backend/window"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -53,6 +54,7 @@ func main() {
 			application.NewService(aiService),
 			application.NewService(winManager),
 			application.NewService(mcp.NewService()),
+			application.NewService(sandbox.NewService()),
 			// Rollback service - exposes checkpoint/rollback APIs to frontend
 			application.NewService(agent.NewRollbackBindings(project.GetProjectRoot())),
 			// Task service - exposes task tracking and apply/reject APIs to frontend

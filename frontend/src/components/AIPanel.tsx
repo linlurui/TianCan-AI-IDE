@@ -1,32 +1,34 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import { Events } from "@wailsio/runtime";
-import { Trash2, Paperclip, SendHorizontal, Cpu, Cloud, Download, Loader2, Key, Globe } from "lucide-react";
+import { Trash2, Paperclip, SendHorizontal, Cpu, Cloud, Download, Loader2, Key, Globe, Activity, Wrench, CheckCircle2, AlertCircle } from "lucide-react";
 import {
   ListModels, IsLMStudioInstalled, InstallLMStudio, LaunchLMStudio,
   SetModel, ListAPIProviders, SetAPIProvider, GetAPIProvider,
   ListWebProviders, LoginWeb, SetWebAuth, GetWebAuth, IsWebProviderLoggedIn,
   SmartRoute, RefreshModelStatuses,
-} from "../bindings/ai";
-import type { APIProviderConfig, WebProviderInfo } from "../bindings/ai";
+} from "@bindings/ai";
+import type { APIProviderConfig, WebProviderInfo } from "@bindings/ai";
 import SubAgentProgressPanel from "./SubAgentProgress";
 
 // ─── <think> block component ────────────────────────────────
-function ThinkBlock({ content, streaming }: { content: string; streaming?: boolean }) {
+function ThinkBlock({ content, streaming, title }: { content: string; streaming?: boolean; title?: string }) {
   const [open, setOpen] = useState(streaming ?? false);
+  const displayContent = content.trim() || (streaming ? "正在准备模型和项目上下文..." : "");
   return (
     <div className={`ai-think-block${streaming ? " ai-think-streaming" : ""}`}>
       <button className="ai-think-toggle" onClick={() => setOpen(o => !o)}>
         <span className="ai-think-chevron">{open ? "▾" : "▸"}</span>
-        <span>{streaming ? "思考中…" : "思考过程"}</span>
+        <span>{title || (streaming ? "思考中…" : "思考过程")}</span>
       </button>
-      {open && <div className="ai-think-content">{content.trim()}</div>}
+      {open && <div className="ai-think-content">{displayContent}</div>}
     </div>
   );
 }
 
 // Parse assistant content splitting on <think>...</think> blocks.
 function renderMessageContent(content: string): React.ReactNode[] {
+  content = content.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<think>[\s\S]*/g, "").trim();
   const parts: React.ReactNode[] = [];
   const re = /<think>([\s\S]*?)<\/think>/g;
   let last = 0, key = 0, m: RegExpExecArray | null;
@@ -74,7 +76,7 @@ function MessageBody({ msg, t }: { msg: Message; t: (key: string) => string }) {
     );
   }
   if (msg.role === "thinking") {
-    return <ThinkBlock content={msg.content} />;
+    return <ThinkBlock content={msg.content} streaming={msg.name === "__activity__"} title={msg.name === "__activity__" ? "执行过程" : undefined} />;
   }
   return (
     <>
@@ -93,6 +95,14 @@ export interface Message {
 }
 
 export type ModelSource = "auto" | "local" | "api" | "web";
+export type ActivityKind = "thinking" | "tool" | "result" | "success" | "error" | "route";
+
+export interface ActivityItem {
+  id: number;
+  kind: ActivityKind;
+  text: string;
+  detail?: string;
+}
 
 type LMModel = { id: string; label: string; available?: boolean; disable_reason?: string };
 
@@ -105,9 +115,52 @@ interface AIPanelProps {
   onSend: (text: string, source: ModelSource) => void;
   isLoading: boolean;
   fullWidth?: boolean;
+  contextToAppend?: { id: number; text: string } | null;
+  activityItems?: ActivityItem[];
 }
 
-export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPanelProps) {
+function ActivityIcon({ kind }: { kind: ActivityKind }) {
+  switch (kind) {
+    case "tool":
+      return <Wrench size={12} />;
+    case "result":
+    case "success":
+      return <CheckCircle2 size={12} />;
+    case "error":
+      return <AlertCircle size={12} />;
+    case "route":
+      return <Activity size={12} />;
+    default:
+      return <Loader2 size={12} className="spin" />;
+  }
+}
+
+function AIActivityStrip({ items, isLoading }: { items: ActivityItem[]; isLoading: boolean }) {
+  const currentItem = items[items.length - 1];
+  if (!isLoading && !currentItem) return null;
+
+  const fallback: ActivityItem = {
+    id: 0,
+    kind: "thinking",
+    text: "正在思考",
+    detail: "准备项目上下文和模型",
+  };
+  const current = currentItem || fallback;
+
+  return (
+    <div className={`ai-activity-strip ${isLoading ? "active" : "idle"}`}>
+      <div className={`ai-activity-current ${current.kind}`} title={current.detail || current.text}>
+        <ActivityIcon kind={current.kind} />
+        <span className="ai-activity-current-text">{current.text}</span>
+      </div>
+      <div className="ai-activity-process" title={current.detail || current.text}>
+        {current.detail || (isLoading ? "正在根据当前上下文等待模型返回" : "")}
+      </div>
+    </div>
+  );
+}
+
+export default function AIPanel({ messages, onSend, isLoading, fullWidth, contextToAppend, activityItems = [] }: AIPanelProps) {
   const [input, setInput] = React.useState("");
   const [source, setSource] = useState<ModelSource>(() => (localStorage.getItem("ai_source") as ModelSource) || "auto");
   const [routeInfo, setRouteInfo] = useState<{ tier: string; reason: string } | null>(null);
@@ -159,6 +212,16 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    if (!contextToAppend?.text) return;
+    setInput((current) => {
+      if (current.includes(contextToAppend.text)) return current;
+      const prefix = current.trimEnd();
+      return prefix ? `${prefix}\n${contextToAppend.text}` : contextToAppend.text;
+    });
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [contextToAppend?.id]);
 
   // Listen for Playwright-based web login events from the backend
   useEffect(() => {
@@ -353,14 +416,19 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
   const handleProviderChange = useCallback(async (name: string) => {
     const p = providers.find((x) => x.name === name);
     if (p) {
-      setActiveProvider(p);
-      setModel(p.model);
-      setCustomBaseUrl(p.baseUrl);
-      setCustomModel(p.model);
+      let next = p;
+      try {
+        const saved = await GetAPIProvider();
+        if (saved?.name === p.name) {
+          next = { ...p, ...saved, apiKey: saved.apiKey || p.apiKey || "" };
+        }
+      } catch { /* keep built-in defaults */ }
+      setActiveProvider(next);
+      setModel(next.model);
+      setCustomBaseUrl(next.baseUrl);
+      setCustomModel(next.model);
       setShowApiKeyInput(false);
-      setApiKeyInput("");
-      // Save to backend
-      await SetAPIProvider(p.name, p.baseUrl, "", p.model);
+      setApiKeyInput(next.apiKey || "");
     }
   }, [providers]);
 
@@ -684,7 +752,7 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
             {installLogs.map((l, i) => <div key={i}>{l}</div>)}
           </div>
         )}
-        {messages.length === 0 && (
+        {messages.filter((msg) => !["thinking", "tool_call", "tool_result"].includes(msg.role)).length === 0 && (
           <div style={{
             textAlign: "center",
             color: "var(--text-muted)",
@@ -724,7 +792,7 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
           </div>
         )}
 
-        {messages.map((msg, idx) => (
+        {messages.filter((msg) => !["thinking", "tool_call", "tool_result"].includes(msg.role)).map((msg, idx) => (
           <div key={idx} className={`ai-message ${msg.role}`}>
             <MessageBody msg={msg} t={t} />
           </div>
@@ -772,6 +840,8 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth }: AIPa
       />
 
       <SubAgentProgressPanel />
+
+      <AIActivityStrip items={activityItems} isLoading={isLoading} />
 
       <div className="ai-input-area" style={{ height: inputAreaHeight, minHeight: 100, maxHeight: 500 }}>
         <textarea

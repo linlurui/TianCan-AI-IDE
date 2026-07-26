@@ -2,8 +2,8 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "../i18n";
 import { GitBranch, Play, RotateCcw, Square, ChevronDown, RefreshCw, Loader2 } from "lucide-react";
 import { Project } from "../types";
-import { StopProject, IsRunning, ScanRunConfigs } from "../bindings/process";
-import { GetDebugStatus } from "../bindings/debug";
+import { StopProject, IsRunning, ScanRunConfigs } from "@bindings/process";
+import { GetDebugStatus } from "@bindings/debug";
 
 interface RunConfig { label: string; cmd: string }
 

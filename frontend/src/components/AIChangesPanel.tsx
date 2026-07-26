@@ -24,11 +24,12 @@ import {
   Eye,
   Diff,
 } from 'lucide-react';
-import { Task, AgentTask, TaskFile } from '../bindings/task';
+import { AgentTask, TaskFile } from '../bindings/task';
+import * as Task from '../bindings/task';
+import { GetFileOriginalContent } from '../bindings/task';
 import { useAgentProgressStore } from '../hooks/useAgentProgress';
 import { useTranslation } from '../i18n';
 import MonacoDiffViewer from './MonacoDiffViewer';
-
 // Re-export types for external use
 export type { AgentTask, TaskFile };
 
@@ -111,7 +112,7 @@ const TaskNode: React.FC<TaskNodeProps> = ({
 
     // pending 状态：获取原始内容
     try {
-      const originalContent = await Task.GetFileOriginalContent(task.id, file.path);
+      const originalContent = await GetFileOriginalContent(task.id, file.path);
       onViewDiff(task.id, file.path, originalContent || '', file.currentContent || file.content || '');
     } catch (e) {
       console.error('Failed to get original content:', e);

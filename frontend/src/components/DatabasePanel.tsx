@@ -8,8 +8,8 @@ import {
   Connect, Disconnect, ListTables, DescribeTable, RunQuery,
   ConnectionConfig, ConnectionInfo, TableInfo, ColumnInfo, QueryResult,
   ConnectionType,
-} from "../bindings/database";
-import { SelectFile } from "../bindings/filesystem";
+} from "@bindings/database";
+import { SelectFile } from "@bindings/filesystem";
 
 interface ConnForm {
   name: string;

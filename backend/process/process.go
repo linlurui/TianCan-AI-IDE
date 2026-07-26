@@ -156,6 +156,8 @@ func scanGoEntrypoints(rootPath string, maxDepth int) []string {
 
 func detectCommand(rootPath string) (string, []string, error) {
 	switch {
+	case isFlutterProject(rootPath):
+		return "flutter", []string{"run"}, nil
 	case fileExists(filepath.Join(rootPath, "go.mod")):
 		return "go", []string{"run", "."}, nil
 	case fileExists(filepath.Join(rootPath, "package.json")):
@@ -178,6 +180,15 @@ func detectCommand(rootPath string) (string, []string, error) {
 		}
 		return "", nil, fmt.Errorf("未识别的项目类型，请检查项目根目录")
 	}
+}
+
+func isFlutterProject(rootPath string) bool {
+	data, err := os.ReadFile(filepath.Join(rootPath, "pubspec.yaml"))
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	return strings.Contains(content, "sdk: flutter") || strings.Contains(content, "\n  flutter:")
 }
 
 // SetRunEnvConfig stores the runtime env config for a project.

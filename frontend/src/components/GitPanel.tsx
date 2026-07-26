@@ -1,8 +1,8 @@
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import { useTranslation } from "../i18n";
 import { ChevronDown, ChevronRight, GitBranch, RefreshCw, Check, X, FilePlus, RotateCcw, MinusCircle, FolderOpen, History, Undo2, Trash2, FileCode } from "lucide-react";
-import { RepoStatus, CommitInfo, CommitFileInfo, GetFileDiff, StageFile, UnstageFile, DiscardFile, GetLog, RevertCommit, GetCommitFiles, GetCommitFileDiff, RestoreFileFromCommit } from "../bindings/git";
-import { DeleteFile } from "../bindings/filesystem";
+import { RepoStatus, CommitInfo, CommitFileInfo, GetFileDiff, StageFile, UnstageFile, DiscardFile, GetLog, RevertCommit, GetCommitFiles, GetCommitFileDiff, RestoreFileFromCommit } from "@bindings/git";
+import { DeleteFile } from "@bindings/filesystem";
 
 interface GitPanelProps {
   status: RepoStatus | null;

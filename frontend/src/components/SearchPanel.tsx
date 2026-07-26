@@ -1,8 +1,8 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
 import { useTranslation } from "../i18n";
 import { Search, X, FileCode, Loader2, ChevronRight, FolderOpen } from "lucide-react";
-import { GrepFiles } from "../bindings/filesystem";
-import type { GrepMatch } from "../bindings/filesystem";
+import { GrepFiles } from "@bindings/filesystem";
+import type { GrepMatch } from "@bindings/filesystem";
 
 interface Project { rootPath: string; name: string }
 

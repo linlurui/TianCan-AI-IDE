@@ -11,6 +11,7 @@ interface ProjectSettingsModalProps {
 
 const PROJECT_TYPES: { type: ProjectType; emoji: string; label?: string; cmd?: string; labelKey?: string; cmdKey?: string }[] = [
   { type: "golang",   emoji: "🐹", label: "Go",            cmd: "go run ."         },
+  { type: "flutter",  emoji: "🦋", label: "Flutter",       cmd: "flutter run"      },
   { type: "java",     emoji: "☕", label: "Java / Maven",  cmd: "mvn spring-boot:run" },
   { type: "frontend", emoji: "🌐", label: "Node.js / Web", cmd: "npm run dev"      },
   { type: "python",   emoji: "🐍", label: "Python",        cmd: "python3 main.py"  },

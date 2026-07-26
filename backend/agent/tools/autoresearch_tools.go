@@ -1635,7 +1635,7 @@ func NewWebSearchTool() *WebSearchTool {
 
 func (t *WebSearchTool) Name() string { return "web_search" }
 func (t *WebSearchTool) Description() string {
-	return "搜索互联网获取信息，支持多种搜索源（SearXNG/Bing/DuckDuckGo），包含分页、排序和安全搜索选项"
+	return "搜索互联网获取最新信息。当你需要了解最新技术文档、查询API用法、搜索代码示例、查找错误解决方案、了解新版本特性时，必须使用此工具。参数：query=搜索内容，source=搜索引擎(可选，默认auto)，page=页码(可选)，per_page=每页数量(可选)，time_range=时间范围(可选day/week/month/year)"
 }
 func (t *WebSearchTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{

@@ -506,6 +506,29 @@
       "argsPlaceholder": "用空格分隔，例如：-y @modelcontextprotocol/server-filesystem ./data",
       "quickActions": "快捷操作",
       "refresh": "刷新服务器"
+    },
+    "sandbox": {
+      "title": "沙箱管理",
+      "hint": "选择沙箱提供者来隔离 AI 操作，支持 Docker、Daytona 和 E2B 云端沙箱",
+      "loading": "加载中...",
+      "providers": "沙箱提供者",
+      "providerDocker": "Docker 容器",
+      "providerDaytona": "Daytona",
+      "providerE2B": "E2B 云端沙箱",
+      "statusAvailable": "可用",
+      "statusNotRunning": "未运行",
+      "statusNotInstalled": "未安装",
+      "install": "自动安装",
+      "installing": "安装中...",
+      "setAsDefault": "设为默认",
+      "e2bConfig": "E2B 配置",
+      "e2bApiKey": "E2B API Key",
+      "e2bApiKeyPlaceholder": "sk-...",
+      "e2bSaved": "已保存",
+      "e2bGetKey": "获取 API Key",
+      "activeSandboxes": "运行中的沙箱",
+      "stop": "停止",
+      "refresh": "刷新状态"
     }
   },
   "lsp": {

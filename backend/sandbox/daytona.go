@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -524,59 +525,132 @@ func (p *DockerProvider) Stop(ctx context.Context, id string) error {
 	return p.mgr.stopViaDocker(ctx, id)
 }
 
-// E2BProvider implements SandboxProvider using E2B micro-VM sandbox.
+// E2BProvider implements SandboxProvider using E2B cloud sandbox.
+// API docs: https://e2b.dev/docs/api-reference/sandboxes
 type E2BProvider struct {
 	apiKey string
 }
 
+const e2bBaseURL = "https://api.e2b.dev/v1"
+
 func (p *E2BProvider) Name() string { return "e2b" }
+
 func (p *E2BProvider) Create(ctx context.Context, cfg SandboxConfig) (*SandboxInfo, error) {
 	if p.apiKey == "" {
 		return nil, fmt.Errorf("E2B_API_KEY not configured")
 	}
 
-	// E2B sandbox create API
+	// E2B v1 sandbox create API
+	// https://api.e2b.dev/v1/sandboxes
 	body := map[string]interface{}{
-		"templateID": "base",
-		"metadata":   map[string]string{"image": cfg.Image},
+		"templateId": "base",
+		"timeout":    cfg.MaxLifetimeSec,
+		"metadata": map[string]string{
+			"image":      cfg.Image,
+			"projectPath": cfg.ProjectPath,
+		},
 	}
 	data, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.e2b.dev/sandboxes", bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", e2bBaseURL+"/sandboxes", bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("E2B create failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		respData, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("E2B create returned status %d: %s", resp.StatusCode, string(respData))
+	}
+
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("E2B read response: %w", err)
 	}
 
-	var result map[string]interface{}
+	var result struct {
+		SandboxID   string `json:"sandboxId"`
+		Status      string `json:"status"`
+		TemplateID  string `json:"templateId"`
+		CreatedAt   string `json:"createdAt"`
+		Metadata    map[string]interface{} `json:"metadata"`
+	}
 	if err := json.Unmarshal(respData, &result); err != nil {
-		return nil, fmt.Errorf("E2B invalid response: %w", err)
+		return nil, fmt.Errorf("E2B invalid response: %w, body: %s", err, string(respData))
 	}
 
-	sandboxID, _ := result["sandboxID"].(string)
-	if sandboxID == "" {
-		return nil, fmt.Errorf("E2B create returned no sandboxID")
+	if result.SandboxID == "" {
+		return nil, fmt.Errorf("E2B create returned no sandboxId: %s", string(respData))
+	}
+
+	createdAt := time.Now()
+	if result.CreatedAt != "" {
+		if t, err := time.Parse(time.RFC3339, result.CreatedAt); err == nil {
+			createdAt = t
+		}
 	}
 
 	info := &SandboxInfo{
-		ID:        sandboxID,
-		Name:      "e2b-" + sandboxID[:8],
-		State:     StateRunning,
-		Image:     cfg.Image,
-		CreatedAt: time.Now(),
+		ID:        result.SandboxID,
+		Name:      "e2b-" + result.SandboxID[:min(8, len(result.SandboxID))],
+		State:     StateCreating,
+		Image:     result.TemplateID,
+		CreatedAt: createdAt,
 		Config:    cfg,
 	}
+
+	// Wait for sandbox to be ready (E2B sandboxes need a moment to boot)
+	if result.Status == "pending" {
+		info.State = StateCreating
+	} else {
+		info.State = StateRunning
+	}
+
 	return info, nil
+}
+
+// WaitForSandbox waits for the sandbox to be in running state
+func (p *E2BProvider) WaitForSandbox(ctx context.Context, sandboxID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequestWithContext(ctx, "GET", e2bBaseURL+"/sandboxes/"+sandboxID, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+		if err != nil {
+			return fmt.Errorf("E2B status check failed: %w", err)
+		}
+
+		var result struct {
+			Status string `json:"status"`
+		}
+		resp.Body.Close()
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+
+		if result.Status == "running" {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return fmt.Errorf("sandbox did not become ready within %v", timeout)
 }
 
 func (p *E2BProvider) Exec(ctx context.Context, id string, cmd string) (*ExecResult, error) {
@@ -584,40 +658,55 @@ func (p *E2BProvider) Exec(ctx context.Context, id string, cmd string) (*ExecRes
 		return nil, fmt.Errorf("E2B_API_KEY not configured")
 	}
 
+	// E2B v1 execute command API
+	// POST https://api.e2b.dev/v1/sandboxes/{sandboxId}/commands
 	body := map[string]interface{}{
 		"command": cmd,
 	}
 	data, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("https://api.e2b.dev/sandboxes/%s/execute", id), bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", e2bBaseURL+"/sandboxes/"+id+"/commands", bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("E2B exec failed: %w", err)
 	}
 	defer resp.Body.Close()
+
 	respData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("E2B read exec response: %w", err)
 	}
 
-	var result map[string]interface{}
+	// E2B v1 returns command result directly
+	var result struct {
+		ExitCode int    `json:"exitCode"`
+		Stdout   string `json:"stdout"`
+		Stderr   string `json:"stderr"`
+	}
 	if err := json.Unmarshal(respData, &result); err != nil {
-		return nil, fmt.Errorf("E2B invalid exec response: %w", err)
+		// Fallback: try older format
+		var oldResult map[string]interface{}
+		if json.Unmarshal(respData, &oldResult) == nil {
+			if v, ok := oldResult["exitCode"].(float64); ok {
+				result.ExitCode = int(v)
+			}
+			if v, ok := oldResult["stdout"].(string); ok {
+				result.Stdout = v
+			}
+			if v, ok := oldResult["stderr"].(string); ok {
+				result.Stderr = v
+			}
+		} else {
+			return nil, fmt.Errorf("E2B invalid exec response: %w, body: %s", err, string(respData))
+		}
 	}
 
-	exitCode := 0
-	if v, ok := result["exitCode"].(float64); ok {
-		exitCode = int(v)
-	}
-	stdout, _ := result["stdout"].(string)
-	stderr, _ := result["stderr"].(string)
-
-	return &ExecResult{ExitCode: exitCode, Stdout: stdout, Stderr: stderr}, nil
+	return &ExecResult{ExitCode: result.ExitCode, Stdout: result.Stdout, Stderr: result.Stderr}, nil
 }
 
 func (p *E2BProvider) Stop(ctx context.Context, id string) error {
@@ -625,7 +714,9 @@ func (p *E2BProvider) Stop(ctx context.Context, id string) error {
 		return fmt.Errorf("E2B_API_KEY not configured")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", fmt.Sprintf("https://api.e2b.dev/sandboxes/%s", id), nil)
+	// E2B v1 delete sandbox API
+	// DELETE https://api.e2b.dev/v1/sandboxes/{sandboxId}
+	req, err := http.NewRequestWithContext(ctx, "DELETE", e2bBaseURL+"/sandboxes/"+id, nil)
 	if err != nil {
 		return err
 	}
@@ -636,5 +727,129 @@ func (p *E2BProvider) Stop(ctx context.Context, id string) error {
 		return fmt.Errorf("E2B stop failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// E2B returns 204 No Content on successful delete
+	if resp.StatusCode != 204 && resp.StatusCode != 200 {
+		respData, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("E2B stop returned status %d: %s", resp.StatusCode, string(respData))
+	}
 	return nil
+}
+
+// UploadFile uploads a file to the E2B sandbox
+func (p *E2BProvider) UploadFile(ctx context.Context, sandboxID, path string, content []byte) error {
+	if p.apiKey == "" {
+		return fmt.Errorf("E2B_API_KEY not configured")
+	}
+
+	// E2B v1 file upload API
+	// POST https://api.e2b.dev/v1/sandboxes/{sandboxId}/files
+	body := map[string]interface{}{
+		"path":    path,
+		"content": base64.StdEncoding.EncodeToString(content),
+	}
+	data, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, "POST", e2bBaseURL+"/sandboxes/"+sandboxID+"/files", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("E2B upload failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		respData, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("E2B upload returned status %d: %s", resp.StatusCode, string(respData))
+	}
+	return nil
+}
+
+// DownloadFile downloads a file from the E2B sandbox
+func (p *E2BProvider) DownloadFile(ctx context.Context, sandboxID, path string) ([]byte, error) {
+	if p.apiKey == "" {
+		return nil, fmt.Errorf("E2B_API_KEY not configured")
+	}
+
+	// E2B v1 file download API
+	// GET https://api.e2b.dev/v1/sandboxes/{sandboxId}/files/{path}
+	req, err := http.NewRequestWithContext(ctx, "GET", e2bBaseURL+"/sandboxes/"+sandboxID+"/files/"+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("E2B download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respData, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("E2B download returned status %d: %s", resp.StatusCode, string(respData))
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// ListSandboxes returns all running sandboxes for this API key
+func (p *E2BProvider) ListSandboxes(ctx context.Context) ([]SandboxInfo, error) {
+	if p.apiKey == "" {
+		return nil, fmt.Errorf("E2B_API_KEY not configured")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", e2bBaseURL+"/sandboxes", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("E2B list failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Data []struct {
+			ID         string `json:"id"`
+			TemplateID string `json:"templateId"`
+			Status     string `json:"status"`
+			CreatedAt  string `json:"createdAt"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("E2B list invalid response: %w", err)
+	}
+
+	var sandboxes []SandboxInfo
+	for _, s := range result.Data {
+		state := StateRunning
+		if s.Status == "stopped" || s.Status == "terminated" {
+			state = StateStopped
+		} else if s.Status == "creating" || s.Status == "pending" {
+			state = StateCreating
+		}
+
+		createdAt := time.Now()
+		if s.CreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339, s.CreatedAt); err == nil {
+				createdAt = t
+			}
+		}
+
+		sandboxes = append(sandboxes, SandboxInfo{
+			ID:        s.ID,
+			Name:      "e2b-" + s.ID[:min(8, len(s.ID))],
+			State:     state,
+			Image:     s.TemplateID,
+			CreatedAt: createdAt,
+		})
+	}
+	return sandboxes, nil
 }

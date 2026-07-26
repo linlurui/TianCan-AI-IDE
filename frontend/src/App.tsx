@@ -11,7 +11,7 @@ import {
 
 import FileTree from "./components/FileTree";
 import SplitEditorArea from "./components/SplitEditorArea";
-import AIPanel, { Message } from "./components/AIPanel";
+import AIPanel, { Message, type ActivityItem } from "./components/AIPanel";
 import StatusBar from "./components/StatusBar";
 import GitPanel from "./components/GitPanel";
 import { AIChangesPanel, AgentTask, TaskFile } from "./components/AIChangesPanel";
@@ -28,7 +28,7 @@ import {
 } from "./bindings/extension";
 import { StartAndGetPort } from "./bindings/terminal";
 import { StartAndGetPort as StartLspPort } from "./bindings/lsp";
-import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, RespondPermission, SmartAgentRun } from "./bindings/ai";
+import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, RespondPermission, SmartAgentRun, SmartAgentRunV2 } from "./bindings/ai";
 import { RemoteReadFile, DockerReadFile } from "./bindings/remote";
 import { Events } from "@wailsio/runtime";
 import type { ModelSource } from "./components/AIPanel";
@@ -97,15 +97,62 @@ const ANALYSIS_EXTS = new Set([
   "rs", "c", "cpp", "cc", "h", "hpp", "php", "rb", "vue", "md", "mdx", "json",
 ]);
 
+function normalizeAgentMessages(rawMessages: any[], pushActivity?: (kind: ActivityItem["kind"], text: string, detail?: string) => void): Message[] {
+  const rawMsgs = (rawMessages ?? []).filter((m: any) => m?.role !== "user");
+  const agentMsgs: Message[] = [];
+
+  for (let i = 0; i < rawMsgs.length; i++) {
+    const m = rawMsgs[i] ?? {};
+    const next = rawMsgs[i + 1] ?? {};
+    const role = String(m.role || "assistant");
+    const content = String(m.content ?? "");
+    const name = m.name || m.toolName || "";
+
+    if (!content.trim() && role !== "tool_call") continue;
+
+    if (role === "assistant" && next && (next.role === "tool_call" || next.role === "tool_result" || next.role === "tool")) {
+      pushActivity?.("thinking", "模型正在规划下一步", "检测到模型准备使用工具，等待工具执行结果");
+    } else if (role === "tool_call") {
+      pushActivity?.("tool", `调用工具 ${name || "tool"}`);
+    } else if (role === "tool_result" || role === "tool") {
+      pushActivity?.("result", `工具返回 ${name || "结果"}`, content.slice(0, 160));
+    } else if (role === "thinking") {
+      pushActivity?.("thinking", "模型正在分析上下文", "已收到模型中间分析信号，继续等待最终回复");
+    } else {
+      agentMsgs.push({ role: "assistant", content });
+    }
+  }
+
+  return agentMsgs;
+}
+
 export default function App() {
   // ── Zustand ──────────────────────────────────────────────────────────────
   const editor = useEditorStore();
   const project = useProjectStore();
   const ui = useUIStore();
 
-  // ── Local state (too small/specific for stores) ──────────────────────────
-  const [messages, setMessages] = React.useState<Message[]>([]);
+  // ── Session state from projectStore (per-project isolation) ─────────────
+  const messages = project.activeMessages as Message[];
+  const setMessages: React.Dispatch<React.SetStateAction<Message[]>> = (action) => {
+    const projectState = useProjectStore.getState();
+    if (typeof action === 'function') {
+      const currentMessages = projectState.activeMessages as Message[];
+      const newMessages = (action as (prev: Message[]) => Message[])(currentMessages);
+      projectState.replaceMessages(newMessages as any);
+    } else {
+      projectState.replaceMessages(action as any);
+    }
+  };
+  const agentTasks = project.activeAgentTasks as unknown as AgentTask[];
+  const setAgentTasks = (tasks: AgentTask[]) => {
+    project.clearAgentTasks();
+    tasks.forEach(t => project.addAgentTask(t as any));
+  };
+
+  // ── Local state ───────────────────────────────────────────────────────
   const [aiLoading, setAiLoading] = React.useState(false);
+  const [aiActivityItems, setAiActivityItems] = React.useState<ActivityItem[]>([]);
   const streamRef = React.useRef<((evt: any) => void) | null>(null);
   const [permRequest, setPermRequest] = React.useState<PermissionRequest | null>(null);
   const [revealSignal, setRevealSignal] = React.useState<RevealSignal | null>(null);
@@ -123,9 +170,7 @@ export default function App() {
   const [debugPausedAt, setDebugPausedAt] = React.useState<{ file: string; line: number } | null>(null);
   const [analysisContent, setAnalysisContent] = React.useState<string | null>(null);
   const [showSettings, setShowSettings] = React.useState(false);
-
-  // AI Changes Panel state
-  const [agentTasks, setAgentTasks] = React.useState<AgentTask[]>([]);
+  const [aiContextSignal, setAiContextSignal] = React.useState<{ id: number; text: string } | null>(null);
 
   const debugPanelRef = useRef<DebugPanelHandle>(null);
   const monacoGlobalRef = useRef<any>(null);
@@ -134,6 +179,53 @@ export default function App() {
   const openedPathsRef = useRef<Set<string>>(new Set());
   const dismissedRecs = useRef<Set<string>>(new Set());
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const pushAIActivity = useCallback((kind: ActivityItem["kind"], text: string, detail?: string) => {
+    setAiActivityItems([{ id: Date.now() + Math.random(), kind, text, detail }]);
+  }, []);
+
+  useEffect(() => {
+    const off = Events.On("ai:provider", (evt: any) => {
+      const data = evt?.data ?? evt;
+      const provider = data?.provider || "模型";
+      const detail = data?.detail || "";
+      const status = data?.status || "attempt";
+      if (status === "success") {
+        pushAIActivity("thinking", "正在整理回复", "模型已返回内容，正在转换为聊天消息");
+      } else if (status === "error") {
+        pushAIActivity("thinking", "正在切换可用模型", detail || `当前通道 ${provider} 没有可用回复，继续尝试下一个`);
+      } else if (status === "skip") {
+        pushAIActivity("thinking", "继续寻找可用模型", `${provider} 暂不可用，跳过并检查后续通道`);
+      } else {
+        pushAIActivity("thinking", "正在等待模型推理", `已把当前请求和项目上下文交给 ${provider}`);
+      }
+    });
+    return () => { off(); };
+  }, [pushAIActivity]);
+
+  const displayPath = useCallback((filePath: string) => {
+    const root = project.activeProject?.rootPath;
+    if (root && filePath.startsWith(root + "/")) {
+      return filePath.slice(root.length + 1);
+    }
+    return filePath;
+  }, [project.activeProject?.rootPath]);
+
+  const quoteContext = (value: string) => JSON.stringify(value);
+
+  const appendAIContext = useCallback((text: string) => {
+    if (ui.appMode !== "ai") return;
+    setAiContextSignal((prev) => ({ id: (prev?.id ?? 0) + 1, text }));
+  }, [ui.appMode]);
+
+  const appendFileContext = useCallback((filePath: string) => {
+    appendAIContext(`@file(${quoteContext(displayPath(filePath))})`);
+  }, [appendAIContext, displayPath]);
+
+  const appendSymbolContext = useCallback((ctx: { name: string; filePath: string; line: number; detail?: string }) => {
+    const detail = ctx.detail ? ` ${ctx.detail}` : "";
+    appendAIContext(`@symbol(${quoteContext(displayPath(ctx.filePath))}:${ctx.line} ${quoteContext(ctx.name)}${detail})`);
+  }, [appendAIContext, displayPath]);
 
   // ── Keyboard shortcuts for AI Changes navigation ─────────────────────────
   useEffect(() => {
@@ -148,14 +240,20 @@ export default function App() {
           const success = ui.navigateToPrevFileModification();
           if (success) {
             // Refresh the tasks to update the UI
-            Task.GetAgentTasks().then(setAgentTasks).catch(console.error);
+            Task.GetAgentTasks().then((tasks: any[]) => {
+              project.clearAgentTasks();
+              tasks.forEach((t: any) => project.addAgentTask(t));
+            }).catch(console.error);
           }
         } else if (e.key === "ArrowRight") {
           e.preventDefault();
           const success = ui.navigateToNextFileModification();
           if (success) {
             // Refresh the tasks to update the UI
-            Task.GetAgentTasks().then(setAgentTasks).catch(console.error);
+            Task.GetAgentTasks().then((tasks: any[]) => {
+              project.clearAgentTasks();
+              tasks.forEach((t: any) => project.addAgentTask(t));
+            }).catch(console.error);
           }
         }
       }
@@ -163,7 +261,7 @@ export default function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [ui, setAgentTasks]);
+  }, [ui, project]);
 
   // ── Initialization ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -302,11 +400,8 @@ export default function App() {
   const openFile = useCallback(async (node: FileNode) => {
     if (node.isDir) return;
 
-    // Smart mode: don't switch to editor mode when clicking files
-    // Stay in AI mode, just open the file in the editor
     if (ui.appMode === "ai") {
-      // Force switch to editor mode for file operations
-      ui.setAppMode("editor");
+      appendFileContext(node.path);
     }
 
     if (openedPathsRef.current.has(node.path)) { editor.setActiveTab(node.path); return; }
@@ -336,7 +431,7 @@ export default function App() {
       openedPathsRef.current.delete(node.path);
       console.error("open:", err);
     }
-  }, [editor, ui, installedExtensions]);
+  }, [editor, ui, installedExtensions, appendFileContext]);
 
   const handleSave = useCallback(async (path: string) => {
     const tab = editor.tabs.find((t) => t.path === path);
@@ -837,35 +932,50 @@ export default function App() {
             ) : null}
           />
         ) : (
-          <AIPanel messages={messages} onSend={async (text, source: ModelSource) => {
+          <AIPanel messages={messages} contextToAppend={aiContextSignal} onSend={async (text, source: ModelSource) => {
             if (text === "__clear__") {
               // Cleanup any active stream listener
               if (streamRef.current) { Events.Off("agent:stream"); streamRef.current = null; }
-              setMessages([]); return;
+              setMessages([]);
+              setAiActivityItems([]);
+              return;
             }
-            setMessages((p) => [...p, { role: "user", content: text }]);
+            setMessages((p) => [
+              ...p,
+              { role: "user", content: text },
+            ]);
             setAiLoading(true);
+            setAiActivityItems([]);
 
             const rootPath = project.activeProject?.rootPath ?? "";
+            pushAIActivity("thinking", "准备上下文", source === "auto" ? "Auto 将按可用模型自动尝试，并把项目路径作为上下文" : `使用 ${source} 模式处理当前请求`);
 
-            // Auto mode: let SmartRouter decide the best tier
+            // Auto mode: use AgentV2 with SmartRouter (enhanced with rollback, parallel execution, MCP)
             if (source === "auto") {
               try {
-                const result = await SmartAgentRun(text, rootPath, 20);
-                const rawMsgs = (result.messages ?? []).filter((m: any) => m.role !== "user");
-                const agentMsgs: Array<{role: any; content: string; name?: string}> = [];
-                for (let i = 0; i < rawMsgs.length; i++) {
-                  const m = rawMsgs[i];
-                  const next = rawMsgs[i + 1];
-                  if (m.role === "assistant" && next && (next.role === "tool_call" || next.role === "tool_result")) {
-                    agentMsgs.push({ role: "thinking", content: m.content });
-                  } else {
-                    agentMsgs.push({ role: m.role, content: m.content, name: m.name });
-                  }
+                pushAIActivity("route", "选择 Auto 路由", rootPath ? "结合当前项目目录和聊天输入执行" : "当前没有项目目录，仅使用聊天输入执行");
+                const result = await SmartAgentRunV2(text, rootPath, 20);
+                if (result.taskAnalysis) {
+                  pushAIActivity("thinking", "正在组织回复", "已完成任务类型判断，正在把模型输出整理为最终回答");
                 }
-                setMessages((p) => [...p, ...agentMsgs]);
+                const agentMsgs = normalizeAgentMessages(result.messages ?? [], pushAIActivity);
+                // Add task analysis info if available
+                if (result.taskAnalysis) {
+                  console.log("🧠 AgentV2 任务分析:", result.taskAnalysis);
+                }
+                if (agentMsgs.length > 0) {
+                  setMessages((p) => [...p, ...agentMsgs]);
+                  pushAIActivity(result.error ? "error" : "success", result.error ? "执行结束但有错误" : "已生成回复");
+                } else {
+                  setMessages((p) => [...p, {
+                    role: "assistant",
+                    content: result.error ? `❌ ${result.error}` : "(no response)",
+                  }]);
+                  pushAIActivity(result.error ? "error" : "success", result.error ? "执行失败" : "返回空响应");
+                }
               } catch (err: any) {
-                setMessages((p) => [...p, { role: "assistant", content: `❌ Smart Router 失败: ${err?.message ?? err}` }]);
+                pushAIActivity("error", "请求失败", err?.message ?? String(err));
+                setMessages((p) => [...p, { role: "assistant", content: `❌ AgentV2 失败: ${err?.message ?? err}` }]);
               }
               setAiLoading(false);
               return;
@@ -875,6 +985,7 @@ export default function App() {
             if (source === "local") {
               // Remove previous listener if any
               if (streamRef.current) { Events.Off("agent:stream"); streamRef.current = null; }
+              pushAIActivity("route", "连接本地模型", "等待流式响应");
 
               // Add a placeholder assistant message for streaming tokens
               setMessages((p) => [...p, { role: "assistant", content: "" }]);
@@ -898,6 +1009,7 @@ export default function App() {
                     });
                     break;
                   case "tool_call":
+                    pushAIActivity("tool", `调用工具 ${eName || "tool"}`, eContent);
                     setMessages((p) => {
                       const updated = [...p];
                       const last = updated[updated.length - 1];
@@ -910,17 +1022,15 @@ export default function App() {
                           content: thinkContent.trim() ? thinkContent : last.content,
                         };
                       }
-                      // Add tool_call card (empty assistant will be added by tool_result)
-                      updated.push(
-                        { role: "tool_call" as any, content: eContent, name: eName },
-                      );
                       return updated;
                     });
                     break;
                   case "tool_result":
-                    setMessages((p) => [...p, { role: "tool_result" as any, content: eContent, name: eName }, { role: "assistant", content: "" }]);
+                    pushAIActivity("result", `工具完成 ${eName || "tool"}`, eContent.slice(0, 120));
+                    setMessages((p) => [...p, { role: "assistant", content: "" }]);
                     break;
                   case "permission_request":
+                    pushAIActivity("tool", `等待授权 ${eName || "tool"}`, data?.reason ?? "");
                     setPermRequest({
                       id: data?.id ?? "",
                       toolName: eName,
@@ -929,6 +1039,7 @@ export default function App() {
                     });
                     break;
                   case "done":
+                    pushAIActivity("success", "任务完成");
                     // Remove trailing empty assistant message if any
                     setMessages((p) => {
                       const updated = [...p];
@@ -943,11 +1054,13 @@ export default function App() {
                     streamRef.current = null;
                     break;
                   case "stream_end":
+                    pushAIActivity("success", "响应结束");
                     setAiLoading(false);
                     Events.Off("agent:stream");
                     streamRef.current = null;
                     break;
                   case "error":
+                    pushAIActivity("error", "执行失败", eContent);
                     setMessages((p) => [...p, { role: "assistant", content: `❌ ${eContent}` }]);
                     setAiLoading(false);
                     Events.Off("agent:stream");
@@ -964,6 +1077,7 @@ export default function App() {
               } catch (err: any) {
                 Events.Off("agent:stream");
                 streamRef.current = null;
+                pushAIActivity("error", "启动流失败", err?.message ?? String(err));
                 setMessages((p) => [...p, { role: "assistant", content: `❌ AI request failed: ${err?.message ?? err}` }]);
                 setAiLoading(false);
               }
@@ -972,41 +1086,31 @@ export default function App() {
               try {
                 let result;
                 if (source === "web") {
+                  pushAIActivity("route", "使用 Web AI", "等待网页登录态响应");
                   result = await AgentRunWeb(text, rootPath, 20);
                 } else {
+                  pushAIActivity("route", "使用 API", "等待接口响应");
                   result = await AgentRunAPI(text, rootPath, 20);
                 }
-                // Show all assistant / tool messages returned by agent.
-                // Intermediate assistant messages (followed by tool messages) are reasoning → 'thinking' role.
-                const rawMsgs = (result.messages ?? []).filter((m: any) => m.role !== "user");
-                const agentMsgs: Array<{role: any; content: string; name?: string}> = [];
-                for (let mi = 0; mi < rawMsgs.length; mi++) {
-                  const m = rawMsgs[mi];
-                  const next = mi + 1 < rawMsgs.length ? rawMsgs[mi + 1] : null;
-                  if (m.role === "assistant" && next && (next.role === "tool" || next.role === "tool_call" || next.role === "tool_result")) {
-                    // This assistant msg is reasoning (not the final reply)
-                    agentMsgs.push({ role: "thinking", content: m.content });
-                  } else if (m.role === "tool") {
-                    agentMsgs.push({ role: "tool_result" as any, content: m.content });
-                  } else {
-                    agentMsgs.push({ role: m.role as any, content: m.content });
-                  }
-                }
+                const agentMsgs = normalizeAgentMessages(result.messages ?? [], pushAIActivity);
                 if (agentMsgs.length > 0) {
                   setMessages((p) => [...p, ...agentMsgs]);
+                  pushAIActivity(result.error ? "error" : "success", result.error ? "执行结束但有错误" : "已生成回复");
                 } else {
                   setMessages((p) => [...p, {
                     role: "assistant",
                     content: result.error ? `❌ ${result.error}` : "(no response)",
                   }]);
+                  pushAIActivity(result.error ? "error" : "success", result.error ? "执行失败" : "返回空响应");
                 }
               } catch (err: any) {
+                pushAIActivity("error", "请求失败", err?.message ?? String(err));
                 setMessages((p) => [...p, { role: "assistant", content: `❌ AI request failed: ${err?.message ?? err}` }]);
               } finally {
                 setAiLoading(false);
               }
             }
-          }} isLoading={aiLoading} fullWidth />
+          }} isLoading={aiLoading} activityItems={aiActivityItems} fullWidth />
         )}
 
         {/* Tool Panel */}
@@ -1073,6 +1177,7 @@ export default function App() {
                       cursorLine={editor.cursorInfo.line}
                       cursorCol={editor.cursorInfo.col}
                       onOpenFile={(path, line) => openFileAtLine(path, line)}
+                      onAddContext={appendSymbolContext}
                       lspPort={ui.lspPort || undefined}
                       monaco={monacoInstance}
                     />

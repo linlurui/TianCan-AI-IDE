@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -387,6 +388,9 @@ func (a *AgentV2) buildV2SystemPrompt(agentDef types.AgentDefinition, analysis r
 				ro = " (read-only)"
 			}
 			sb.WriteString(fmt.Sprintf("- **%s**: %s%s\n", t.Name(), t.Description(), ro))
+			if schema, err := json.Marshal(t.InputSchema()); err == nil && len(schema) > 0 {
+				sb.WriteString(fmt.Sprintf("  Input schema: %s\n", string(schema)))
+			}
 		}
 	}
 
@@ -398,6 +402,24 @@ func (a *AgentV2) buildV2SystemPrompt(agentDef types.AgentDefinition, analysis r
 	}
 
 	sb.WriteString("\n")
+
+	sb.WriteString("## Tool Calling Protocol\n\n")
+	sb.WriteString("When you need project information, filesystem access, command execution, or code changes, use exactly one tool call and then wait for the tool result before continuing.\n")
+	sb.WriteString("Do not guess file contents. Read or search files first.\n")
+	sb.WriteString("Emit tool calls in this exact format:\n\n")
+	sb.WriteString("```tool\n")
+	sb.WriteString("{\"name\":\"tool_name\",\"args\":{\"key\":\"value\"}}\n")
+	sb.WriteString("```\n\n")
+	sb.WriteString("After receiving a tool result, continue reasoning from that result. When the task is complete, answer in natural language without another tool call.\n\n")
+
+	// Search guidance
+	sb.WriteString("## Important: When to Search\n\n")
+	sb.WriteString("Use **web_search** when you need:\n")
+	sb.WriteString("- Current documentation or tutorials\n")
+	sb.WriteString("- API usage examples from the web\n")
+	sb.WriteString("- Solutions to unknown errors\n")
+	sb.WriteString("- Latest version features or changelogs\n")
+	sb.WriteString("- Technical blog posts or articles\n\n")
 
 	// Permission mode
 	sb.WriteString(fmt.Sprintf("Permission mode: %s\n", a.permMgr.GetMode()))

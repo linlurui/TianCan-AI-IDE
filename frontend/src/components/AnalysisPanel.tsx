@@ -8,7 +8,7 @@ import {
 import mammoth from "mammoth";
 import * as XLSX from "xlsx";
 import JSZip from "jszip";
-import { ReadFileAsBase64 } from "../bindings/filesystem";
+import { ReadFileAsBase64 } from "@bindings/filesystem";
 import { DocumentSymbol, SYMBOL_KIND_ICON, getActiveLspClient, getLspClient } from "../lsp/client";
 import CallHierarchyPanel from "./CallHierarchyPanel";
 
@@ -23,6 +23,7 @@ interface AnalysisPanelProps {
   onOpenFile?: (path: string, line: number) => void;
   lspPort?: number;
   monaco?: any;
+  onAddContext?: (ctx: { type: "symbol"; name: string; filePath: string; line: number; detail?: string }) => void;
 }
 
 type FileCat = "html" | "css" | "ts" | "js" | "go" | "python" | "java" | "rust" | "cpp" | "php" | "ruby" | "vue" | "markdown" | "json" | "makefile" | "pdf" | "word" | "excel" | "pptx" | "other";
@@ -681,7 +682,7 @@ function GoCallBlockView({ block, onGoToLine }: { block: GoCallBlock; onGoToLine
   );
 }
 
-function SymbolView({ sym, depth = 0, onGoToLine }: { sym: Sym; depth?: number; onGoToLine?: (line: number) => void }) {
+function SymbolView({ sym, depth = 0, filePath, onGoToLine, onAddContext }: { sym: Sym; depth?: number; filePath?: string | null; onGoToLine?: (line: number) => void; onAddContext?: (ctx: { type: "symbol"; name: string; filePath: string; line: number; detail?: string }) => void }) {
   const [open, setOpen] = useState(true);
   const { t } = useTranslation();
   const hasChildren = sym.children && sym.children.length > 0;
@@ -693,6 +694,9 @@ function SymbolView({ sym, depth = 0, onGoToLine }: { sym: Sym; depth?: number; 
   const handleRowClick = () => {
     if (hasChildren) setOpen(!open);
     if (sym.line > 0) onGoToLine?.(sym.line);
+    if (filePath && sym.line > 0) {
+      onAddContext?.({ type: "symbol", name: sym.name, filePath, line: sym.line, detail: sym.kind });
+    }
   };
   return (
     <div className="ana-tree-node" style={{ paddingLeft: depth * 12 }}>
@@ -709,7 +713,7 @@ function SymbolView({ sym, depth = 0, onGoToLine }: { sym: Sym; depth?: number; 
         <span className="ana-line-num">{sym.line}</span>
       </div>
       {open && hasChildren && sym.children!.map((c, i) => (
-        <SymbolView key={i} sym={c} depth={depth + 1} onGoToLine={onGoToLine} />
+        <SymbolView key={i} sym={c} depth={depth + 1} filePath={filePath} onGoToLine={onGoToLine} onAddContext={onAddContext} />
       ))}
     </div>
   );
@@ -789,7 +793,7 @@ function JsonNodeView({
 // ── Vue SFC Panel ─────────────────────────────────────────────
 
 type VueSfcTab = "template" | "script" | "style";
-function VueSfcPanel({ sfc, onGoToLine }: { sfc: VueSfc; onGoToLine?: (line: number) => void }) {
+function VueSfcPanel({ sfc, filePath, onGoToLine, onAddContext }: { sfc: VueSfc; filePath?: string | null; onGoToLine?: (line: number) => void; onAddContext?: (ctx: { type: "symbol"; name: string; filePath: string; line: number; detail?: string }) => void }) {
   const [tab, setTab] = useState<VueSfcTab>("template");
   const { t } = useTranslation();
 
@@ -831,7 +835,7 @@ function VueSfcPanel({ sfc, onGoToLine }: { sfc: VueSfc; onGoToLine?: (line: num
         {tab === "script" && (
           sfc.symbols.length > 0 ? (
             <div className="ana-section-body">
-              {sfc.symbols.map((s, i) => <SymbolView key={i} sym={s} onGoToLine={onGoToLine} />)}
+              {sfc.symbols.map((s, i) => <SymbolView key={i} sym={s} filePath={filePath} onGoToLine={onGoToLine} onAddContext={onAddContext} />)}
             </div>
           ) : (
             <div className="analysis-empty-inline">{t("analysis.noScriptBlock")}</div>
@@ -858,7 +862,7 @@ function VueSfcPanel({ sfc, onGoToLine }: { sfc: VueSfc; onGoToLine?: (line: num
   );
 }
 
-function LspSymbolNode({ sym, depth = 0, onGoToLine }: { sym: DocumentSymbol; depth?: number; onGoToLine?: (line: number) => void }) {
+function LspSymbolNode({ sym, depth = 0, filePath, onGoToLine, onAddContext }: { sym: DocumentSymbol; depth?: number; filePath?: string | null; onGoToLine?: (line: number) => void; onAddContext?: (ctx: { type: "symbol"; name: string; filePath: string; line: number; detail?: string }) => void }) {
   const [open, setOpen] = useState(true);
   const { t } = useTranslation();
   const hasChildren = sym.children && sym.children.length > 0;
@@ -868,7 +872,11 @@ function LspSymbolNode({ sym, depth = 0, onGoToLine }: { sym: DocumentSymbol; de
     <div className="ana-tree-node" style={{ paddingLeft: depth * 12 }}>
       <div
         className="ana-tree-row clickable"
-        onClick={() => { if (hasChildren) setOpen(!open); onGoToLine?.(line); }}
+        onClick={() => {
+          if (hasChildren) setOpen(!open);
+          onGoToLine?.(line);
+          if (filePath) onAddContext?.({ type: "symbol", name: sym.name, filePath, line, detail: sym.detail });
+        }}
         title={t("analysis.line", { n: line })}
       >
         <span className="ana-tree-arrow">
@@ -880,7 +888,7 @@ function LspSymbolNode({ sym, depth = 0, onGoToLine }: { sym: DocumentSymbol; de
         <span className="ana-line-num">{line}</span>
       </div>
       {open && hasChildren && sym.children!.map((c, i) => (
-        <LspSymbolNode key={i} sym={c} depth={depth + 1} onGoToLine={onGoToLine} />
+        <LspSymbolNode key={i} sym={c} depth={depth + 1} filePath={filePath} onGoToLine={onGoToLine} onAddContext={onAddContext} />
       ))}
     </div>
   );
@@ -888,7 +896,7 @@ function LspSymbolNode({ sym, depth = 0, onGoToLine }: { sym: DocumentSymbol; de
 
 // ── Main Component ────────────────────────────────────────────
 
-export default function AnalysisPanel({ filePath, content, onGoToLine, rootPath, langId, cursorLine = 1, cursorCol = 1, onOpenFile, lspPort, monaco }: AnalysisPanelProps) {
+export default function AnalysisPanel({ filePath, content, onGoToLine, rootPath, langId, cursorLine = 1, cursorCol = 1, onOpenFile, lspPort, monaco, onAddContext }: AnalysisPanelProps) {
   const { t } = useTranslation();
   const fileName = filePath?.split("/").pop() ?? "";
   const ext = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() ?? "" : fileName.toLowerCase();
@@ -1181,7 +1189,7 @@ export default function AnalysisPanel({ filePath, content, onGoToLine, rootPath,
                 <span className="ana-count">{symbols.length}</span>
               </div>
               <div className="ana-section-body">
-                {symbols.map((s, i) => <SymbolView key={i} sym={s} onGoToLine={onGoToLine} />)}
+                {symbols.map((s, i) => <SymbolView key={i} sym={s} filePath={filePath} onGoToLine={onGoToLine} onAddContext={onAddContext} />)}
               </div>
             </div>
           ) : goCallBlocks.length === 0 ? (
@@ -1205,7 +1213,7 @@ export default function AnalysisPanel({ filePath, content, onGoToLine, rootPath,
 
         {/* ── Vue SFC ── */}
         {cat === "vue" && vueSfc && (
-          <VueSfcPanel sfc={vueSfc} onGoToLine={onGoToLine} />
+          <VueSfcPanel sfc={vueSfc} filePath={filePath} onGoToLine={onGoToLine} onAddContext={onAddContext} />
         )}
 
         {/* ── Markdown preview ── */}
@@ -1316,7 +1324,7 @@ export default function AnalysisPanel({ filePath, content, onGoToLine, rootPath,
                   <div className="analysis-empty-inline">{t("analysis.noLspSymbols")}</div>
                 )}
                 {lspState === "done" && lspSymbols.length > 0 && lspSymbols.map((s, i) => (
-                  <LspSymbolNode key={i} sym={s} onGoToLine={onGoToLine} />
+                  <LspSymbolNode key={i} sym={s} filePath={filePath} onGoToLine={onGoToLine} onAddContext={onAddContext} />
                 ))}
               </div>
             )}
@@ -1343,6 +1351,7 @@ export default function AnalysisPanel({ filePath, content, onGoToLine, rootPath,
                   cursorLine={cursorLine}
                   cursorCol={cursorCol}
                   onOpenFile={onOpenFile ?? (() => {})}
+                  onAddContext={onAddContext}
                   lspPort={lspPort}
                   monaco={monaco}
                 />

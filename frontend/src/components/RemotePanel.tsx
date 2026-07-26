@@ -8,7 +8,7 @@ import { Server, Container, Plus, Trash2, Plug, Unplug, FolderOpen } from "lucid
 import {
   GetConnections, AddConnection, RemoveConnection,
   Connect, Disconnect, GetConnectionStatus, ListDockerContainers,
-} from "../bindings/remote";
+} from "@bindings/remote";
 import { ConnectionConfig, ConnectionStatus, DockerContainer } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/remote/models";
 
 type ConnectionType = "ssh" | "docker";

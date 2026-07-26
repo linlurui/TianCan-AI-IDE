@@ -108,7 +108,7 @@ export const useUIStore = create<UIState>((set, get) => ({
   activeToolTab: "terminal",
   toolPanelWidth: 420,
 
-  appMode: "editor",
+  appMode: "ai",
 
   terminals: [{ id: "1", name: "Terminal 1" }],
   activeTerminalId: "1",

@@ -3,7 +3,7 @@
  * 实现点击联动：点击子Agent进度 → 高亮右侧任务列表
  */
 import { create } from "zustand";
-import { AgentTask } from "../bindings/task";
+import { AgentTask } from "@bindings/task";
 
 interface FileModification {
   taskId: string;

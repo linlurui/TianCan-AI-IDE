@@ -1332,6 +1332,80 @@ body {
   background: var(--bg-primary);
 }
 
+.ai-activity-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 30px;
+  padding: 4px 16px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-secondary) 92%, var(--accent) 8%);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.ai-panel-full .ai-activity-strip {
+  background: color-mix(in srgb, var(--bg-primary) 94%, var(--accent) 6%);
+}
+
+.ai-activity-current {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  animation: aiActivityFlash 0.22s ease-out;
+}
+
+.ai-activity-current.thinking,
+.ai-activity-current.route {
+  color: var(--accent);
+}
+
+.ai-activity-current.tool {
+  color: #d6a84f;
+}
+
+.ai-activity-current.result,
+.ai-activity-current.success {
+  color: #50c878;
+}
+
+.ai-activity-current.error {
+  color: #ff6b6b;
+}
+
+.ai-activity-current-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ai-activity-process {
+  flex: 1;
+  min-width: 0;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+@keyframes aiActivityFlash {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .ai-input {
   background: var(--bg-primary);
   border: 1px solid var(--border-light);

@@ -11,7 +11,7 @@ import {
   Deploy, GetTask, ListTasks,
   ServerConfig, DeployConfig, DeployTask,
   AuthType, DeployType,
-} from "../bindings/deploy";
+} from "@bindings/deploy";
 
 type WorkTab = "servers" | "configs" | "logs";
 

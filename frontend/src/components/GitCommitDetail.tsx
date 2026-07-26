@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import { GitCommit, RotateCcw, ChevronRight, ChevronDown, Loader2, X } from "lucide-react";
-import { CommitInfo, CommitFileInfo, GetCommitFiles, GetCommitFileDiff, RestoreFileFromCommit } from "../bindings/git";
+import { CommitInfo, CommitFileInfo, GetCommitFiles, GetCommitFileDiff, RestoreFileFromCommit } from "@bindings/git";
 
 interface Props {
   repoPath: string;

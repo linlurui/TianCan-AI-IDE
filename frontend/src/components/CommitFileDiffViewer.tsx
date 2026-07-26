@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { DiffEditor } from "@monaco-editor/react";
 import { useTranslation } from "../i18n";
 import { Loader2, RotateCcw } from "lucide-react";
-import { GetCommitFileDiff, RestoreFileFromCommit } from "../bindings/git";
+import { GetCommitFileDiff, RestoreFileFromCommit } from "@bindings/git";
 
 interface CommitFileDiffViewerProps {
   repoPath: string;

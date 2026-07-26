@@ -2,7 +2,7 @@ import React, { useRef } from "react";
 import { useTranslation } from "../i18n";
 import { AlertCircle, Terminal, RefreshCw, Download, CheckCircle, XCircle, Loader } from "lucide-react";
 import { useUIStore, LspInstallStatus } from "../store/uiStore";
-import { CheckLspInstalled, InstallLspStream } from "../bindings/lsp";
+import { CheckLspInstalled, InstallLspStream } from "@bindings/lsp";
 
 const LSP_NAMES: Record<string, string> = {
   go:         "gopls (Go)",

@@ -57,6 +57,26 @@ export class AgentRunResult {
     "done": boolean;
     "error"?: string;
 
+    /**
+     * AgentV2 duration
+     */
+    "durationMs"?: number;
+
+    /**
+     * "v1", "v2", "ralph"
+     */
+    "agentType"?: string;
+
+    /**
+     * Token count
+     */
+    "totalTokens"?: number;
+
+    /**
+     * V2 rollback support
+     */
+    "hasRollback"?: boolean;
+
     /** Creates a new AgentRunResult instance. */
     constructor($$source: Partial<AgentRunResult> = {}) {
         if (!("messages" in $$source)) {

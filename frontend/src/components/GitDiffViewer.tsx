@@ -2,8 +2,8 @@ import React, { useEffect, useState } from "react";
 import { DiffEditor } from "@monaco-editor/react";
 import { useTranslation } from "../i18n";
 import { Loader2, GitCompare } from "lucide-react";
-import { GetHeadFileContent } from "../bindings/git";
-import { ReadFile } from "../bindings/filesystem";
+import { GetHeadFileContent } from "@bindings/git";
+import { ReadFile } from "@bindings/filesystem";
 
 interface GitDiffViewerProps {
   repoPath: string;

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "../i18n";
 import { CheckCircle, XCircle, Loader, Palette, Code2, FileCode, Puzzle, Zap, Terminal, Trash2 } from "lucide-react";
-import { GetExtensionContributes, ExtensionContributes, Extension } from "../bindings/extension";
+import { GetExtensionContributes, ExtensionContributes, Extension } from "@bindings/extension";
 import { getLspClient } from "../lsp/client";
 import type * as Monaco from "monaco-editor";
 

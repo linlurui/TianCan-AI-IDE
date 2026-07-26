@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import { Play, Square, RotateCcw, Terminal } from "lucide-react";
 import { Project } from "../types";
-import { StartProject, StopProject, IsRunning, DetectRunCommand } from "../bindings/process";
+import { StartProject, StopProject, IsRunning, DetectRunCommand } from "@bindings/process";
 
 interface RunBarProps {
   activeProject: Project | null;

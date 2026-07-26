@@ -10,6 +10,17 @@ import {
   CleanupOldTasks,
 } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/taskbindings";
 
+export {
+  GetAgentTasks,
+  GetTask,
+  ApplyTask,
+  RejectTask,
+  ApplyFile,
+  RejectFile,
+  GetFileOriginalContent,
+  CleanupOldTasks,
+};
+
 // Re-export types from generated bindings
 export type { AgentTask, TaskFile } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/ralph/models";
 

@@ -528,6 +528,15 @@ func (a *Agent) buildSystemPrompt(agentDef AgentDefinition) string {
 
 	sb.WriteString("\n")
 
+	// Search guidance
+	sb.WriteString("## Important: When to Search\n\n")
+	sb.WriteString("Use **web_search** when you need:\n")
+	sb.WriteString("- Current documentation or tutorials\n")
+	sb.WriteString("- API usage examples from the web\n")
+	sb.WriteString("- Solutions to unknown errors\n")
+	sb.WriteString("- Latest version features or changelogs\n")
+	sb.WriteString("- Technical blog posts or articles\n\n")
+
 	// Safety mode indicator
 	if a.safetySys.IsAutoMode() {
 		sb.WriteString("Running in **auto mode** — tool calls are automatically classified for safety.\n\n")

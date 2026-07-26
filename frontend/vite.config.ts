@@ -6,26 +6,50 @@ import react from "@vitejs/plugin-react";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * Redirect `import ... from "/wails/runtime.js"` to our local typed wrapper.
- * The wrapper uses `import(/* @vite-ignore *\/ RUNTIME_URL)` so Vite never
- * sees the circular reference, and the browser fetches the real runtime
- * from the Go backend at run-time.
+ * Generated Wails bindings import the runtime from /wails/runtime.js.
+ * Vite treats /public JavaScript files as static assets, so rewrite those
+ * imports to the npm runtime package before import analysis runs.
  */
-function wailsRuntimePlugin(): Plugin {
-  const localRuntime = path.resolve(__dirname, "src/wailsjs/runtime.ts");
+function wailsBindingsPlugin(): Plugin {
   return {
-    name: "vite-plugin-wails-runtime",
+    name: "vite-plugin-wails-bindings",
     enforce: "pre",
-    resolveId(id) {
-      if (id === "/wails/runtime.js") {
-        return localRuntime;
+    transform(code, id) {
+      if (!/\.[cm]?[jt]sx?$/.test(id)) {
+        return null;
       }
+
+      let nextCode = code.replace(
+        /((?:from|export\s+\*)\s+)(["'])\/wails(?:js)?\/runtime\.js\2/g,
+        '$1"@wailsio/runtime"',
+      );
+
+      if (id.includes("/frontend/bindings/")) {
+        nextCode = nextCode.replace(
+          /((?:from|export\s+\*)\s+)(["'])(\.\.?\/[^"']+)\.js\2/g,
+          '$1$2$3.ts$2',
+        );
+      }
+
+      if (nextCode === code) {
+        return null;
+      }
+
+      return {
+        code: nextCode,
+        map: null,
+      };
     },
   };
 }
 
 export default defineConfig({
-  plugins: [wailsRuntimePlugin(), react()],
+  plugins: [wailsBindingsPlugin(), react()],
+  resolve: {
+    alias: {
+      "@bindings": path.resolve(__dirname, "bindings"),
+    },
+  },
   server: {
     port: 34115,
     strictPort: true,
@@ -33,8 +57,5 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    rollupOptions: {
-      external: ["/wails/runtime.js"],
-    },
   },
 });

@@ -1,5 +1,5 @@
 import type * as Monaco from "monaco-editor";
-import type { ExtensionContributes } from "../bindings/extension";
+import type { ExtensionContributes } from "@bindings/extension";
 
 /**
  * Applies all static contributions from an installed extension to Monaco Editor.

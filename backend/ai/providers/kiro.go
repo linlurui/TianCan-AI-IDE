@@ -311,60 +311,61 @@ func (d *VSCodeCopilotDiscoverer) Priority() int {
 
 // Discover 发现 VS Code Copilot Provider
 func (d *VSCodeCopilotDiscoverer) Discover() (*Provider, error) {
-	// VS Code Copilot 使用 GitHub Copilot 授权
-	// 需要读取 VS Code 的认证存储
 	home, _ := os.UserHomeDir()
+	candidates := []string{}
 
 	switch runtime.GOOS {
 	case "darwin":
-		// 尝试从 VS Code 认证存储读取
-		copilotDir := filepath.Join(home, "Library", "Application Support", "Code", "User", "globalStorage", "github.copilot")
-		if data, err := os.ReadFile(filepath.Join(copilotDir, "config.json")); err == nil {
-			var config map[string]interface{}
-			if json.Unmarshal(data, &config) == nil {
-				if apiKey, ok := config["apiKey"].(string); ok && apiKey != "" {
-					return &Provider{
-						ID:      "vscode-copilot",
-						Name:    "VS Code Copilot",
-						Type:    ProviderTypeCLI,
-						Status:  ProviderStatusAvailable,
-						APIKey:  apiKey,
-						Model:   "gpt-4",
-						Icon:    "🔷",
-						Color:   "#007acc",
-					}, nil
-				}
-			}
+		candidates = []string{
+			filepath.Join(home, "Library", "Application Support", "Code", "User", "globalStorage", "state.vscdb"),
+			filepath.Join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb"),
+			filepath.Join(home, "Library", "Application Support", "Windsurf", "User", "globalStorage", "state.vscdb"),
 		}
 	case "windows":
-		copilotDir := filepath.Join(os.Getenv("APPDATA"), "Code", "User", "globalStorage", "github.copilot")
-		if data, err := os.ReadFile(filepath.Join(copilotDir, "config.json")); err == nil {
-			var config map[string]interface{}
-			if json.Unmarshal(data, &config) == nil {
-				if apiKey, ok := config["apiKey"].(string); ok && apiKey != "" {
-					return &Provider{
-						ID:      "vscode-copilot",
-						Name:    "VS Code Copilot",
-						Type:    ProviderTypeCLI,
-						Status:  ProviderStatusAvailable,
-						APIKey:  apiKey,
-						Model:   "gpt-4",
-						Icon:    "🔷",
-						Color:   "#007acc",
-					}, nil
-				}
-			}
+		appData := os.Getenv("APPDATA")
+		candidates = []string{
+			filepath.Join(appData, "Code", "User", "globalStorage", "state.vscdb"),
+			filepath.Join(appData, "Cursor", "User", "globalStorage", "state.vscdb"),
 		}
 	}
 
-	// Copilot 授权信息通常存储在特定目录
-	// 这里简化处理，提示用户使用 GitHub API Key
-	return nil, fmt.Errorf("VS Code Copilot requires manual GitHub authentication. Use GitHub Models API instead.")
+	authFile := firstExistingPath(candidates)
+	if authFile == "" {
+		return nil, fmt.Errorf("VS Code storage not found")
+	}
+	if !sqliteHasProviderItemKeyLike(authFile, "%copilot%", "%github.copilot%") {
+		return nil, fmt.Errorf("VS Code Copilot auth state not found")
+	}
+
+	baseURL := providerEnv("COPILOT", "API_BASE_URL")
+	status := ProviderStatusAvailable
+	errText := ""
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:18769"
+		if !providerTCPPortOpen("127.0.0.1", 18769, 250*time.Millisecond) {
+			status = ProviderStatusUnavailable
+			errText = "VS Code Copilot 已登录，但本地 Ollama/API 桥接端口 18769 未监听"
+		}
+	}
+
+	return &Provider{
+		ID:       "vscode-copilot",
+		Name:     "VS Code Copilot",
+		Type:     ProviderTypeLocal,
+		Status:   status,
+		BaseURL:  baseURL,
+		Model:    firstNonEmptyProviderString(providerEnv("COPILOT", "MODEL"), "copilot"),
+		Priority: 25,
+		Error:    errText,
+		AuthFile: authFile,
+		Icon:     "C",
+		Color:    "#007acc",
+	}, nil
 }
 
 // Test 测试 VS Code Copilot Provider
 func (d *VSCodeCopilotDiscoverer) Test(p *Provider) error {
-	return fmt.Errorf("not implemented")
+	return testIDEProvider(p)
 }
 
 // GeminiCLIDiscoverer 发现 Gemini CLI
@@ -405,7 +406,7 @@ func (d *GeminiCLIDiscoverer) Discover() (*Provider, error) {
 		Status:   ProviderStatusAvailable,
 		BaseURL:  "https://generativelanguage.googleapis.com/v1beta",
 		Priority: 18,
-		Icon:    "💎",
+		Icon:     "💎",
 		Color:    "#4285f4",
 		AuthFile: configPath,
 	}, nil

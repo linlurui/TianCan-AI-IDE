@@ -43,19 +43,19 @@ type Quota struct {
 
 // Provider 代表一个 AI Provider
 type Provider struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name"`
-	Type        ProviderType   `json:"type"`
-	Status      ProviderStatus `json:"status"`
-	BaseURL     string         `json:"baseUrl,omitempty"`
-	APIKey      string         `json:"-"`
-	Model       string         `json:"model,omitempty"`
-	Quota       *Quota         `json:"quota,omitempty"`
-	Priority    int            `json:"priority"` // 优先级，数字越小优先级越高
-	Error       string         `json:"error,omitempty"`
-	AuthFile    string         `json:"authFile,omitempty"`     // 认证文件路径
-	Icon        string         `json:"icon,omitempty"`         // 图标 emoji
-	Color       string         `json:"color,omitempty"`        // 主题色
+	ID       string         `json:"id"`
+	Name     string         `json:"name"`
+	Type     ProviderType   `json:"type"`
+	Status   ProviderStatus `json:"status"`
+	BaseURL  string         `json:"baseUrl,omitempty"`
+	APIKey   string         `json:"-"`
+	Model    string         `json:"model,omitempty"`
+	Quota    *Quota         `json:"quota,omitempty"`
+	Priority int            `json:"priority"` // 优先级，数字越小优先级越高
+	Error    string         `json:"error,omitempty"`
+	AuthFile string         `json:"authFile,omitempty"` // 认证文件路径
+	Icon     string         `json:"icon,omitempty"`     // 图标 emoji
+	Color    string         `json:"color,omitempty"`    // 主题色
 }
 
 // Discoverer Provider 发现器接口
@@ -72,8 +72,8 @@ type Discoverer interface {
 
 // Registry Provider 注册表
 type Registry struct {
-	mu         sync.RWMutex
-	providers  map[string]*Provider
+	mu          sync.RWMutex
+	providers   map[string]*Provider
 	discoverers []Discoverer
 }
 
@@ -103,6 +103,8 @@ func (r *Registry) registerDiscoverers() {
 		&KiroDiscoverer{},
 		&OpenCodeDiscoverer{},
 		&GeminiCLIDiscoverer{},
+		&CursorDiscoverer{},
+		&WindsurfDiscoverer{},
 		&VSCodeCopilotDiscoverer{},
 		&CustomAPIDiscoverer{},
 	)
@@ -560,9 +562,9 @@ func (r *Registry) fetchAnthropicQuota(p *Provider) (*Quota, error) {
 	defer cancel()
 
 	reqBody := map[string]interface{}{
-		"model":            "claude-3-5-sonnet-20241022",
-		"max_tokens":        1,
-		"messages":          []map[string]string{{"role": "user", "content": "ping"}},
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
 	}
 	body, _ := json.Marshal(reqBody)
 

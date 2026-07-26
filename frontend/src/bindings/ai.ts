@@ -28,12 +28,15 @@ export {
   RespondPermission,
   SmartRoute,
   SmartAgentRun,
+  SmartAgentRunV2,
   GetRouterConfig,
   SetRouterConfig,
   RefreshModelStatuses,
 } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/ai/service";
 export {
   AgentRunResult,
+  AgentRunResultV2,
+  TaskAnalysisV2,
   APIProviderConfig,
   ChatMessage,
   ModelInfo,

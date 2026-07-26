@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from "react";
 import { useTranslation } from "../i18n";
 import { ScrollText, Trash2 } from "lucide-react";
-import { GetProcessOutput } from "../bindings/process";
+import { GetProcessOutput } from "@bindings/process";
 import { AnsiLine } from "../utils/ansi";
 
 interface OutputPanelProps {

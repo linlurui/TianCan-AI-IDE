@@ -32,8 +32,8 @@ import {
   IsDartInstalled,
   DetectAdapterType, GetDebugStatus,
   AdapterType,
-} from "../bindings/debug";
-import { StopProject, DetectRunEnv, StartProjectWithCmd, GetProcessOutput, ScanRunConfigs } from "../bindings/process";
+} from "@bindings/debug";
+import { StopProject, DetectRunEnv, StartProjectWithCmd, GetProcessOutput, ScanRunConfigs } from "@bindings/process";
 
 /* ─────────────────────────────────────────────────────────────────
    Public types
@@ -1176,7 +1176,7 @@ const DebugPanel = forwardRef<DebugPanelHandle, Props>(function DebugPanel(
           <span className="debug-program-label">{t("debug.target")}</span>
           <select className="debug-program-select" value={selectedPkg}
             onChange={e => setSelectedPkg(e.target.value)} disabled={isActive}>
-            {mainPkgs.map(p => <option key={p} value={p}>{p}</option>)}
+            {mainPkgs.map((p, i) => <option key={`${p}-${i}`} value={p}>{p}</option>)}
           </select>
         </div>
       )}

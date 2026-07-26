@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sort -t: -k2 -n)",
+      "Bash(go build *)",
+      "Bash(gofmt -e router/router.go)",
+      "Bash(go test *)",
+      "Bash(grep -E \"\\\\.go$|\\\\.ts$\")",
+      "Bash(~/go/bin/wails3 generate *)",
+      "Bash(npm run *)"
+    ]
+  }
+}

@@ -5,10 +5,10 @@ import {
   FolderPlus, Download, Plus, Globe, Smartphone, Coffee, Code, Zap,
   Shield, Layers, Cpu, Server, Package, FilePlus2, Gem,
 } from "lucide-react";
-import { SelectDirectory, WriteFile } from "../bindings/filesystem";
-import { DetectProjectTypes, CreateProject } from "../bindings/project";
-import { IsDlvInstalled, InstallDlv } from "../bindings/debug";
-import type { DetectResult } from "../bindings/project";
+import { SelectDirectory, WriteFile } from "@bindings/filesystem";
+import { DetectProjectTypes, CreateProject } from "@bindings/project";
+import { IsDlvInstalled, InstallDlv } from "@bindings/debug";
+import type { DetectResult } from "@bindings/project";
 import { PROJECT_CATEGORIES, type ProjectTypeItem } from "../data/projectTypes";
 
 export interface WizardResult {

@@ -28,6 +28,7 @@ interface Props {
   cursorLine: number;
   cursorCol: number;
   onOpenFile: (path: string, line: number) => void;
+  onAddContext?: (ctx: { type: "symbol"; name: string; filePath: string; line: number; detail?: string }) => void;
   lspPort?: number;
   monaco?: any;
 }
@@ -50,6 +51,7 @@ export default function CallHierarchyPanel({
   cursorLine,
   cursorCol,
   onOpenFile,
+  onAddContext,
   lspPort,
   monaco,
 }: Props) {
@@ -159,8 +161,9 @@ export default function CallHierarchyPanel({
       const path = uriToPath(item.uri);
       const line = (item.selectionRange?.start?.line ?? item.range?.start?.line ?? 0) + 1;
       onOpenFile(path, line);
+      onAddContext?.({ type: "symbol", name: item.name, filePath: path, line, detail: item.detail });
     },
-    [onOpenFile]
+    [onOpenFile, onAddContext]
   );
 
   const edges = mode === "incoming" ? incoming : outgoing;

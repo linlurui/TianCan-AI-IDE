@@ -65,6 +65,7 @@ var allTypes = []DetectResult{
 	{Type: "maven", DisplayName: "Maven (Java)", Icon: "☕", Description: "mvn dependency:resolve 下载 JAR 依赖", SetupCmd: "mvn dependency:resolve -q"},
 	{Type: "gradle", DisplayName: "Gradle (Java/Kotlin)", Icon: "🐘", Description: "gradle dependencies 下载依赖", SetupCmd: "gradle dependencies -q"},
 	{Type: "go", DisplayName: "Go Modules", Icon: "🐹", Description: "go mod download 拉取模块", SetupCmd: "go mod download"},
+	{Type: "flutter", DisplayName: "Flutter", Icon: "🦋", Description: "flutter pub get 安装 Dart/Flutter 依赖", SetupCmd: "flutter pub get"},
 	{Type: "npm", DisplayName: "npm (Node.js)", Icon: "📦", Description: "npm install 安装 node_modules", SetupCmd: "npm install"},
 	{Type: "yarn", DisplayName: "Yarn (Node.js)", Icon: "🧶", Description: "yarn install 安装 node_modules", SetupCmd: "yarn install"},
 	{Type: "pnpm", DisplayName: "pnpm (Node.js)", Icon: "📦", Description: "pnpm install 安装 node_modules", SetupCmd: "pnpm install"},
@@ -97,6 +98,14 @@ func (s *Service) DetectProjectTypes(dirPath string) ([]DetectResult, error) {
 	for file, projectType := range indicators {
 		if _, err := os.Stat(filepath.Join(dirPath, file)); err == nil {
 			detected[projectType] = true
+		}
+	}
+
+	// Flutter projects are identified by a pubspec with the Flutter SDK dependency.
+	if data, err := os.ReadFile(filepath.Join(dirPath, "pubspec.yaml")); err == nil {
+		content := string(data)
+		if strings.Contains(content, "sdk: flutter") || strings.Contains(content, "\n  flutter:") {
+			detected["flutter"] = true
 		}
 	}
 

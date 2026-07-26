@@ -5,7 +5,7 @@ import {
   FileImage, ChevronRight, ChevronDown, Loader2, Pencil, Trash2,
   FilePlus, FolderPlus, Wrench,
 } from "lucide-react";
-import { FileNode, ListDirectory, RenameFile, DeleteFile, CreateFile, MkDir, WriteFile } from "../bindings/filesystem";
+import { FileNode, ListDirectory, RenameFile, DeleteFile, CreateFile, MkDir, WriteFile } from "@bindings/filesystem";
 import { Project, ProjectType } from "../types";
 
 export interface RevealSignal { path: string; ts: number }
@@ -63,6 +63,7 @@ const PROJECT_TYPE_COLORS: Record<ProjectType, string> = {
   java:     "#b07219",
   frontend: "#f7df1e",
   golang:   "#00add8",
+  flutter:  "#54c5f8",
   python:   "#4b8bbe",
   rust:     "#ce4a0c",
   other:    "#858585",
@@ -282,7 +283,7 @@ function getFileTemplate(filePath: string): string {
 
 interface ProjectCtxMenu { x: number; y: number; projectId: string }
 interface FileCtxMenu { x: number; y: number; node: FileNode }
-const PROJECT_TYPES: ProjectType[] = ["java", "frontend", "golang", "python", "rust", "other"];
+const PROJECT_TYPES: ProjectType[] = ["java", "frontend", "golang", "flutter", "python", "rust", "other"];
 
 export default function FileTree({
   projects, activeProjectId, activeFile, revealSignal,

@@ -1,8 +1,26 @@
 package process
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestDetectCommandFlutter(t *testing.T) {
+	root := t.TempDir()
+	pubspec := "name: sample_app\ndependencies:\n  flutter:\n    sdk: flutter\n"
+	if err := os.WriteFile(filepath.Join(root, "pubspec.yaml"), []byte(pubspec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	name, args, err := detectCommand(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "flutter" || len(args) != 1 || args[0] != "run" {
+		t.Fatalf("unexpected Flutter command: %s %v", name, args)
+	}
+}
 
 func TestExtractConflictPort(t *testing.T) {
 	cases := []struct {
