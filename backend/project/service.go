@@ -2,11 +2,14 @@ package project
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 )
 
 // ProjectRoot holds the current project root path (set from frontend).
@@ -163,15 +166,150 @@ func (s *Service) RunSetup(dirPath, projectType string) (string, error) {
 	}
 
 	parts := strings.Fields(setupCmd)
-	cmd := exec.Command(parts[0], parts[1:]...)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("依赖安装命令为空")
+	}
+
+	execPath, err := resolveSetupExecutable(dirPath, projectType, parts[0])
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, execPath, parts[1:]...)
 	cmd.Dir = dirPath
+	cmd.Env = setupEnvironment(dirPath)
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
 	if err := cmd.Run(); err != nil {
-		return buf.String(), fmt.Errorf("配置失败: %w", err)
+		output := strings.TrimSpace(buf.String())
+		if ctx.Err() == context.DeadlineExceeded {
+			return output, fmt.Errorf("依赖安装超时，已等待 10 分钟。输出:\n%s", output)
+		}
+		if output != "" {
+			return output, fmt.Errorf("依赖安装失败: %w\n\n%s", err, output)
+		}
+		return output, fmt.Errorf("依赖安装失败: %w", err)
 	}
 	return buf.String(), nil
+}
+
+func resolveSetupExecutable(dirPath, projectType, name string) (string, error) {
+	if projectType == "flutter" {
+		if path := findFlutterExecutable(dirPath); path != "" {
+			return path, nil
+		}
+		return "", fmt.Errorf("未找到 Flutter SDK。请先安装 Flutter，或在项目中配置 FVM（.fvm/flutter_sdk），然后重新导入。")
+	}
+
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	for _, dir := range setupPathDirs(dirPath) {
+		candidate := filepath.Join(dir, name)
+		if runtime.GOOS == "windows" {
+			for _, ext := range []string{".exe", ".cmd", ".bat"} {
+				if fileExecutable(candidate + ext) {
+					return candidate + ext, nil
+				}
+			}
+		}
+		if fileExecutable(candidate) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("未找到命令 %q，请先安装对应开发环境，或确认它在 PATH 中。", name)
+}
+
+func findFlutterExecutable(dirPath string) string {
+	candidates := []string{
+		filepath.Join(dirPath, ".fvm", "flutter_sdk", "bin", flutterBinaryName()),
+		filepath.Join(dirPath, ".fvm", "versions", "stable", "bin", flutterBinaryName()),
+	}
+
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		candidates = append(candidates,
+			filepath.Join(home, "fvm", "default", "bin", flutterBinaryName()),
+			filepath.Join(home, ".fvm", "default", "bin", flutterBinaryName()),
+			filepath.Join(home, "development", "flutter", "bin", flutterBinaryName()),
+			filepath.Join(home, "Developer", "flutter", "bin", flutterBinaryName()),
+			filepath.Join(home, "flutter", "bin", flutterBinaryName()),
+		)
+	}
+
+	for _, dir := range setupPathDirs(dirPath) {
+		candidates = append(candidates, filepath.Join(dir, flutterBinaryName()))
+	}
+	if path, err := exec.LookPath("flutter"); err == nil {
+		candidates = append(candidates, path)
+	}
+	for _, candidate := range candidates {
+		if fileExecutable(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func flutterBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "flutter.bat"
+	}
+	return "flutter"
+}
+
+func setupEnvironment(dirPath string) []string {
+	env := os.Environ()
+	path := os.Getenv("PATH")
+	dirs := setupPathDirs(dirPath)
+	if path == "" {
+		path = strings.Join(dirs, string(os.PathListSeparator))
+	} else {
+		path = strings.Join(append(dirs, path), string(os.PathListSeparator))
+	}
+	env = append(env, "PATH="+path)
+	return env
+}
+
+func setupPathDirs(dirPath string) []string {
+	var dirs []string
+	add := func(path string) {
+		if path != "" {
+			dirs = append(dirs, path)
+		}
+	}
+
+	add(filepath.Join(dirPath, ".fvm", "flutter_sdk", "bin"))
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		add(filepath.Join(home, ".pub-cache", "bin"))
+		add(filepath.Join(home, ".fvm", "default", "bin"))
+		add(filepath.Join(home, "fvm", "default", "bin"))
+		add(filepath.Join(home, "development", "flutter", "bin"))
+		add(filepath.Join(home, "Developer", "flutter", "bin"))
+		add(filepath.Join(home, "flutter", "bin"))
+		add(filepath.Join(home, ".local", "bin"))
+	}
+	add("/opt/homebrew/bin")
+	add("/usr/local/bin")
+	add("/usr/bin")
+	add("/bin")
+	return dirs
+}
+
+func fileExecutable(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return info.Mode()&0o111 != 0
 }
