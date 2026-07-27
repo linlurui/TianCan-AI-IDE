@@ -5,8 +5,31 @@ import { create } from "zustand";
 import { Project, ProjectType } from "../types";
 import { GetDirectoryTree } from "@bindings/filesystem";
 import { GetStatus } from "@bindings/git";
+import { EnsureProjectMemory } from "../bindings/memory";
 
 const STORAGE_KEY = "tiancan-projects";
+const memoryWarmupState = new Map<string, "scheduled" | "running" | "done">();
+
+function scheduleProjectMemoryWarmup(rootPath: string | null | undefined) {
+  if (!rootPath || memoryWarmupState.has(rootPath)) return;
+  memoryWarmupState.set(rootPath, "scheduled");
+
+  const run = () => {
+    memoryWarmupState.set(rootPath, "running");
+    void EnsureProjectMemory(rootPath)
+      .then(() => memoryWarmupState.set(rootPath, "done"))
+      .catch((err) => {
+        memoryWarmupState.delete(rootPath);
+        console.debug("project memory warmup deferred:", err);
+      });
+  };
+
+  if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+    window.requestIdleCallback(run, { timeout: 1200 });
+  } else {
+    setTimeout(run, 0);
+  }
+}
 
 // ── Types for session isolation ──────────────────────────────────────────────
 
@@ -140,6 +163,7 @@ export const useProjectStore = create<ProjectState>((set, get) => {
         activeMessages: firstSession.messages,
         activeAgentTasks: firstSession.agentTasks,
       });
+      scheduleProjectMemoryWarmup(loaded[0]?.rootPath);
     },
 
     importProject: async (rootPath) => {
@@ -172,6 +196,7 @@ export const useProjectStore = create<ProjectState>((set, get) => {
           activeAgentTasks: [],
         };
       });
+      scheduleProjectMemoryWarmup(proj.rootPath);
     },
 
     removeProject: (id) => {
@@ -189,6 +214,7 @@ export const useProjectStore = create<ProjectState>((set, get) => {
           const newSessions = loadSessions();
           const nextId = next[0]?.id ?? null;
           const nextSession = nextId ? (newSessions[nextId] ?? { messages: [], agentTasks: [], lastActive: Date.now() }) : { messages: [], agentTasks: [], lastActive: Date.now() };
+          scheduleProjectMemoryWarmup(next[0]?.rootPath);
           return {
             projects: next,
             activeProjectId: nextId,
@@ -203,6 +229,8 @@ export const useProjectStore = create<ProjectState>((set, get) => {
 
     activateProject: (id) => {
       const { projects, activeProjectId } = get();
+      const newProject = projects.find((p) => p.id === id) ?? null;
+      scheduleProjectMemoryWarmup(newProject?.rootPath);
       if (id === activeProjectId) return;
 
       // Save current project's session
@@ -218,8 +246,6 @@ export const useProjectStore = create<ProjectState>((set, get) => {
 
       // Load new project's session
       const newSession = currentSessions[id] ?? { messages: [], agentTasks: [], lastActive: Date.now() };
-      const newProject = projects.find((p) => p.id === id) ?? null;
-
       set({
         activeProjectId: id,
         activeProject: newProject,
@@ -249,6 +275,9 @@ export const useProjectStore = create<ProjectState>((set, get) => {
           activeProject: next.find((p) => p.id === (s.activeProjectId === id ? newPath : s.activeProjectId)) ?? null,
         };
       });
+      if (get().activeProjectId === newPath) {
+        scheduleProjectMemoryWarmup(newPath);
+      }
     },
 
     setProjectType: (id, type) => {

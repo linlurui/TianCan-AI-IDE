@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import { Events } from "@wailsio/runtime";
-import { Trash2, Paperclip, SendHorizontal, Cpu, Cloud, Download, Loader2, Key, Globe, Activity, Wrench, CheckCircle2, AlertCircle } from "lucide-react";
+import { Trash2, Paperclip, SendHorizontal, Square, Cpu, Cloud, Download, Loader2, Key, Globe, Activity, Wrench, CheckCircle2, AlertCircle, ChevronDown, ChevronRight, FileCode2, Terminal, Search } from "lucide-react";
 import {
   ListModels, IsLMStudioInstalled, InstallLMStudio, LaunchLMStudio,
   SetModel, ListAPIProviders, SetAPIProvider, GetAPIProvider,
@@ -10,6 +10,8 @@ import {
 } from "@bindings/ai";
 import type { APIProviderConfig, WebProviderInfo } from "@bindings/ai";
 import SubAgentProgressPanel from "./SubAgentProgress";
+import { describeTool, type ActivityItem, type ActivityKind } from "../aiActivity";
+export type { ActivityItem, ActivityKind } from "../aiActivity";
 
 // ─── <think> block component ────────────────────────────────
 function ThinkBlock({ content, streaming, title }: { content: string; streaming?: boolean; title?: string }) {
@@ -28,7 +30,6 @@ function ThinkBlock({ content, streaming, title }: { content: string; streaming?
 
 // Parse assistant content splitting on <think>...</think> blocks.
 function renderMessageContent(content: string): React.ReactNode[] {
-  content = content.replace(/<think>[\s\S]*?<\/think>/g, "").replace(/<think>[\s\S]*/g, "").trim();
   const parts: React.ReactNode[] = [];
   const re = /<think>([\s\S]*?)<\/think>/g;
   let last = 0, key = 0, m: RegExpExecArray | null;
@@ -92,18 +93,10 @@ export interface Message {
   role: "user" | "assistant" | "system" | "tool_call" | "tool_result" | "thinking";
   content: string;
   name?: string; // tool name for tool_call/tool_result
+  streaming?: boolean;
 }
 
 export type ModelSource = "auto" | "local" | "api" | "web";
-export type ActivityKind = "thinking" | "tool" | "result" | "success" | "error" | "route";
-
-export interface ActivityItem {
-  id: number;
-  kind: ActivityKind;
-  text: string;
-  detail?: string;
-}
-
 type LMModel = { id: string; label: string; available?: boolean; disable_reason?: string };
 
 const LOCAL_MODELS_FALLBACK: LMModel[] = [
@@ -112,7 +105,8 @@ const LOCAL_MODELS_FALLBACK: LMModel[] = [
 
 interface AIPanelProps {
   messages: Message[];
-  onSend: (text: string, source: ModelSource) => void;
+  onSend: (text: string, source: ModelSource) => void | Promise<void>;
+  onStop?: () => void | Promise<void>;
   isLoading: boolean;
   fullWidth?: boolean;
   contextToAppend?: { id: number; text: string } | null;
@@ -135,32 +129,85 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   }
 }
 
-function AIActivityStrip({ items, isLoading }: { items: ActivityItem[]; isLoading: boolean }) {
-  const currentItem = items[items.length - 1];
-  if (!isLoading && !currentItem) return null;
+function elapsedLabel(item: ActivityItem, now: number) {
+  if (!item.startedAt) return "";
+  const end = item.completedAt || now;
+  const seconds = Math.max(0, Math.round((end - item.startedAt) / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
 
-  const fallback: ActivityItem = {
-    id: 0,
-    kind: "thinking",
-    text: "正在思考",
-    detail: "准备项目上下文和模型",
-  };
-  const current = currentItem || fallback;
+function ActivityRow({ item, now, isLoading }: { item: ActivityItem; now: number; isLoading: boolean }) {
+  const [open, setOpen] = useState(false);
+  const tool = item.toolName ? describeTool(item.toolName, item.detail) : null;
+  const thoughtSummary = item.kind === "thinking" ? item.detail?.replace(/\s+/g, " ").trim() : "";
+  const title = thoughtSummary || tool?.title || item.text;
+  const summary = tool?.summary;
+  const files = item.files?.length ? item.files : tool?.files || [];
+  const expandable = item.kind !== "thinking" && Boolean(item.detail || item.output || files.length);
+  const icon = item.status === "success" || (!isLoading && item.status === "running")
+    ? <CheckCircle2 size={12} />
+    : item.status === "error"
+      ? <AlertCircle size={12} />
+      : item.toolName && ["bash", "shell", "execute_command", "run_command", "test_run"].includes(item.toolName)
+    ? <Terminal size={13} />
+    : item.toolName && ["grep", "grep_files", "glob", "search_files", "web_search"].includes(item.toolName)
+      ? <Search size={13} />
+      : <ActivityIcon kind={item.kind} />;
 
   return (
-    <div className={`ai-activity-strip ${isLoading ? "active" : "idle"}`}>
-      <div className={`ai-activity-current ${current.kind}`} title={current.detail || current.text}>
-        <ActivityIcon kind={current.kind} />
-        <span className="ai-activity-current-text">{current.text}</span>
-      </div>
-      <div className="ai-activity-process" title={current.detail || current.text}>
-        {current.detail || (isLoading ? "正在根据当前上下文等待模型返回" : "")}
-      </div>
+    <div className={`ai-trace-row ${item.status || item.kind}`}>
+      <button className="ai-trace-summary" onClick={() => expandable && setOpen((value) => !value)} aria-expanded={open}>
+        <span className="ai-trace-chevron">{expandable ? (open ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : null}</span>
+        <span className="ai-trace-icon">{icon}</span>
+        <span className="ai-trace-title">{title}</span>
+        {summary && <span className="ai-trace-inline">{summary}</span>}
+        <span className="ai-trace-time">{elapsedLabel(item, now)}</span>
+      </button>
+      {open && (
+        <div className="ai-trace-detail">
+          {files.map((file) => (
+            <div className="ai-trace-file" key={file} title={file}>
+              <CheckCircle2 size={11} />
+              <FileCode2 size={12} />
+              <span>{file}</span>
+            </div>
+          ))}
+          {item.detail && <pre>{item.detail.length > 4000 ? `${item.detail.slice(0, 4000)}\n...` : item.detail}</pre>}
+          {item.output && <pre className="ai-trace-output">{item.output.length > 4000 ? `${item.output.slice(0, 4000)}\n...` : item.output}</pre>}
+        </div>
+      )}
     </div>
   );
 }
 
-export default function AIPanel({ messages, onSend, isLoading, fullWidth, contextToAppend, activityItems = [] }: AIPanelProps) {
+function AIActivityTimeline({ items, isLoading }: { items: ActivityItem[]; isLoading: boolean }) {
+  const [open, setOpen] = useState(true);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!isLoading) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isLoading]);
+
+  const allVisibleItems = items.filter((item) => item.toolName || (item.kind === "thinking" && item.text === "思考过程"));
+  const visibleItems = allVisibleItems.slice(-4);
+  if (!visibleItems.length) return null;
+  const running = isLoading && visibleItems.some((item) => item.status === "running");
+  const hasReasoning = visibleItems.some((item) => item.kind === "thinking");
+  return (
+    <section className="ai-trace" aria-label="模型思考与操作">
+      <button className="ai-trace-header" onClick={() => setOpen((value) => !value)}>
+        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        <span>{hasReasoning ? "模型思考" : "模型操作"}</span>
+        <span className="ai-trace-count">最近 {visibleItems.length} 条</span>
+        {running && <Loader2 size={13} className="spin ai-trace-running" />}
+      </button>
+      {open && <div className="ai-trace-list">{visibleItems.map((item) => <ActivityRow key={item.id} item={item} now={now} isLoading={isLoading} />)}</div>}
+    </section>
+  );
+}
+
+export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth, contextToAppend, activityItems = [] }: AIPanelProps) {
   const [input, setInput] = React.useState("");
   const [source, setSource] = useState<ModelSource>(() => (localStorage.getItem("ai_source") as ModelSource) || "auto");
   const [routeInfo, setRouteInfo] = useState<{ tier: string; reason: string } | null>(null);
@@ -205,9 +252,17 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth, contex
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [inputAreaHeight, setInputAreaHeight] = useState(180); // px
+  const [pendingPrompts, setPendingPrompts] = useState<Array<{ id: number; text: string; source: ModelSource }>>([]);
+  const promptQueueRef = useRef<Array<{ id: number; text: string; source: ModelSource }>>([]);
+  const drainingQueueRef = useRef(false);
+  const onSendRef = useRef(onSend);
   const resizingRef = useRef(false);
   const startYRef = useRef(0);
   const startHeightRef = useRef(0);
+
+  useEffect(() => {
+    onSendRef.current = onSend;
+  }, [onSend]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -471,12 +526,40 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth, contex
 
   const models = source === "local" ? localModels : [{ id: model, label: model }];
 
+  const drainPromptQueue = useCallback(async () => {
+    if (drainingQueueRef.current) return;
+    drainingQueueRef.current = true;
+    try {
+      while (promptQueueRef.current.length > 0) {
+        const next = promptQueueRef.current.shift();
+        if (!next) break;
+        setPendingPrompts((current) => current.filter((prompt) => prompt.id !== next.id));
+        try {
+          await onSendRef.current(next.text, next.source);
+        } catch (error) {
+          console.error("AI prompt failed:", error);
+        }
+      }
+    } finally {
+      drainingQueueRef.current = false;
+    }
+  }, []);
+
   const handleSend = () => {
     const text = input.trim();
-    if (!text || isLoading) return;
-    onSend(text, source);
+    if (!text) return;
+    const prompt = { id: Date.now() + Math.random(), text, source };
+    promptQueueRef.current.push(prompt);
+    setPendingPrompts((current) => [...current, prompt]);
     setInput("");
     textareaRef.current?.focus();
+    void drainPromptQueue();
+  };
+
+  const handleClearChat = () => {
+    promptQueueRef.current = [];
+    setPendingPrompts([]);
+    void onSend("__clear__", source);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -632,7 +715,7 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth, contex
         <button
           className="sidebar-header-btn sidebar-header-btn-always"
           title={t("ai.clearChat")}
-          onClick={() => onSend("__clear__", source)}
+          onClick={handleClearChat}
           style={{ marginLeft: "auto", flexShrink: 0 }}
         >
           <Trash2 size={12} />
@@ -798,7 +881,14 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth, contex
           </div>
         ))}
 
-        {isLoading && (
+        {pendingPrompts.map((prompt) => (
+          <div key={prompt.id} className="ai-message user ai-message-queued">
+            <div className="ai-message-role">{t("ai.roleUser")} · 排队中</div>
+            <div className="ai-message-body">{prompt.text}</div>
+          </div>
+        ))}
+
+        {isLoading && messages[messages.length - 1]?.role !== "assistant" && !activityItems.some((item) => item.toolName || (item.kind === "thinking" && item.text === "思考过程")) && (
           <div className="ai-message assistant">
             <div className="ai-message-role">AI</div>
             <div className="ai-message-body" style={{ color: "var(--text-muted)" }}>
@@ -809,6 +899,8 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth, contex
 
         <div ref={bottomRef} />
       </div>
+
+      <AIActivityTimeline items={activityItems} isLoading={isLoading} />
 
       {/* Resize handle between messages and input */}
       <div
@@ -841,8 +933,6 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth, contex
 
       <SubAgentProgressPanel />
 
-      <AIActivityStrip items={activityItems} isLoading={isLoading} />
-
       <div className="ai-input-area" style={{ height: inputAreaHeight, minHeight: 100, maxHeight: 500 }}>
         <textarea
           ref={textareaRef}
@@ -858,14 +948,20 @@ export default function AIPanel({ messages, onSend, isLoading, fullWidth, contex
             <Paperclip size={13} />
             {t("ai.context")}
           </button>
+          {isLoading && onStop && (
+            <button className="ai-stop-btn" onClick={() => void onStop()} title="停止生成" aria-label="停止生成">
+              <Square size={12} fill="currentColor" />
+            </button>
+          )}
           <button
             className="btn-primary"
             onClick={handleSend}
-            disabled={isLoading || !input.trim()}
+            disabled={!input.trim()}
+            title={isLoading ? "当前任务完成后继续处理" : t("ai.send")}
             style={{ display: "flex", alignItems: "center", gap: 5 }}
           >
             <SendHorizontal size={13} />
-            {t("ai.send")}
+            {isLoading && pendingPrompts.length > 0 ? `排队 ${pendingPrompts.length}` : t("ai.send")}
           </button>
         </div>
       </div>

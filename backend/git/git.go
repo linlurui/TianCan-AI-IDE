@@ -232,8 +232,9 @@ func (s *Service) UnstageFile(repoPath, filePath string) error {
 // Existing files are restored in both the index and worktree. Files added after
 // HEAD are removed, matching the user's "restore this file" expectation.
 func (s *Service) DiscardFile(repoPath, filePath string) error {
-	if strings.TrimSpace(filePath) == "" {
-		return fmt.Errorf("discard file: empty file path")
+	filePath = filepath.Clean(strings.TrimSpace(filePath))
+	if filePath == "." || filepath.IsAbs(filePath) || filePath == ".." || strings.HasPrefix(filePath, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("discard file: invalid file path")
 	}
 
 	existsInHead := exec.Command("git", "cat-file", "-e", "HEAD:"+filePath)

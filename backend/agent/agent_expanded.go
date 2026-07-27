@@ -44,9 +44,26 @@ type AgentV2 struct {
 	configRes    *config.ConfigResolver
 	mcpClient    *mcp.Client
 
-	mu        sync.Mutex
-	messages  []Message
-	sessionID string
+	mu         sync.Mutex
+	messages   []Message
+	sessionID  string
+	progressCB ProgressCallback
+}
+
+// SetProgressCallback publishes model-selected tool activity while RunV2 is executing.
+func (a *AgentV2) SetProgressCallback(cb ProgressCallback) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.progressCB = cb
+}
+
+func (a *AgentV2) reportProgress(iteration int, toolName string, toolArgs map[string]interface{}, output string, done bool, errText string) {
+	a.mu.Lock()
+	cb := a.progressCB
+	a.mu.Unlock()
+	if cb != nil {
+		cb(iteration, toolName, toolArgs, output, done, errText)
+	}
 }
 
 // NewAgentV2 creates an enhanced agent with all expanded subsystems.
@@ -188,12 +205,15 @@ func (a *AgentV2) RunV2(ctx context.Context, userMessage string, maxIter int, ch
 
 		// Execute tool calls with role-based permission checks
 		for _, tc := range toolCalls {
+			a.reportProgress(i+1, tc.Name, tc.Args, "", false, "")
 			// Check if tool is allowed for this role
 			if !a.roleReg.IsToolAllowed(analysis.PrimaryRole, tc.Name) {
+				output := fmt.Sprintf("Tool %s not allowed for role %s", tc.Name, analysis.PrimaryRole)
 				msgs = append(msgs, Message{
-					Role: RoleTool, Content: fmt.Sprintf("Tool %s not allowed for role %s", tc.Name, analysis.PrimaryRole),
+					Role: RoleTool, Content: output,
 					ToolName: tc.Name, Success: false,
 				})
+				a.reportProgress(i+1, tc.Name, tc.Args, output, false, output)
 				continue
 			}
 
@@ -203,9 +223,12 @@ func (a *AgentV2) RunV2(ctx context.Context, userMessage string, maxIter int, ch
 				// Try MCP
 				mcpResult, mcpErr := a.mcpClient.CallTool(ctx, tc.Name, tc.Args)
 				if mcpErr != nil {
-					msgs = append(msgs, Message{Role: RoleTool, Content: fmt.Sprintf("Tool not found: %s", tc.Name), ToolName: tc.Name, Success: false})
+					output := fmt.Sprintf("Tool not found: %s", tc.Name)
+					msgs = append(msgs, Message{Role: RoleTool, Content: output, ToolName: tc.Name, Success: false})
+					a.reportProgress(i+1, tc.Name, tc.Args, output, false, output)
 				} else {
 					msgs = append(msgs, Message{Role: RoleTool, Content: mcpResult.Content, ToolName: tc.Name, Success: mcpResult.Success})
+					a.reportProgress(i+1, tc.Name, tc.Args, mcpResult.Content, false, "")
 				}
 				continue
 			}
@@ -213,15 +236,19 @@ func (a *AgentV2) RunV2(ctx context.Context, userMessage string, maxIter int, ch
 			permResult := a.permMgr.Check(tool, tc.Args)
 			switch permResult.Decision {
 			case DecisionDeny:
+				output := fmt.Sprintf("Denied: %s", permResult.Reason)
 				msgs = append(msgs, Message{
-					Role: RoleTool, Content: fmt.Sprintf("Denied: %s", permResult.Reason),
+					Role: RoleTool, Content: output,
 					ToolName: tc.Name, Success: false,
 				})
+				a.reportProgress(i+1, tc.Name, tc.Args, output, false, output)
 			case DecisionAsk:
+				output := fmt.Sprintf("Needs confirmation: %s", permResult.Reason)
 				msgs = append(msgs, Message{
-					Role: RoleTool, Content: fmt.Sprintf("Needs confirmation: %s", permResult.Reason),
+					Role: RoleTool, Content: output,
 					ToolName: tc.Name, Success: false,
 				})
+				a.reportProgress(i+1, tc.Name, tc.Args, output, false, output)
 			case DecisionAllow:
 				// Snapshot for rollback if write operation
 				if !tool.IsReadOnly() {
@@ -236,6 +263,11 @@ func (a *AgentV2) RunV2(ctx context.Context, userMessage string, maxIter int, ch
 				msgs = append(msgs, Message{
 					Role: RoleTool, Content: result.Content, ToolName: tc.Name, Success: result.Success,
 				})
+				errText := ""
+				if !result.Success {
+					errText = result.Error
+				}
+				a.reportProgress(i+1, tc.Name, tc.Args, result.Content, false, errText)
 				totalTokens += len(result.Content) / 4
 				a.convMem.AddMessage(Message{Role: RoleTool, Content: result.Content, ToolName: tc.Name, Success: result.Success})
 			}

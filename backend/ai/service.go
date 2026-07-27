@@ -64,10 +64,63 @@ type Service struct {
 	App            *application.App    // set by main.go; used for Events.Emit
 	Router         *router.SmartRouter // hardware-aware model tier routing
 	sandboxMgr     *sandbox.Manager    // persistent sandbox manager (shared state)
+	requestCtx     context.Context
+	requestCancel  context.CancelFunc
+	requestID      uint64
 	// Provider management
 	providerRegistry *aiprovider.Registry
 	activeProvider   string // ID of active provider
 	// Agent mode
+}
+
+func (s *Service) beginRequest() (context.Context, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.requestCancel != nil {
+		s.requestCancel()
+	}
+	s.requestID++
+	ctx, cancel := context.WithCancel(context.Background())
+	s.requestCtx = ctx
+	s.requestCancel = cancel
+	return ctx, s.requestID
+}
+
+func (s *Service) endRequest(id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.requestID != id {
+		return
+	}
+	if s.requestCancel != nil {
+		s.requestCancel()
+	}
+	s.requestCtx = nil
+	s.requestCancel = nil
+}
+
+func (s *Service) currentRequestContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.requestCtx != nil {
+		return s.requestCtx
+	}
+	return context.Background()
+}
+
+// StopAgentRequest cancels the active model request and any attached CLI process.
+func (s *Service) StopAgentRequest() bool {
+	s.mu.Lock()
+	cancel := s.requestCancel
+	s.requestID++
+	s.requestCtx = nil
+	s.requestCancel = nil
+	s.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
 }
 
 // NewService creates a new AI service.
@@ -780,7 +833,8 @@ type ChatStreamChunk struct {
 	Object  string `json:"object"`
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -976,47 +1030,7 @@ func (s *Service) Chat(messages []ChatMessage) (string, error) {
 	apiURL := s.apiURL
 	model := s.model
 	s.mu.Unlock()
-
-	reqBody := ChatRequest{
-		Model:       model,
-		Messages:    messages,
-		Temperature: 0.7,
-		MaxTokens:   4096,
-		Stream:      false,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", apiURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("LM Studio 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("LM Studio 返回错误 %d: %s", resp.StatusCode, string(b))
-	}
-
-	var result ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("解析响应失败: %w", err)
-	}
-
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("LM Studio 返回空响应")
-	}
-
-	return result.Choices[0].Message.Content, nil
+	return s.chatOpenAIStream(s.currentRequestContext(), apiURL, "", model, messages, "LM Studio")
 }
 
 // CallLLM implements tools.LLMCaller interface — a simple single-turn LLM call
@@ -1066,48 +1080,84 @@ func (s *Service) ChatAPI(messages []ChatMessage) (string, error) {
 		return "", fmt.Errorf("API Key 未配置：请在设置中填写 API Key")
 	}
 
-	reqBody := ChatRequest{
-		Model:       p.Model,
-		Messages:    messages,
-		Temperature: 0.7,
-		MaxTokens:   4096,
-		Stream:      false,
-	}
+	return s.chatOpenAIStream(s.currentRequestContext(), p.BaseURL, p.APIKey, p.Model, messages, p.Name)
+}
 
+func (s *Service) chatOpenAIStream(ctx context.Context, baseURL, apiKey, model string, messages []ChatMessage, provider string) (string, error) {
+	reqBody := ChatRequest{Model: model, Messages: messages, Temperature: 0.7, MaxTokens: 4096, Stream: true}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		return "", fmt.Errorf("marshal %s request: %w", provider, err)
 	}
-
-	req, err := http.NewRequest("POST", p.BaseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(baseURL, "/")+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("创建请求失败: %w", err)
+		return "", fmt.Errorf("创建 %s 请求失败: %w", provider, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
-
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(req)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
 	if err != nil {
-		return "", fmt.Errorf("API 请求失败 (%s): %w", p.Name, err)
+		return "", fmt.Errorf("%s 请求失败: %w", provider, err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API 返回错误 %d (%s): %s", resp.StatusCode, p.Name, string(b))
+		return "", fmt.Errorf("%s 返回错误 %d: %s", provider, resp.StatusCode, truncateString(string(b), 1200))
 	}
 
-	var result ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("解析响应失败: %w", err)
+	s.emitModelStream("start", provider, "")
+	var full strings.Builder
+	var raw strings.Builder
+	var reasoning strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		raw.WriteString(line)
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var chunk ChatStreamChunk
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			continue
+		}
+		for _, choice := range chunk.Choices {
+			if choice.Delta.ReasoningContent != "" {
+				reasoning.WriteString(choice.Delta.ReasoningContent)
+			}
+			if choice.Delta.Content != "" {
+				full.WriteString(choice.Delta.Content)
+				s.emitModelStream("token", provider, choice.Delta.Content)
+			}
+		}
 	}
-
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("API 返回空响应 (%s)", p.Name)
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("读取 %s 流失败: %w", provider, err)
 	}
-
-	return result.Choices[0].Message.Content, nil
+	if reasoning.Len() > 0 && s.App != nil {
+		s.App.Event.Emit("ai:reasoning", map[string]string{"provider": provider, "content": truncateString(reasoning.String(), 4000)})
+	}
+	if full.Len() == 0 {
+		var result ChatResponse
+		if json.Unmarshal([]byte(raw.String()), &result) == nil && len(result.Choices) > 0 {
+			full.WriteString(result.Choices[0].Message.Content)
+			s.emitChunkedModelOutput(provider, full.String())
+		}
+	}
+	s.emitModelStream("end", provider, "")
+	if strings.TrimSpace(full.String()) == "" {
+		return "", fmt.Errorf("%s 返回空响应", provider)
+	}
+	if thinking, _ := splitThinkingContent(full.String()); thinking != "" && s.App != nil {
+		s.App.Event.Emit("ai:reasoning", map[string]string{
+			"provider": provider,
+			"content":  truncateString(thinking, 4000),
+		})
+	}
+	return full.String(), nil
 }
 
 func openRelayBaseURL() string {
@@ -1125,56 +1175,23 @@ func openRelayBaseURL() string {
 // OpenAI-compatible local endpoint. OpenRelay then routes to configured
 // local/CLI/IDE providers such as Claude Code, Codex, Cursor, and Windsurf.
 func (s *Service) ChatOpenRelay(messages []ChatMessage) (string, error) {
+	return s.chatOpenRelay(s.currentRequestContext(), messages)
+}
+
+func (s *Service) chatOpenRelay(ctx context.Context, messages []ChatMessage) (string, error) {
 	baseURL := openRelayBaseURL()
 	client := &http.Client{Timeout: 120 * time.Second}
 
-	model, err := s.firstOpenRelayModel(client, baseURL)
+	model, err := s.firstOpenRelayModel(ctx, client, baseURL)
 	if err != nil {
 		return "", err
 	}
 
-	reqBody := ChatRequest{
-		Model:       model,
-		Messages:    messages,
-		Temperature: 0.7,
-		MaxTokens:   4096,
-		Stream:      false,
-	}
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("创建 OpenRelay 请求失败: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer unused")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("OpenRelay 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("OpenRelay 返回错误 %d: %s", resp.StatusCode, string(b))
-	}
-
-	var result ChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("解析 OpenRelay 响应失败: %w", err)
-	}
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("OpenRelay 返回空响应")
-	}
-	return result.Choices[0].Message.Content, nil
+	return s.chatOpenAIStream(ctx, baseURL, "unused", model, messages, "OpenRelay")
 }
 
-func (s *Service) firstOpenRelayModel(client *http.Client, baseURL string) (string, error) {
-	req, err := http.NewRequest("GET", baseURL+"/models", nil)
+func (s *Service) firstOpenRelayModel(ctx context.Context, client *http.Client, baseURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/models", nil)
 	if err != nil {
 		return "", fmt.Errorf("创建 OpenRelay 模型请求失败: %w", err)
 	}
@@ -1209,11 +1226,15 @@ func (s *Service) firstOpenRelayModel(client *http.Client, baseURL string) (stri
 // mirroring OpenRelay's "use existing local quota" idea without requiring the
 // OpenRelay HTTP daemon to be running.
 func (s *Service) ChatLocalCLI(messages []ChatMessage) (string, error) {
+	return s.chatLocalCLI(s.currentRequestContext(), messages)
+}
+
+func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (string, error) {
 	var attempts []string
 
 	if claudePath := findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude")); claudePath != "" {
 		s.emitLLMProviderEvent("attempt", "Claude Code", "正在调用本地 Claude Code，允许它读取当前项目进行分析")
-		resp, err := s.chatClaudeCodeCLI(messages)
+		resp, err := s.chatClaudeCodeCLI(ctx, messages)
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "Claude Code", "已返回响应")
 			return resp, nil
@@ -1227,7 +1248,7 @@ func (s *Service) ChatLocalCLI(messages []ChatMessage) (string, error) {
 
 	if codexPath := findLocalCLI("codex", filepath.Join(homeDir(), ".local", "bin", "codex")); codexPath != "" {
 		s.emitLLMProviderEvent("attempt", "Codex", "正在调用本地 Codex，允许它读取当前项目进行分析")
-		resp, err := s.chatCodexCLI(messages)
+		resp, err := s.chatCodexCLI(ctx, messages)
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "Codex", "已返回响应")
 			return resp, nil
@@ -1328,6 +1349,39 @@ func (s *Service) emitLLMProviderEvent(status, provider, detail string) {
 			"detail":   truncateString(detail, 240),
 		})
 	}
+}
+
+func (s *Service) emitModelStream(phase, provider, content string) {
+	if s.App == nil {
+		return
+	}
+	s.App.Event.Emit("ai:model-stream", map[string]string{
+		"phase":    phase,
+		"provider": provider,
+		"content":  content,
+	})
+}
+
+func (s *Service) emitChunkedModelOutput(provider, content string) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+	s.emitModelStream("start", provider, "")
+	const chunkRunes = 48
+	runes := []rune(content)
+	for len(runes) > 0 {
+		size := chunkRunes
+		if len(runes) < size {
+			size = len(runes)
+		}
+		s.emitModelStream("token", provider, string(runes[:size]))
+		runes = runes[size:]
+		if s.App != nil && len(runes) > 0 {
+			time.Sleep(6 * time.Millisecond)
+		}
+	}
+	s.emitModelStream("end", provider, "")
 }
 
 func firstNonEmptyEnv(keys ...string) string {
@@ -1621,8 +1675,8 @@ func quoteSQLiteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-func (s *Service) chatClaudeCodeCLI(messages []ChatMessage) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+func (s *Service) chatClaudeCodeCLI(parent context.Context, messages []ChatMessage) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 75*time.Second)
 	defer cancel()
 
 	claudePath := findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude"))
@@ -1631,36 +1685,28 @@ func (s *Service) chatClaudeCodeCLI(messages []ChatMessage) (string, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, claudePath,
-		"-p", chatMessagesToLLMPrompt(messages),
-		"--output-format", "json",
+		"-p", chatMessagesToCLIPrompt(messages),
+		"--output-format", "stream-json",
+		"--verbose",
+		"--include-partial-messages",
 		"--permission-mode", "default",
 		"--no-session-persistence",
 	)
+	configureCommandCancellation(cmd)
 	cmd.Dir = s.cliWorkDir()
 
-	out, err := cmd.CombinedOutput()
+	out, err := s.runClaudeStream(cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("Claude Code CLI 超时")
 	}
 	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, truncateString(string(out), 1200))
+		return "", err
 	}
-
-	var result struct {
-		IsError bool   `json:"is_error"`
-		Result  string `json:"result"`
-	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return strings.TrimSpace(string(out)), nil
-	}
-	if result.IsError {
-		return "", fmt.Errorf("Claude Code CLI 返回错误: %s", truncateString(result.Result, 1200))
-	}
-	return strings.TrimSpace(result.Result), nil
+	return strings.TrimSpace(out), nil
 }
 
-func (s *Service) chatCodexCLI(messages []ChatMessage) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+func (s *Service) chatCodexCLI(parent context.Context, messages []ChatMessage) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 75*time.Second)
 	defer cancel()
 
 	codexPath := findLocalCLI("codex", filepath.Join(homeDir(), ".local", "bin", "codex"))
@@ -1678,6 +1724,7 @@ func (s *Service) chatCodexCLI(messages []ChatMessage) (string, error) {
 
 	args := []string{
 		"exec",
+		"--json",
 		"--skip-git-repo-check",
 		"--ephemeral",
 		"--ignore-rules",
@@ -1686,17 +1733,18 @@ func (s *Service) chatCodexCLI(messages []ChatMessage) (string, error) {
 		"--output-last-message", tmpPath,
 	}
 	args = append(args, codexExecApprovalArgs()...)
-	args = append(args, chatMessagesToLLMPrompt(messages))
+	args = append(args, chatMessagesToCLIPrompt(messages))
 
 	cmd := exec.CommandContext(ctx, codexPath, args...)
+	configureCommandCancellation(cmd)
 	cmd.Dir = s.cliWorkDir()
 
-	out, err := cmd.CombinedOutput()
+	streamOutput, err := s.runCodexStream(cmd)
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("Codex CLI 超时")
 	}
 	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, truncateString(string(out), 1200))
+		return "", err
 	}
 
 	content, err := os.ReadFile(tmpPath)
@@ -1704,7 +1752,7 @@ func (s *Service) chatCodexCLI(messages []ChatMessage) (string, error) {
 		return "", fmt.Errorf("读取 Codex 输出失败: %w", err)
 	}
 	if strings.TrimSpace(string(content)) == "" {
-		return strings.TrimSpace(string(out)), nil
+		return strings.TrimSpace(streamOutput), nil
 	}
 	return strings.TrimSpace(string(content)), nil
 }
@@ -1764,6 +1812,83 @@ func chatMessagesToLLMPrompt(messages []ChatMessage) string {
 	return strings.TrimSpace(sb.String())
 }
 
+const cliPromptMaxRunes = 24000
+
+// chatMessagesToCLIPrompt omits TianCan's full tool schema because coding CLIs
+// already have native project tools. Keeping the schemas duplicates thousands
+// of tokens and can make an otherwise healthy local CLI exceed its timeout.
+func chatMessagesToCLIPrompt(messages []ChatMessage) string {
+	var systemParts []string
+	var conversationParts []string
+	for _, m := range messages {
+		content := strings.TrimSpace(m.Content)
+		if content == "" {
+			continue
+		}
+		if m.Role == "system" {
+			systemParts = append(systemParts, compactCLISystemPrompt(content))
+			continue
+		}
+		role := "User"
+		if m.Role == "assistant" {
+			role = "Assistant"
+		}
+		conversationParts = append(conversationParts, role+": "+limitRunes(content, 6000))
+	}
+
+	system := limitRunes(strings.Join(systemParts, "\n\n"), 10000)
+	conversation := keepRecentPromptParts(conversationParts, 13500)
+	prompt := strings.TrimSpace(system + "\n\n" +
+		"Use your native coding tools to inspect and modify the current project when needed. " +
+		"Do not reproduce tool schemas or internal workflow narration. Return a concise final response when the task is complete.\n\n" +
+		conversation)
+	return limitRunes(prompt, cliPromptMaxRunes)
+}
+
+func compactCLISystemPrompt(content string) string {
+	const toolsMarker = "# Available Tools"
+	if marker := strings.Index(content, toolsMarker); marker >= 0 {
+		prefix := strings.TrimSpace(content[:marker])
+		root := ""
+		if rootMarker := strings.LastIndex(content, "Project root:"); rootMarker >= 0 {
+			root = strings.TrimSpace(strings.SplitN(content[rootMarker:], "\n", 2)[0])
+		}
+		if root != "" {
+			return prefix + "\n\n" + root
+		}
+		return prefix
+	}
+	return content
+}
+
+func keepRecentPromptParts(parts []string, maxRunes int) string {
+	kept := make([]string, 0, len(parts))
+	remaining := maxRunes
+	for i := len(parts) - 1; i >= 0 && remaining > 0; i-- {
+		part := parts[i]
+		partRunes := []rune(part)
+		if len(partRunes) > remaining {
+			part = string(partRunes[len(partRunes)-remaining:])
+			remaining = 0
+		} else {
+			remaining -= len(partRunes)
+		}
+		kept = append(kept, part)
+	}
+	for left, right := 0, len(kept)-1; left < right; left, right = left+1, right-1 {
+		kept[left], kept[right] = kept[right], kept[left]
+	}
+	return strings.Join(kept, "\n\n")
+}
+
+func limitRunes(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max])
+}
+
 func homeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -1809,7 +1934,12 @@ func (s *Service) ChatStream(messages []ChatMessage, onToken func(token string))
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
-	resp, err := http.Post(apiURL+"/chat/completions", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(s.currentRequestContext(), "POST", apiURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("创建 LM Studio 请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("LM Studio 请求失败: %w", err)
 	}
@@ -1983,7 +2113,7 @@ func (s *Service) ExecuteTool(name string, args map[string]interface{}, rootPath
 	}
 
 	r := s.getRegistry(rootPath)
-	result, err := r.Execute(context.Background(), name, args)
+	result, err := r.Execute(s.currentRequestContext(), name, args)
 	if err != nil {
 		// Tool not found in registry — try name aliases for backward compatibility
 		aliases := map[string]string{
@@ -1993,7 +2123,7 @@ func (s *Service) ExecuteTool(name string, args map[string]interface{}, rootPath
 			"list_dir":   "list_directory",
 		}
 		if alias, ok := aliases[name]; ok && alias != name {
-			result, err = r.Execute(context.Background(), alias, args)
+			result, err = r.Execute(s.currentRequestContext(), alias, args)
 		}
 		if err != nil {
 			return fmt.Sprintf("未知工具: %s", name)
@@ -2338,6 +2468,19 @@ func parseToolCall(content string) (string, map[string]interface{}, bool) {
 	return "", nil, false
 }
 
+// extractVisibleThinking returns only reasoning text explicitly produced by the
+// model, with tool protocol blocks removed before it is sent to the UI.
+func extractVisibleThinking(content string) string {
+	thinking, _ := splitThinkingContent(content)
+	if thinking == "" {
+		thinking = content
+	}
+	for _, tc := range parser.ParseToolCalls(thinking) {
+		thinking = strings.Replace(thinking, tc.RawText, "", 1)
+	}
+	return stripThinkingArtifacts(thinking)
+}
+
 // removeOverlap detects if the start of answer repeats the end of thinking
 // and strips the duplicated prefix from answer. DeepSeek's RESPONSE fragment
 // often repeats the last few words/characters of the THINK fragment.
@@ -2674,6 +2817,8 @@ func (s *Service) emitProgress(iteration int, agentType, toolName string, toolAr
 // and iterates until the model produces a final text response or
 // reaches maxIterations.
 func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations int) AgentRunResult {
+	ctx, requestID := s.beginRequest()
+	defer s.endRequest(requestID)
 	s.SetRootPath(rootPath)
 	if maxIterations <= 0 {
 		maxIterations = 20
@@ -2708,6 +2853,11 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 	result := AgentRunResult{Messages: messages}
 
 	for i := 0; i < maxIterations; i++ {
+		if ctx.Err() != nil {
+			result.Error = "已停止生成"
+			result.Done = true
+			return result
+		}
 		result.Iterations = i + 1
 
 		// Call LM Studio
@@ -2754,6 +2904,8 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 
 // AgentRunAPI executes the TAOR loop using a remote API provider.
 func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations int) AgentRunResult {
+	ctx, requestID := s.beginRequest()
+	defer s.endRequest(requestID)
 	s.SetRootPath(rootPath)
 	if maxIterations <= 0 {
 		maxIterations = 20
@@ -2788,6 +2940,11 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 	result := AgentRunResult{Messages: messages}
 
 	for i := 0; i < maxIterations; i++ {
+		if ctx.Err() != nil {
+			result.Error = "已停止生成"
+			result.Done = true
+			return result
+		}
 		result.Iterations = i + 1
 
 		// Call remote API provider
@@ -2887,6 +3044,9 @@ func (s *Service) SmartAgentRun(userMessage string, rootPath string, maxIteratio
 
 	// Try the routed tier
 	result := s.runOnTier(tier, userMessage, rootPath, maxIterations)
+	if isStoppedError(result.Error) {
+		return result
+	}
 	if result.Error == "" {
 		return result
 	}
@@ -2903,6 +3063,9 @@ func (s *Service) SmartAgentRun(userMessage string, rootPath string, maxIteratio
 		}
 
 		result = s.runOnTier(fallback, userMessage, rootPath, maxIterations)
+		if isStoppedError(result.Error) {
+			return result
+		}
 		if result.Error == "" {
 			if s.App != nil {
 				s.App.Event.Emit("router:fallback", map[string]string{
@@ -2920,9 +3083,16 @@ func (s *Service) SmartAgentRun(userMessage string, rootPath string, maxIteratio
 	return result
 }
 
+func isStoppedError(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(message, "已停止生成") || strings.Contains(lower, "context canceled") || strings.Contains(lower, "context cancelled")
+}
+
 // SmartAgentRunV2 使用增强版 AgentV2 执行任务
 // AgentV2 包含：增强记忆、高级压缩、Rollback、并行执行、MCP 集成
 func (s *Service) SmartAgentRunV2(userMessage string, rootPath string, maxIterations int) AgentRunResultV2 {
+	ctx, requestID := s.beginRequest()
+	defer s.endRequest(requestID)
 	s.SetRootPath(rootPath)
 	if maxIterations <= 0 {
 		maxIterations = 20
@@ -2938,18 +3108,27 @@ func (s *Service) SmartAgentRunV2(userMessage string, rootPath string, maxIterat
 
 	agentChatFn := func(systemPrompt string, msgs []agent.Message) (string, error) {
 		messages := agentMessagesToChatMessages(systemPrompt, msgs)
-		return s.ChatWithModel(messages)
+		response, err := s.ChatWithModel(messages)
+		if err == nil && len(parser.ParseToolCalls(response)) > 0 && s.App != nil {
+			if thinking := extractVisibleThinking(response); thinking != "" {
+				s.App.Event.Emit("ai:reasoning", map[string]string{"content": thinking})
+			}
+		}
+		return response, err
 	}
 
 	// 创建 AgentV2
 	agentV2 := agent.NewAgentV2(rootPath, chatFn)
+	agentV2.SetProgressCallback(func(iteration int, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string) {
+		s.emitProgress(iteration, "auto", toolName, toolArgs, output, isDone, err)
+	})
 
 	// 分析任务类型
 	analysis := agentV2.GetAnalysis(userMessageWithMemory)
 
 	// 统一走标准 V2 工具循环，确保所有 provider 都能持续收到工具执行结果。
 	// Parallel/Ralph V2 目前只完成了单轮工具执行，不适合作为 Auto 默认路径。
-	result := agentV2.RunV2(context.Background(), userMessageWithMemory, maxIterations, agentChatFn)
+	result := agentV2.RunV2(ctx, userMessageWithMemory, maxIterations, agentChatFn)
 
 	// 转换结果
 	return AgentRunResultV2{
@@ -3041,13 +3220,24 @@ func shouldUseRalphLoop(task string) bool {
 // ChatWithModel 是内部方法，用于 AgentV2 的 LLM 调用
 func (s *Service) ChatWithModel(messages []ChatMessage) (string, error) {
 	var attempts []string
+	deadline := time.Now().Add(240 * time.Second)
+	callCandidate := func(limit time.Duration, fn func(context.Context) (string, error)) (string, error) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return "", fmt.Errorf("Auto 模型选择总超时")
+		}
+		if limit > remaining {
+			limit = remaining
+		}
+		return callLLMWithTimeout(s.currentRequestContext(), limit, fn)
+	}
 
 	s.mu.Lock()
 	apiProvider := s.provider
 	s.mu.Unlock()
 	if apiProvider.BaseURL != "" && apiProvider.APIKey != "" && apiProvider.Model != "" {
 		s.emitLLMProviderEvent("attempt", "API", "正在请求已配置的 API")
-		resp, err := callLLMWithTimeout(45*time.Second, func() (string, error) {
+		resp, err := callCandidate(45*time.Second, func(_ context.Context) (string, error) {
 			return s.ChatAPI(messages)
 		})
 		if err == nil && strings.TrimSpace(resp) != "" {
@@ -3061,40 +3251,11 @@ func (s *Service) ChatWithModel(messages []ChatMessage) (string, error) {
 		attempts = append(attempts, "API 未配置")
 	}
 
-	s.emitLLMProviderEvent("attempt", "LM Studio", "正在连接本地模型")
-	resp, err := callLLMWithTimeout(20*time.Second, func() (string, error) {
-		return s.Chat(messages)
-	})
-	if err == nil && strings.TrimSpace(resp) != "" {
-		s.emitLLMProviderEvent("success", "LM Studio", "已返回响应")
-		return resp, nil
-	}
-	s.emitLLMProviderEvent("error", "LM Studio", formatLLMAttemptError("LM Studio", resp, err))
-	attempts = append(attempts, formatLLMAttemptError("本地 LM Studio", resp, err))
-
-	s.emitLLMProviderEvent("attempt", "Claude Code / Codex", "正在尝试本地 CLI")
-	resp, err = callLLMWithTimeout(190*time.Second, func() (string, error) {
-		return s.ChatLocalCLI(messages)
-	})
-	if err == nil && strings.TrimSpace(resp) != "" {
-		return resp, nil
-	}
-	attempts = append(attempts, formatLLMAttemptError("本地 CLI Provider", resp, err))
-
-	s.emitLLMProviderEvent("attempt", "IDE Provider", "正在尝试 Cursor / Windsurf / Copilot，并通过天蚕 Agent 工具层执行项目操作")
-	resp, err = callLLMWithTimeout(35*time.Second, func() (string, error) {
-		return s.ChatIDEProviders(messages)
-	})
-	if err == nil && strings.TrimSpace(resp) != "" {
-		s.emitLLMProviderEvent("success", "IDE Provider", "已返回响应")
-		return resp, nil
-	}
-	s.emitLLMProviderEvent("error", "IDE Provider", formatLLMAttemptError("IDE Provider", resp, err))
-	attempts = append(attempts, formatLLMAttemptError("IDE RPC Provider", resp, err))
-
+	var resp string
+	var err error
 	s.emitLLMProviderEvent("attempt", "OpenRelay", "正在尝试 OpenRelay，并通过天蚕 Agent 工具层执行项目操作")
-	resp, err = callLLMWithTimeout(35*time.Second, func() (string, error) {
-		return s.ChatOpenRelay(messages)
+	resp, err = callCandidate(60*time.Second, func(ctx context.Context) (string, error) {
+		return s.chatOpenRelay(ctx, messages)
 	})
 	if err == nil && strings.TrimSpace(resp) != "" {
 		s.emitLLMProviderEvent("success", "OpenRelay", "已返回响应")
@@ -3103,9 +3264,34 @@ func (s *Service) ChatWithModel(messages []ChatMessage) (string, error) {
 	s.emitLLMProviderEvent("error", "OpenRelay", formatLLMAttemptError("OpenRelay", resp, err))
 	attempts = append(attempts, formatLLMAttemptError("OpenRelay", resp, err))
 
+	s.emitLLMProviderEvent("attempt", "Claude Code / Codex", "正在尝试本地 CLI")
+	resp, err = callCandidate(150*time.Second, func(ctx context.Context) (string, error) {
+		return s.chatLocalCLI(ctx, messages)
+	})
+	if err == nil && strings.TrimSpace(resp) != "" {
+		return resp, nil
+	}
+	attempts = append(attempts, formatLLMAttemptError("本地 CLI Provider", resp, err))
+
+	if s.isServerRunning() {
+		s.emitLLMProviderEvent("attempt", "LM Studio", "正在连接本地模型")
+		resp, err = callCandidate(45*time.Second, func(_ context.Context) (string, error) {
+			return s.Chat(messages)
+		})
+		if err == nil && strings.TrimSpace(resp) != "" {
+			s.emitLLMProviderEvent("success", "LM Studio", "已返回响应")
+			return resp, nil
+		}
+		s.emitLLMProviderEvent("error", "LM Studio", formatLLMAttemptError("LM Studio", resp, err))
+		attempts = append(attempts, formatLLMAttemptError("本地 LM Studio", resp, err))
+	} else {
+		s.emitLLMProviderEvent("skip", "LM Studio", "本地服务未启动")
+		attempts = append(attempts, "本地 LM Studio 未启动")
+	}
+
 	if s.GetWebAuth() != "" {
 		s.emitLLMProviderEvent("attempt", "Web AI", "正在尝试网页登录态，并通过天蚕 Agent 工具层执行项目操作")
-		resp, err = callLLMWithTimeout(45*time.Second, func() (string, error) {
+		resp, err = callCandidate(45*time.Second, func(_ context.Context) (string, error) {
 			webResp, _, callErr := s.chatWebConv(chatMessagesToWebPrompt(messages), "", "")
 			return webResp, callErr
 		})
@@ -3123,20 +3309,25 @@ func (s *Service) ChatWithModel(messages []ChatMessage) (string, error) {
 	return "", fmt.Errorf("所有 LLM 均不可用：%s", strings.Join(attempts, "；"))
 }
 
-func callLLMWithTimeout(timeout time.Duration, fn func() (string, error)) (string, error) {
+func callLLMWithTimeout(parent context.Context, timeout time.Duration, fn func(context.Context) (string, error)) (string, error) {
 	type result struct {
 		resp string
 		err  error
 	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 	ch := make(chan result, 1)
 	go func() {
-		resp, err := fn()
+		resp, err := fn(ctx)
 		ch <- result{resp: resp, err: err}
 	}()
 	select {
 	case res := <-ch:
 		return res.resp, res.err
-	case <-time.After(timeout):
+	case <-ctx.Done():
+		if ctx.Err() == context.Canceled {
+			return "", fmt.Errorf("已停止生成")
+		}
 		return "", fmt.Errorf("尝试超时（%s）", timeout.String())
 	}
 }
@@ -3446,11 +3637,12 @@ func (s *Service) agentStreamWeb(userMessage string, rootPath string, maxIterati
 
 // AgentStreamEvent represents a streaming event from the agent loop.
 type AgentStreamEvent struct {
-	Type    string `json:"type"`             // "token", "tool_call", "tool_result", "permission_request", "done", "error"
-	Content string `json:"content"`          // content depends on type
-	Name    string `json:"name,omitempty"`   // tool name for tool_call/tool_result
-	ID      string `json:"id,omitempty"`     // unique ID for permission_request correlation
-	Reason  string `json:"reason,omitempty"` // reason for permission request
+	Type     string `json:"type"`               // "token", "tool_call", "tool_result", "permission_request", "done", "error"
+	Content  string `json:"content"`            // content depends on type
+	Name     string `json:"name,omitempty"`     // tool name for tool_call/tool_result
+	Thinking string `json:"thinking,omitempty"` // model-provided reasoning text before a tool call
+	ID       string `json:"id,omitempty"`       // unique ID for permission_request correlation
+	Reason   string `json:"reason,omitempty"`   // reason for permission request
 }
 
 // pendingPermission holds a channel that blocks until the user responds.
@@ -3506,11 +3698,13 @@ func (s *Service) RespondPermission(requestID string, approved bool) {
 
 // AgentStream runs the TAOR loop and streams events via a channel.
 func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations int) (<-chan AgentStreamEvent, error) {
+	ctx, requestID := s.beginRequest()
 	s.SetRootPath(rootPath)
 	ch := make(chan AgentStreamEvent, 256)
 
 	go func() {
 		defer close(ch)
+		defer s.endRequest(requestID)
 
 		if maxIterations <= 0 {
 			maxIterations = 20
@@ -3554,6 +3748,10 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 		}
 
 		for i := 0; i < maxIterations; i++ {
+			if ctx.Err() != nil {
+				ch <- AgentStreamEvent{Type: "cancelled", Content: "已停止生成"}
+				return
+			}
 			// Streaming chat call
 			var fullResp strings.Builder
 			_, err := s.ChatStream(messages, func(token string) {
@@ -3579,7 +3777,7 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 
 			// Notify UI about tool call
 			argsJSON, _ := json.Marshal(toolArgs)
-			ch <- AgentStreamEvent{Type: "tool_call", Name: toolName, Content: string(argsJSON)}
+			ch <- AgentStreamEvent{Type: "tool_call", Name: toolName, Content: string(argsJSON), Thinking: extractVisibleThinking(resp)}
 
 			// Permission check: ask user if needed
 			pm := safety.NewPermissionManager(rootPath, safety.ModeDefault)
@@ -3603,6 +3801,12 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 				var approved bool
 				select {
 				case approved = <-respCh:
+				case <-ctx.Done():
+					pendingPermissionsMu.Lock()
+					delete(pendingPermissions, reqID)
+					pendingPermissionsMu.Unlock()
+					ch <- AgentStreamEvent{Type: "cancelled", Content: "已停止生成"}
+					return
 				case <-time.After(5 * time.Minute):
 					approved = false
 					pendingPermissionsMu.Lock()
@@ -3918,7 +4122,7 @@ func (s *Service) ChatWeb(message string) (string, error) {
 		return "", fmt.Errorf("Web 提供商未登录：请先登录并保存 Cookie")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(s.currentRequestContext(), 120*time.Second)
 	defer cancel()
 
 	req := types.ChatRequest{
@@ -4071,6 +4275,18 @@ func (s *Service) chatWebConv(message string, convID string, providerID string) 
 	for _, pid := range orderedProviders {
 		resp, newConvID, err := s.chatWithProvider(message, convID, pid)
 		if err == nil {
+			thinking, answer := splitThinkingContent(resp)
+			if thinking != "" && s.App != nil {
+				s.App.Event.Emit("ai:reasoning", map[string]string{
+					"provider": "Web AI",
+					"content":  truncateString(thinking, 4000),
+				})
+			}
+			visible := answer
+			if strings.TrimSpace(visible) == "" {
+				visible = stripThinkingArtifacts(resp)
+			}
+			s.emitChunkedModelOutput("Web AI", visible)
 			return resp, newConvID, nil
 		}
 
@@ -4213,7 +4429,7 @@ func (s *Service) chatWithProvider(message string, convID string, providerID str
 	}
 
 	if !cfg.UsesBrowserChat {
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		ctx, cancel := context.WithTimeout(s.currentRequestContext(), 120*time.Second)
 		defer cancel()
 		result, err := providers.Chat(ctx, providerID, auth, req)
 		if err != nil {
@@ -4324,6 +4540,8 @@ func truncate(s string, maxLen int) string {
 // Web AI platforms only accept a single message per turn (using convID for history),
 // so we embed a context summary in tool result messages to prevent context loss.
 func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations int) AgentRunResult {
+	ctx, requestID := s.beginRequest()
+	defer s.endRequest(requestID)
 	if maxIterations <= 0 {
 		maxIterations = 20
 	}
@@ -4376,6 +4594,11 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 	assistantReasoning := ""
 
 	for i := 0; i < maxIterations; i++ {
+		if ctx.Err() != nil {
+			result.Error = "已停止生成"
+			result.Done = true
+			return result
+		}
 		result.Iterations = i + 1
 
 		// First iteration: send the full prompt with tool descriptions.

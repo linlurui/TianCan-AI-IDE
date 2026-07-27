@@ -28,7 +28,7 @@
 | 🖥️ **本地推理** | 支持 LM Studio / OpenAI 兼容 API |
 | 📝 **代码编辑** | Monaco Editor + 多语言 LSP + Diff 审查 |
 | 🔧 **断点调试** | DAP 协议，支持 Go / Python / JS / C++ / Java / Dart 等 6+ 语言 |
-| 📂 **Git 集成** | 提交、分支、Diff 查看、历史回溯 |
+| 📂 **Git 集成** | 提交、分支、Diff 查看、历史回溯、多项目快速切换 |
 | 🌐 **Web AI 接入** | 支持通过浏览器接入 DeepSeek / ChatGPT 等 Web AI，无需本地模型 |
 | 🔌 **MCP 协议** | 完整 MCP Client/Server，动态扩展工具与上下文 |
 | 🧪 **自我验证** | 自动生成测试 + 完成度评估，不通过则自动修复 |
@@ -48,6 +48,7 @@
 - **双模式切换**：询问模式（逐步确认）与自动模式（授权范围内自主执行）
 - **子Agent并行**：复杂任务可派生子 Agent 并行处理
 - **技能系统**：可复用的标准化工作流（`.skill.yaml`），支持社区共享
+- **模型思考记录**：展示模型明确返回的思考摘要、读取文件和工具结果，内部路由与调度日志不对用户展示
 
 ### 安全与审查
 
@@ -161,6 +162,7 @@ go build -tags production -o tiancan-ai-ide .
 - 完整 PTY 终端（go-pty + xterm.js + WebSocket）
 - 多语言断点调试（Go / Python / JS / C++ / Java / Dart，DAP 协议）
 - Git 版本控制（提交、分支、Diff、历史、Stage/Unstage）
+- Git 面板多项目快速切换，切换后自动同步文件树当前项目
 - AI Agent TAOR 主循环 + RalphLoop 自纠错
 - AgentV2 增强版（分析/规划/执行分离，默认启用，支持并行/Rollback/MCP）
 - 40+ 工具集（文件/搜索/LSP/Git/测试/DB/API/部署/沙箱）
@@ -195,6 +197,13 @@ go build -tags production -o tiancan-ai-ide .
 - 子 Agent Worktree 隔离（并行任务独立分支）
 - AutoResearch AI 驱动研究闭环（假设生成→实验→验证）
 - 多项目会话隔离（切换项目时聊天记录和任务自动切换，数据本地持久化）
+- 项目级共享记忆（跨模型复用、按项目隔离、自动压缩关键上下文以节省 token）
+- 项目首次选中时静默预热记忆（根目录浅扫描、并发去重、无 LLM 与无额外 token 开销）
+- 模型思考与操作时间线（思考摘要、文件读取、代码搜索、命令及耗时，可折叠查看输入输出）
+- 同项目连续对话队列（消息立即入队、Agent 串行执行、携带限长近期上下文，避免任务串线和 token 无界增长）
+- Auto Provider 固定路由与进程组回收（API → OpenRelay → 本机 Claude/Codex → LM Studio → Web AI，取消时清理派生进程）
+- Claude/Codex 原生流式活动（展示模型实际 thinking 分析、读取、搜索、命令和文件修改）
+- 全通道统一流式输出（API / OpenRelay / Claude / Codex / LM Studio / Web AI 共用实时消息协议）
 
 ### 🚧 进行中 / 规划中
 
@@ -245,6 +254,13 @@ go build -tags production -o tiancan-ai-ide .
 - **差异比对**：查看文件当前内容与历史快照的差异
 - **精确回滚**：支持单文件、多文件、按检查点回滚
 - **撤销历史**：保留完整的修改历史，可追溯任意版本
+
+### Git 与项目记忆体验改进 ✅
+
+- **Git 恢复文件修复**：已支持恢复“仅暂存/新加入暂存区”的文件，不再出现右键无反应
+- **Git 面板项目切换**：顶部可直接切换当前项目，适合多仓同时打开时快速查看状态
+- **文件树自动跟随**：从 Git 面板切换项目后，文件树会自动高亮并展开对应项目
+- **项目关键记忆压缩**：项目记忆会做去重、归并、画像提炼，并在 token 预算内优先注入关键上下文
 
 ---
 

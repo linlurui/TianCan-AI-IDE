@@ -319,6 +319,14 @@ export default function FileTree({
     return () => document.removeEventListener("mousedown", close);
   }, []);
 
+  useEffect(() => {
+    if (!activeProjectId) return;
+    setExpandedIds((prev) => {
+      if (prev.has(activeProjectId)) return prev;
+      return new Set([...prev, activeProjectId]);
+    });
+  }, [activeProjectId]);
+
   // Reveal file: expand project + all ancestor dirs, then scroll
   useEffect(() => {
     if (!revealSignal) return;

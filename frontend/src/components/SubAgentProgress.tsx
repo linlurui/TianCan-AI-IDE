@@ -63,6 +63,8 @@ export default function SubAgentProgressPanel({ onNavigateToTask }: SubAgentProg
     const off = Events.On("subagent:progress", (evt: any) => {
       const data = evt?.data ?? evt;
       if (!data || !data.agentId) return;
+      // Main-agent model activity is rendered in the AI reasoning timeline.
+      if (data.agentId === "main") return;
 
       setRuns((prev) => {
         const existing = prev.findIndex((r) => r.agentId === data.agentId);

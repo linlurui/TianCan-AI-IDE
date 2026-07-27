@@ -25,6 +25,7 @@ export {
   SetModel,
   SetWebAuth,
   StartAgentStream,
+  StopAgentRequest,
   RespondPermission,
   SmartRoute,
   SmartAgentRun,

@@ -29,8 +29,9 @@ export function Commit(path: string, message: string, authorName: string, author
 }
 
 /**
- * DiscardFile discards working-tree changes for a file (git checkout -- <file>).
- * For untracked files it removes the file entirely.
+ * DiscardFile discards all uncommitted changes for a file.
+ * Existing files are restored in both the index and worktree. Files added after
+ * HEAD are removed, matching the user's "restore this file" expectation.
  */
 export function DiscardFile(repoPath: string, filePath: string): $CancellablePromise<void> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/git.Service.DiscardFile", repoPath, filePath);

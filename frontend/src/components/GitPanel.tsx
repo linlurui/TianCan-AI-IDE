@@ -3,10 +3,14 @@ import { useTranslation } from "../i18n";
 import { ChevronDown, ChevronRight, GitBranch, RefreshCw, Check, X, FilePlus, RotateCcw, MinusCircle, FolderOpen, History, Undo2, Upload, Loader2 } from "lucide-react";
 import { RepoStatus, CommitInfo, CommitFileInfo, GetFileDiff, StageFile, UnstageFile, DiscardFile, GetLog, RevertCommit, GetCommitFiles, GetCommitFileDiff, RestoreFileFromCommit } from "@bindings/git";
 import { DeleteFile } from "@bindings/filesystem";
+import { Project } from "../types";
 
 interface GitPanelProps {
+  projects: Project[];
+  activeProjectId: string | null;
   status: RepoStatus | null;
   workingDir: string | null;
+  onProjectChange: (id: string) => void;
   onInitRepo: () => void | Promise<void>;
   onStageAll: () => void | Promise<void>;
   onCommit: (message: string) => void | Promise<void>;
@@ -47,7 +51,7 @@ function DiffViewer({ diff }: { diff: string }) {
 }
 
 export default function GitPanel({
-  status, workingDir, onInitRepo, onStageAll, onCommit, onPush, onRefresh, onOpenFile, onCommitClick,
+  projects, activeProjectId, status, workingDir, onProjectChange, onInitRepo, onStageAll, onCommit, onPush, onRefresh, onOpenFile, onCommitClick,
 }: GitPanelProps) {
   const [commitMsg, setCommitMsg] = useState("");
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -61,12 +65,17 @@ export default function GitPanel({
   const [revertingHash, setRevertingHash] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
+  const [gitNotice, setGitNotice] = useState<string | null>(null);
+  const [pendingCtxAction, setPendingCtxAction] = useState<"discard" | "delete" | null>(null);
   const ctxRef = useRef<HTMLDivElement>(null);
   const { t } = useTranslation();
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
-      if (ctxRef.current && !ctxRef.current.contains(e.target as Node)) setFileCtxMenu(null);
+      if (ctxRef.current && !ctxRef.current.contains(e.target as Node)) {
+        setFileCtxMenu(null);
+        setPendingCtxAction(null);
+      }
     };
     document.addEventListener("mousedown", close);
     return () => document.removeEventListener("mousedown", close);
@@ -102,6 +111,7 @@ export default function GitPanel({
   const handleCtxMenu = useCallback((e: React.MouseEvent, fp: string, staging: string, worktree: string) => {
     e.preventDefault();
     e.stopPropagation();
+    setPendingCtxAction(null);
     setFileCtxMenu({ x: e.clientX, y: e.clientY, filePath: fp, staging, worktree });
   }, []);
 
@@ -109,23 +119,27 @@ export default function GitPanel({
     if (!workingDir || !fileCtxMenu) return;
     const fp = fileCtxMenu.filePath;
     setFileCtxMenu(null);
+    setPendingCtxAction(null);
     setBusyAction(`${action}:${fp}`);
     setGitError(null);
+    setGitNotice(null);
     try {
       if (action === "stage")   await StageFile(workingDir, fp);
       if (action === "unstage") await UnstageFile(workingDir, fp);
       if (action === "discard") {
-        if (!window.confirm(t("git.confirmDiscard", { file: fp }))) return;
         await DiscardFile(workingDir, fp);
+        setSelectedFile(null);
+        setDiffContent(null);
+        setGitNotice(t("git.fileRestored", { file: fp }));
       }
       if (action === "delete") {
-        if (!window.confirm(t("git.confirmDelete", { file: fp }))) return;
         await DeleteFile(workingDir + "/" + fp);
+        setGitNotice(t("git.fileDeleted", { file: fp }));
       }
       await onRefresh();
-    } catch (err) { setGitError(String(err)); alert(String(err)); }
+    } catch (err) { setGitError(String(err)); }
     finally { setBusyAction(null); }
-  }, [workingDir, fileCtxMenu, onRefresh]);
+  }, [workingDir, fileCtxMenu, onRefresh, t]);
 
   const handleFileClick = useCallback(async (filePath: string) => {
     if (!workingDir) return;
@@ -223,10 +237,26 @@ export default function GitPanel({
 
   return (
     <div className="git-panel">
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
-        <div style={{ fontSize: "12px", color: "var(--accent)", fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
-          <GitBranch size={13} />
-          {status.branch}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: "12px", color: "var(--accent)", fontWeight: 600, display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+            <GitBranch size={13} />
+            {status.branch}
+          </div>
+          {projects.length > 1 && (
+            <select
+              className="git-project-switch"
+              value={activeProjectId ?? ""}
+              onChange={(e) => onProjectChange(e.target.value)}
+              title={t("git.switchProject")}
+            >
+              {projects.map((proj) => (
+                <option key={proj.id} value={proj.id}>
+                  {proj.name}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
         <button className="sidebar-header-btn sidebar-header-btn-always" onClick={handleRefresh} disabled={busy} title={t("git.refreshStatus")}>
           {busyAction === "refresh" ? <Loader2 size={12} className="spin" /> : <RefreshCw size={12} />}
@@ -235,6 +265,9 @@ export default function GitPanel({
 
       {gitError && (
         <div className="git-error-banner">{gitError}</div>
+      )}
+      {gitNotice && (
+        <div className="git-success-banner">{gitNotice}</div>
       )}
 
       {changedFiles.length === 0 && untrackedFiles.length === 0 ? (
@@ -376,6 +409,23 @@ export default function GitPanel({
           <div className="context-menu-label" style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {fileCtxMenu.filePath.split("/").pop()}
           </div>
+          {pendingCtxAction ? (
+            <div className="context-menu-delete-confirm">
+              <span style={{ whiteSpace: "pre-line" }}>
+                {pendingCtxAction === "discard"
+                  ? t("git.confirmDiscard", { file: fileCtxMenu.filePath })
+                  : t("git.confirmDelete", { file: fileCtxMenu.filePath })}
+              </span>
+              <div className="context-menu-delete-actions">
+                <button className="ctx-del-yes" onClick={() => ctxAction(pendingCtxAction)}>
+                  {pendingCtxAction === "discard" ? t("git.restore") : t("git.deleteFile")}
+                </button>
+                <button className="ctx-del-no" onClick={() => setPendingCtxAction(null)}>
+                  {t("git.cancel")}
+                </button>
+              </div>
+            </div>
+          ) : (<>
           {onOpenFile && (
             <div className="context-menu-item" onClick={() => { onOpenFile(fileCtxMenu.filePath); setFileCtxMenu(null); }}>
               <FolderOpen size={11} style={{ marginRight: 6, opacity: 0.7 }} />
@@ -393,10 +443,10 @@ export default function GitPanel({
               {t("git.unstage")} <span style={{ opacity: 0.5, marginLeft: 4, fontSize: 10 }}>git restore --staged</span>
             </div>
           )}
-          {fileCtxMenu.worktree !== "?" && (
+          {(fileCtxMenu.worktree !== "?" || fileCtxMenu.staging !== "?") && (
             <>
               <div className="context-menu-divider" />
-              <div className="context-menu-item context-menu-item-danger" onClick={() => ctxAction("discard")} title={t("git.discardTitle")}>
+              <div className="context-menu-item context-menu-item-danger" onClick={() => setPendingCtxAction("discard")} title={t("git.discardTitle")}>
                 <RotateCcw size={11} style={{ marginRight: 6, opacity: 0.7 }} />
                 {t("git.discardFile")} <span style={{ opacity: 0.5, marginLeft: 4, fontSize: 10 }}>git checkout --</span>
               </div>
@@ -405,12 +455,13 @@ export default function GitPanel({
           {fileCtxMenu.staging === "?" && fileCtxMenu.worktree === "?" && (
             <>
               <div className="context-menu-divider" />
-              <div className="context-menu-item context-menu-item-danger" onClick={() => ctxAction("delete")}>
+              <div className="context-menu-item context-menu-item-danger" onClick={() => setPendingCtxAction("delete")}>
                 <X size={11} style={{ marginRight: 6, opacity: 0.7 }} />
                 {t("git.deleteFile")}
               </div>
             </>
           )}
+          </>)}
         </div>
       )}
       {/* ── Commit History ── */}

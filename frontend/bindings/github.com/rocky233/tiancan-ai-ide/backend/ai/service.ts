@@ -114,6 +114,35 @@ export function ChatAPI(messages: $models.ChatMessage[]): $CancellablePromise<st
 }
 
 /**
+ * ChatIDEProviders discovers local IDE quota providers. Cursor/Windsurf use
+ * proprietary ConnectRPC bridges; VS Code Copilot commonly appears as a VS Code
+ * auth/session. When a compatible local bridge is configured or running, this
+ * function calls it; otherwise it reports exact discovery state so Auto can keep
+ * falling back without pretending these providers do not exist.
+ */
+export function ChatIDEProviders(messages: $models.ChatMessage[]): $CancellablePromise<string> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ChatIDEProviders", messages);
+}
+
+/**
+ * ChatLocalCLI discovers and calls local logged-in coding CLIs directly,
+ * mirroring OpenRelay's "use existing local quota" idea without requiring the
+ * OpenRelay HTTP daemon to be running.
+ */
+export function ChatLocalCLI(messages: $models.ChatMessage[]): $CancellablePromise<string> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ChatLocalCLI", messages);
+}
+
+/**
+ * ChatOpenRelay sends a non-streaming chat request through OpenRelay's
+ * OpenAI-compatible local endpoint. OpenRelay then routes to configured
+ * local/CLI/IDE providers such as Claude Code, Codex, Cursor, and Windsurf.
+ */
+export function ChatOpenRelay(messages: $models.ChatMessage[]): $CancellablePromise<string> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.ChatOpenRelay", messages);
+}
+
+/**
  * ChatStream sends a streaming chat request. It calls onToken for each token
  * received and returns the full accumulated response.
  */
@@ -698,6 +727,13 @@ export function SmartRoute(userMessage: string): $CancellablePromise<$models.Sma
  */
 export function StartAgentStream(userMessage: string, rootPath: string, maxIterations: number): $CancellablePromise<void> {
     return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.StartAgentStream", userMessage, rootPath, maxIterations);
+}
+
+/**
+ * StopAgentRequest cancels the active model request and any attached CLI process.
+ */
+export function StopAgentRequest(): $CancellablePromise<boolean> {
+    return $Call.ByName("github.com/rocky233/tiancan-ai-ide/backend/ai.Service.StopAgentRequest");
 }
 
 /**

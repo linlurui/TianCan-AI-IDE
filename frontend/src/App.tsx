@@ -12,6 +12,7 @@ import {
 import FileTree from "./components/FileTree";
 import SplitEditorArea from "./components/SplitEditorArea";
 import AIPanel, { Message, type ActivityItem } from "./components/AIPanel";
+import { appendActivity, describeTool, finishToolActivity, withConversationContext } from "./aiActivity";
 import StatusBar from "./components/StatusBar";
 import GitPanel from "./components/GitPanel";
 import { AIChangesPanel, AgentTask, TaskFile } from "./components/AIChangesPanel";
@@ -28,7 +29,7 @@ import {
 } from "./bindings/extension";
 import { StartAndGetPort } from "./bindings/terminal";
 import { StartAndGetPort as StartLspPort } from "./bindings/lsp";
-import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, RespondPermission, SmartAgentRun, SmartAgentRunV2 } from "./bindings/ai";
+import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, StopAgentRequest, RespondPermission, SmartAgentRun, SmartAgentRunV2 } from "./bindings/ai";
 import { RemoteReadFile, DockerReadFile } from "./bindings/remote";
 import { Events } from "@wailsio/runtime";
 import type { ModelSource } from "./components/AIPanel";
@@ -98,7 +99,7 @@ const ANALYSIS_EXTS = new Set([
   "rs", "c", "cpp", "cc", "h", "hpp", "php", "rb", "vue", "md", "mdx", "json",
 ]);
 
-function normalizeAgentMessages(rawMessages: any[], pushActivity?: (kind: ActivityItem["kind"], text: string, detail?: string) => void): Message[] {
+function normalizeAgentMessages(rawMessages: any[], pushActivity?: (kind: ActivityItem["kind"], text: string, detail?: string, toolName?: string) => void): Message[] {
   const rawMsgs = (rawMessages ?? []).filter((m: any) => m?.role !== "user");
   const agentMsgs: Message[] = [];
 
@@ -112,13 +113,14 @@ function normalizeAgentMessages(rawMessages: any[], pushActivity?: (kind: Activi
     if (!content.trim() && role !== "tool_call") continue;
 
     if (role === "assistant" && next && (next.role === "tool_call" || next.role === "tool_result" || next.role === "tool")) {
-      pushActivity?.("thinking", "模型正在规划下一步", "检测到模型准备使用工具，等待工具执行结果");
+      pushActivity?.("thinking", "思考过程", content.trim() || "模型正在规划下一步");
     } else if (role === "tool_call") {
-      pushActivity?.("tool", `调用工具 ${name || "tool"}`);
+      const info = describeTool(name || "tool", content);
+      pushActivity?.("tool", info.title, content, name || "tool");
     } else if (role === "tool_result" || role === "tool") {
-      pushActivity?.("result", `工具返回 ${name || "结果"}`, content.slice(0, 160));
+      pushActivity?.("result", `工具完成 ${name || "结果"}`, content, name || "tool");
     } else if (role === "thinking") {
-      pushActivity?.("thinking", "模型正在分析上下文", "已收到模型中间分析信号，继续等待最终回复");
+      pushActivity?.("thinking", "思考过程", content);
     } else {
       agentMsgs.push({ role: "assistant", content });
     }
@@ -155,6 +157,8 @@ export default function App() {
   const [aiLoading, setAiLoading] = React.useState(false);
   const [aiActivityItems, setAiActivityItems] = React.useState<ActivityItem[]>([]);
   const streamRef = React.useRef<((evt: any) => void) | null>(null);
+  const aiRunSourceRef = React.useRef<ModelSource | null>(null);
+  const aiStopRequestedRef = React.useRef(false);
   const [permRequest, setPermRequest] = React.useState<PermissionRequest | null>(null);
   const [revealSignal, setRevealSignal] = React.useState<RevealSignal | null>(null);
   const [runEnvTarget, setRunEnvTarget] = React.useState<{ path: string; name: string; projectId?: string } | null>(null);
@@ -181,8 +185,98 @@ export default function App() {
   const dismissedRecs = useRef<Set<string>>(new Set());
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const pushAIActivity = useCallback((kind: ActivityItem["kind"], text: string, detail?: string) => {
-    setAiActivityItems([{ id: Date.now() + Math.random(), kind, text, detail }]);
+  const pushAIActivity = useCallback((kind: ActivityItem["kind"], text: string, detail?: string, toolName?: string) => {
+    setAiActivityItems((current) => {
+      if (kind === "result" && toolName) {
+        return finishToolActivity(current, toolName, detail || "", /error|failed|denied|not allowed|失败|错误|拒绝/i.test(detail || ""));
+      }
+      if (kind === "thinking" && text === "思考过程") {
+        const now = Date.now();
+        const settled = current.filter((item) => !(item.kind === "thinking" && item.text === "思考过程"));
+        return appendActivity(settled, {
+          id: now + Math.random(), kind, text, detail,
+          status: "running", startedAt: now,
+        });
+      }
+      if (kind === "tool" && toolName && current.some((item) => item.toolName === toolName && item.detail === detail)) {
+        return current;
+      }
+      const now = Date.now();
+      const terminal = kind === "success" || kind === "error";
+      const settled = current.map((item) => item.status === "running" && (!item.toolName || terminal)
+        ? { ...item, status: "success" as const, completedAt: now }
+        : item);
+      return appendActivity(settled, {
+        id: now + Math.random(), kind, text, detail, toolName,
+        status: kind === "error" ? "error" : kind === "success" || kind === "result" ? "success" : "running",
+        startedAt: now,
+        completedAt: terminal ? now : undefined,
+      });
+    });
+  }, []);
+
+  const stopAIRequest = useCallback(async () => {
+    aiStopRequestedRef.current = true;
+    await StopAgentRequest().catch(() => false);
+    if (streamRef.current) {
+      Events.Off("agent:stream");
+      streamRef.current = null;
+    }
+    setPermRequest(null);
+    setMessages((current) => current
+      .filter((message) => !(message.role === "assistant" && !message.content.trim()))
+      .map((message) => message.streaming ? { ...message, streaming: false } : message));
+    pushAIActivity("success", "已停止生成");
+    aiRunSourceRef.current = null;
+    setAiLoading(false);
+  }, [pushAIActivity]);
+
+  useEffect(() => {
+    const off = Events.On("subagent:progress", (evt: any) => {
+      if (!aiRunSourceRef.current || aiRunSourceRef.current === "local") return;
+      const data = evt?.data ?? evt;
+      const toolName = String(data?.toolName || "");
+      if (toolName && data?.output) {
+        pushAIActivity("result", `工具完成 ${toolName}`, String(data.output), toolName);
+      } else if (toolName) {
+        const args = JSON.stringify(data?.toolArgs ?? {});
+        const info = describeTool(toolName, args);
+        pushAIActivity("tool", info.title, args, toolName);
+      } else if (data?.error) {
+        pushAIActivity("error", "执行失败", String(data.error));
+      }
+    });
+    const offReasoning = Events.On("ai:reasoning", (evt: any) => {
+      if (!aiRunSourceRef.current) return;
+      const data = evt?.data ?? evt;
+      const content = String(data?.content || "").trim();
+      if (content) pushAIActivity("thinking", "思考过程", content);
+    });
+    return () => { off(); offReasoning(); };
+  }, [pushAIActivity]);
+
+  useEffect(() => {
+    const off = Events.On("ai:model-stream", (evt: any) => {
+      if (!aiRunSourceRef.current || aiRunSourceRef.current === "local") return;
+      const data = evt?.data ?? evt;
+      const phase = String(data?.phase || "token");
+      const content = String(data?.content || "");
+      setMessages((current) => {
+        if (phase === "start" || phase === "reset") {
+          return current.filter((message) => !message.streaming);
+        }
+        if (phase !== "token" || !content) return current;
+        const next = [...current];
+        let index = -1;
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].streaming) { index = i; break; }
+        }
+        if (index >= 0) next[index] = { ...next[index], content: next[index].content + content };
+        else next.push({ role: "assistant", content, streaming: true });
+        return next;
+      });
+    });
+    return () => { off(); };
   }, []);
 
   useEffect(() => {
@@ -686,8 +780,11 @@ export default function App() {
           {/* Git */}
           <div className="sidebar-panel" style={{ display: ui.sidebarTab === "git" ? "contents" : "none" }}>
             <GitPanel
+              projects={project.projects}
+              activeProjectId={project.activeProjectId}
               status={project.activeProject?.gitStatus ?? null}
               workingDir={project.activeProject?.rootPath ?? null}
+              onProjectChange={project.activateProject}
               onInitRepo={handleInitRepo}
               onStageAll={async () => { if (project.activeProject) await StageAll(project.activeProject.rootPath); }}
               onCommit={handleCommit}
@@ -942,12 +1039,15 @@ export default function App() {
               setAiActivityItems([]);
               return;
             }
+            const requestText = withConversationContext(text, messages);
+            aiStopRequestedRef.current = false;
             setMessages((p) => [
               ...p,
               { role: "user", content: text },
             ]);
             setAiLoading(true);
             setAiActivityItems([]);
+            aiRunSourceRef.current = source;
 
             const rootPath = project.activeProject?.rootPath ?? "";
             pushAIActivity("thinking", "准备上下文", source === "auto" ? "Auto 将按可用模型自动尝试，并把项目路径作为上下文" : `使用 ${source} 模式处理当前请求`);
@@ -956,7 +1056,8 @@ export default function App() {
             if (source === "auto") {
               try {
                 pushAIActivity("route", "选择 Auto 路由", rootPath ? "结合当前项目目录和聊天输入执行" : "当前没有项目目录，仅使用聊天输入执行");
-                const result = await SmartAgentRunV2(text, rootPath, 20);
+                const result = await SmartAgentRunV2(requestText, rootPath, 20);
+                if (aiStopRequestedRef.current) return;
                 if (result.taskAnalysis) {
                   pushAIActivity("thinking", "正在组织回复", "已完成任务类型判断，正在把模型输出整理为最终回答");
                 }
@@ -966,18 +1067,19 @@ export default function App() {
                   console.log("🧠 AgentV2 任务分析:", result.taskAnalysis);
                 }
                 if (agentMsgs.length > 0) {
-                  setMessages((p) => [...p, ...agentMsgs]);
+                  setMessages((p) => [...p.filter((message) => !message.streaming), ...agentMsgs]);
                   pushAIActivity(result.error ? "error" : "success", result.error ? "执行结束但有错误" : "已生成回复");
                 } else {
-                  setMessages((p) => [...p, {
+                  setMessages((p) => [...p.filter((message) => !message.streaming), {
                     role: "assistant",
                     content: result.error ? `❌ ${result.error}` : "(no response)",
                   }]);
                   pushAIActivity(result.error ? "error" : "success", result.error ? "执行失败" : "返回空响应");
                 }
               } catch (err: any) {
+                if (aiStopRequestedRef.current) return;
                 pushAIActivity("error", "请求失败", err?.message ?? String(err));
-                setMessages((p) => [...p, { role: "assistant", content: `❌ AgentV2 失败: ${err?.message ?? err}` }]);
+                setMessages((p) => [...p.filter((message) => !message.streaming), { role: "assistant", content: `❌ AgentV2 失败: ${err?.message ?? err}` }]);
               }
               setAiLoading(false);
               return;
@@ -989,9 +1091,6 @@ export default function App() {
               if (streamRef.current) { Events.Off("agent:stream"); streamRef.current = null; }
               pushAIActivity("route", "连接本地模型", "等待流式响应");
 
-              // Add a placeholder assistant message for streaming tokens
-              setMessages((p) => [...p, { role: "assistant", content: "" }]);
-
               const handler = (evt: any) => {
                 const data = evt?.data ?? evt;
                 const eType = data?.type ?? "";
@@ -1000,18 +1099,22 @@ export default function App() {
                 const eThinking = data?.thinking ?? "";
                 switch (eType) {
                   case "token":
-                    // Append token to the last assistant message
                     setMessages((p) => {
                       const updated = [...p];
                       const last = updated[updated.length - 1];
                       if (last && last.role === "assistant") {
                         updated[updated.length - 1] = { ...last, content: last.content + eContent };
+                      } else if (eContent) {
+                        updated.push({ role: "assistant", content: eContent });
                       }
                       return updated;
                     });
                     break;
                   case "tool_call":
-                    pushAIActivity("tool", `调用工具 ${eName || "tool"}`, eContent);
+                    if (eThinking.trim()) {
+                      pushAIActivity("thinking", "思考过程", eThinking);
+                    }
+                    pushAIActivity("tool", describeTool(eName || "tool", eContent).title, eContent, eName || "tool");
                     setMessages((p) => {
                       const updated = [...p];
                       const last = updated[updated.length - 1];
@@ -1028,11 +1131,10 @@ export default function App() {
                     });
                     break;
                   case "tool_result":
-                    pushAIActivity("result", `工具完成 ${eName || "tool"}`, eContent.slice(0, 120));
-                    setMessages((p) => [...p, { role: "assistant", content: "" }]);
+                    pushAIActivity("result", `工具完成 ${eName || "tool"}`, eContent, eName || "tool");
                     break;
                   case "permission_request":
-                    pushAIActivity("tool", `等待授权 ${eName || "tool"}`, data?.reason ?? "");
+                    pushAIActivity("tool", `等待授权 ${eName || "tool"}`, data?.reason ?? "", eName || "tool");
                     setPermRequest({
                       id: data?.id ?? "",
                       toolName: eName,
@@ -1042,12 +1144,13 @@ export default function App() {
                     break;
                   case "done":
                     pushAIActivity("success", "任务完成");
-                    // Remove trailing empty assistant message if any
                     setMessages((p) => {
                       const updated = [...p];
                       const last = updated[updated.length - 1];
                       if (last && last.role === "assistant" && !last.content.trim()) {
                         updated.pop();
+                      } else if ((!last || last.role !== "assistant") && eContent.trim()) {
+                        updated.push({ role: "assistant", content: eContent });
                       }
                       return updated;
                     });
@@ -1062,8 +1165,15 @@ export default function App() {
                     streamRef.current = null;
                     break;
                   case "error":
+                    if (aiStopRequestedRef.current) break;
                     pushAIActivity("error", "执行失败", eContent);
                     setMessages((p) => [...p, { role: "assistant", content: `❌ ${eContent}` }]);
+                    setAiLoading(false);
+                    Events.Off("agent:stream");
+                    streamRef.current = null;
+                    break;
+                  case "cancelled":
+                    pushAIActivity("success", "已停止生成");
                     setAiLoading(false);
                     Events.Off("agent:stream");
                     streamRef.current = null;
@@ -1075,44 +1185,47 @@ export default function App() {
               streamRef.current = handler;
 
               try {
-                await StartAgentStream(text, rootPath, 20);
+                await StartAgentStream(requestText, rootPath, 20);
               } catch (err: any) {
+                if (aiStopRequestedRef.current) return;
                 Events.Off("agent:stream");
                 streamRef.current = null;
                 pushAIActivity("error", "启动流失败", err?.message ?? String(err));
-                setMessages((p) => [...p, { role: "assistant", content: `❌ AI request failed: ${err?.message ?? err}` }]);
+                setMessages((p) => [...p.filter((message) => !message.streaming), { role: "assistant", content: `❌ AI request failed: ${err?.message ?? err}` }]);
                 setAiLoading(false);
               }
             } else {
-              // Non-local modes: use blocking AgentRun (API/Web don't support streaming yet)
+              // API/Web calls emit unified model-stream events while AgentRun manages tools.
               try {
                 let result;
                 if (source === "web") {
                   pushAIActivity("route", "使用 Web AI", "等待网页登录态响应");
-                  result = await AgentRunWeb(text, rootPath, 20);
+                  result = await AgentRunWeb(requestText, rootPath, 20);
                 } else {
                   pushAIActivity("route", "使用 API", "等待接口响应");
-                  result = await AgentRunAPI(text, rootPath, 20);
+                  result = await AgentRunAPI(requestText, rootPath, 20);
                 }
+                if (aiStopRequestedRef.current) return;
                 const agentMsgs = normalizeAgentMessages(result.messages ?? [], pushAIActivity);
                 if (agentMsgs.length > 0) {
-                  setMessages((p) => [...p, ...agentMsgs]);
+                  setMessages((p) => [...p.filter((message) => !message.streaming), ...agentMsgs]);
                   pushAIActivity(result.error ? "error" : "success", result.error ? "执行结束但有错误" : "已生成回复");
                 } else {
-                  setMessages((p) => [...p, {
+                  setMessages((p) => [...p.filter((message) => !message.streaming), {
                     role: "assistant",
                     content: result.error ? `❌ ${result.error}` : "(no response)",
                   }]);
                   pushAIActivity(result.error ? "error" : "success", result.error ? "执行失败" : "返回空响应");
                 }
               } catch (err: any) {
+                if (aiStopRequestedRef.current) return;
                 pushAIActivity("error", "请求失败", err?.message ?? String(err));
-                setMessages((p) => [...p, { role: "assistant", content: `❌ AI request failed: ${err?.message ?? err}` }]);
+                setMessages((p) => [...p.filter((message) => !message.streaming), { role: "assistant", content: `❌ AI request failed: ${err?.message ?? err}` }]);
               } finally {
                 setAiLoading(false);
               }
             }
-          }} isLoading={aiLoading} activityItems={aiActivityItems} fullWidth />
+          }} onStop={stopAIRequest} isLoading={aiLoading} activityItems={aiActivityItems} fullWidth />
         )}
 
         {/* Tool Panel */}
