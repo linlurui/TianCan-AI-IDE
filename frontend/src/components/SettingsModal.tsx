@@ -278,7 +278,7 @@ export default function SettingsModal({ onClose }: Props) {
           <div className="settings-sidebar">
             {(["editor", "lsp", "mcp", "sandbox", "about"] as Tab[]).map((tabKey) => (
               <button key={tabKey} className={`settings-nav-item${tab === tabKey ? " active" : ""}`} onClick={() => setTab(tabKey)}>
-                {{ editor: t("settings.editor"), lsp: t("settings.lsp"), mcp: t("settings.mcp"), sandbox: t("settings.sandbox"), about: t("settings.about") }[tabKey]}
+                {{ editor: t("settings.editor"), lsp: t("settings.lsp"), mcp: t("settings.mcp.title"), sandbox: t("settings.sandbox.title"), about: t("settings.about") }[tabKey]}
               </button>
             ))}
           </div>
@@ -726,4 +726,3 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
     </button>
   );
 }
-
