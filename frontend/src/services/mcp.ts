@@ -10,10 +10,10 @@ import type {
   MCPServerState,
   MCPToolInfo,
   MCPServerConnType,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/types/models";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/types/models";
 
 // Import functions from the Wails-generated service bindings
-import * as mcpService from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/mcp/service";
+import * as mcpService from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/mcp/service";
 
 // Re-export types for convenience
 export type {
@@ -23,7 +23,7 @@ export type {
 };
 
 // Re-export enums
-export { MCPServerConnType } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/types/models";
+export { MCPServerConnType } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/types/models";
 
 /**
  * Alias for MCPServerState - represents a connected MCP server

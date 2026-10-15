@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
 // ── LSPDefinitionTool ───────────────────────────────────────────

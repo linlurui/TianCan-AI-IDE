@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
 // ── Priority Merge Engine ───────────────────────────────────────

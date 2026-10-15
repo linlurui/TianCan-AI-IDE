@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/rocky233/tiancan-ai-ide/backend/webai/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/webai/types"
 )
 
 func makeID() string {

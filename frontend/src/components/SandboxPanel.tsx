@@ -3,7 +3,7 @@ import { Box, Download, Key, Server, Play, Square, RefreshCw, Settings } from "l
 import {
   SandboxProviderStatus, SandboxList, SandboxAutoInstall,
   SandboxSetE2BAPIKey, SandboxSetProvider, SandboxStop, SandboxCreate,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/ai/service";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/ai/service";
 
 interface ProviderStatus {
   name: string;

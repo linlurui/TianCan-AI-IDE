@@ -3,8 +3,8 @@ import {
   ListSkills, ValidateAllSkills, GetSkillDetail, DeleteSkill, InstallSkill,
   ExportSkill, ExportAllSkills, ImportSkillFromJSON, ImportSkillsFromFile,
   SearchMarketSkills, RateSkill,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/ai/service";
-import { MarketEntry } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/skills/models";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/ai/service";
+import { MarketEntry } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/skills/models";
 import {
   Package, Trash2, Plus, CheckCircle, XCircle, RefreshCw, FileText,
   Download, Upload, Search, Star, Tag, X, ChevronDown, ChevronUp

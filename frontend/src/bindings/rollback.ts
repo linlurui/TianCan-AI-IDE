@@ -12,7 +12,7 @@ import {
   CreateSnapshot,
   GetSnapshotCount,
   ClearSnapshots,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/rollbackbindings";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/rollbackbindings";
 
 // Re-export types from generated bindings
 export type {
@@ -20,7 +20,7 @@ export type {
   ModifiedFileInfo,
   FileSnapshot,
   RollbackManager,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/ralph/models";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/ralph/models";
 
 /**
  * Rollback bindings API for frontend

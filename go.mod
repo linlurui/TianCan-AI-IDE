@@ -1,4 +1,4 @@
-module github.com/rocky233/tiancan-ai-ide
+module github.com/linlurui/tiancan-ai-ide
 
 go 1.25.0
 

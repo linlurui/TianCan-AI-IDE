@@ -1,5 +1,5 @@
 // Re-export from wails3 auto-generated bindings
-export type { FileStatus, RepoStatus, CommitInfo, CommitFileInfo } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/git/models";
+export type { FileStatus, RepoStatus, CommitInfo, CommitFileInfo } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/git/models";
 export {
   InitRepo,
   GetStatus,
@@ -16,4 +16,4 @@ export {
   GetCommitFiles,
   GetCommitFileDiff,
   RestoreFileFromCommit,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/git/service";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/git/service";

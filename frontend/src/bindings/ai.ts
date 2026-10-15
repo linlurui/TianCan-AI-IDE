@@ -33,7 +33,7 @@ export {
   GetRouterConfig,
   SetRouterConfig,
   RefreshModelStatuses,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/ai/service";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/ai/service";
 export {
   AgentRunResult,
   AgentRunResultV2,
@@ -42,4 +42,4 @@ export {
   ChatMessage,
   ModelInfo,
   WebProviderInfo,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/ai/models";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/ai/models";

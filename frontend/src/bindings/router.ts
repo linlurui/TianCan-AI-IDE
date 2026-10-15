@@ -5,9 +5,9 @@
 import { Call as $Call, Create as $Create } from "/wails/runtime.js";
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
-import * as router$0 from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/router/models";
+import * as router$0 from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/router/models";
 
-export type { HardwareProfile, SmartRouterConfig, TierRecommendation } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/router/models";
+export type { HardwareProfile, SmartRouterConfig, TierRecommendation } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/router/models";
 
 // Hardware monitor hooks for real-time monitoring
 export interface HardwareMonitorState {

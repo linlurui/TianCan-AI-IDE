@@ -10,6 +10,6 @@ export {
   SetRunEnvConfig,
   GetRunEnvConfig,
   DetectRunEnv,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/process/service";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/process/service";
 
-export type { RunEnvConfig } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/process/models";
+export type { RunEnvConfig } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/process/models";

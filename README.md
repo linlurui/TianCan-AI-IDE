@@ -4,7 +4,7 @@
   <p>纯本地、跨平台（Windows / macOS / Linux）的 AI 编程 IDE<br/>
   无需云端 API，无需订阅，所有 AI 推理均在本地硬件运行，数据零上传</p>
   <p>
-    <a href="https://github.com/linlurui/TianCan-AI-IDE">GitHub 仓库</a>
+    <a href="https://github.com/linlurui/tiancan-ai-ide">GitHub 仓库</a>
   </p>
 </div>
 
@@ -122,7 +122,7 @@ TianCan-AI-IDE/
 ### 开发模式
 
 ```bash
-git clone https://github.com/linlurui/TianCan-AI-IDE.git
+git clone https://github.com/linlurui/tiancan-ai-ide.git
 cd TianCan-AI-IDE
 
 # 安装依赖

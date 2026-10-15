@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/safety"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 )
 
 // Settings represents the user/project settings file.

@@ -42,3 +42,6 @@ yarn-cache/
 yarn-*
 pnpm-lock.yaml
 pnpm-store/
+
+# Build artifacts (G0)
+/tiancan-dev

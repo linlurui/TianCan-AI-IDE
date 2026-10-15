@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/webai/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/webai/types"
 )
 
 var (

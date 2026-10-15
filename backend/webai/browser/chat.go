@@ -7,8 +7,8 @@ import (
 	"time"
 
 	playwright "github.com/playwright-community/playwright-go"
-	"github.com/rocky233/tiancan-ai-ide/backend/webai/providers"
-	"github.com/rocky233/tiancan-ai-ide/backend/webai/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/webai/providers"
+	"github.com/linlurui/tiancan-ai-ide/backend/webai/types"
 )
 
 // RunBrowserChat restores session cookies into a headless Chromium page and

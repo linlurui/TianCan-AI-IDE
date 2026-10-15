@@ -13,7 +13,7 @@ import {
 import type {
   ProviderStatus,
   SandboxInfo,
-} from "@bindings/github.com/rocky233/tiancan-ai-ide/backend/sandbox/models";
+} from "@bindings/github.com/linlurui/tiancan-ai-ide/backend/sandbox/models";
 
 interface Settings {
   fontSize: number;

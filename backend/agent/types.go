@@ -2,7 +2,7 @@ package agent
 
 // Re-export types from the types sub-package to avoid import cycles.
 // Sub-packages should import agent/types directly.
-import "github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+import "github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 
 type MessageRole = types.MessageRole
 type Message = types.Message

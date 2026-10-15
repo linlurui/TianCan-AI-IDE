@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
 // ConfigName is the project-level config file name (analogous to TIANCAN.md).

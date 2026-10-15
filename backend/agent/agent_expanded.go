@@ -9,16 +9,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/compact"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/config"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/mcp"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/memory"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/parallel"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/ralph"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/roles"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/safety"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/tools"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/memory"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/parallel"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/ralph"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/roles"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
 // ── Enhanced Agent V2 ───────────────────────────────────────────

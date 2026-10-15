@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/safety"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
-	webparser "github.com/rocky233/tiancan-ai-ide/backend/webai/parser"
-	webtypes "github.com/rocky233/tiancan-ai-ide/backend/webai/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
+	webparser "github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
+	webtypes "github.com/linlurui/tiancan-ai-ide/backend/webai/types"
 )
 
 const (

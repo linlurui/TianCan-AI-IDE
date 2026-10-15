@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	agenttypes "github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	agenttypes "github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
 // GenerateTestsTool generates unit tests for a given source file.

@@ -8,7 +8,7 @@ import {
   RejectFile,
   GetFileOriginalContent,
   CleanupOldTasks,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/taskbindings";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/taskbindings";
 
 export {
   GetAgentTasks,
@@ -22,7 +22,7 @@ export {
 };
 
 // Re-export types from generated bindings
-export type { AgentTask, TaskFile } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/agent/ralph/models";
+export type { AgentTask, TaskFile } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/ralph/models";
 
 /**
  * Task bindings API for frontend

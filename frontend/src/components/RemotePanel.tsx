@@ -9,7 +9,7 @@ import {
   GetConnections, AddConnection, RemoveConnection,
   Connect, Disconnect, GetConnectionStatus, ListDockerContainers,
 } from "@bindings/remote";
-import { ConnectionConfig, ConnectionStatus, DockerContainer } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/remote/models";
+import { ConnectionConfig, ConnectionStatus, DockerContainer } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/remote/models";
 
 type ConnectionType = "ssh" | "docker";
 

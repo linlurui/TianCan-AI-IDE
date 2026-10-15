@@ -6,7 +6,7 @@ export {
   LanguageContrib,
   GrammarContrib,
   SnippetContrib,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/extension/models";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/extension/models";
 export {
   GetInstalledExtensions,
   SearchExtensions,
@@ -16,4 +16,4 @@ export {
   InstallLocalVSIX,
   GetExtensionIcon,
   GetExtensionContributes,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/extension/service";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/extension/service";

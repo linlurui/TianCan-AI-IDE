@@ -8,4 +8,4 @@ export {
   HasSettingsChanged,
   GetCurrentVersion,
   CheckForUpdate,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/config/service";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/config/service";

@@ -3,7 +3,7 @@ package agent
 import (
 	"sync"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/ralph"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/ralph"
 )
 
 // RollbackBindings 提供给前端的 Rollback API 绑定

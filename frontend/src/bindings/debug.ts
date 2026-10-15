@@ -20,5 +20,5 @@ export {
   StartJsDebug,
   StartLldbDapDebug,
   StopDebug,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/debug/service";
-export { AdapterType, DebugStatus } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/debug/models";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/debug/service";
+export { AdapterType, DebugStatus } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/debug/models";

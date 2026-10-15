@@ -7,9 +7,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/ralph"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
-	"github.com/rocky233/tiancan-ai-ide/backend/sandbox"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/ralph"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/sandbox"
 )
 
 // LLMCaller allows tools to call the LLM for AI-driven decisions.

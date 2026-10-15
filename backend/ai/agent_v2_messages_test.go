@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent"
 )
 
 func TestAgentMessagesToChatMessagesIncludesToolResults(t *testing.T) {

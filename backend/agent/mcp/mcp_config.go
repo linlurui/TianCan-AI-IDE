@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
 // MCPConfigFile represents the MCP server configuration file format.

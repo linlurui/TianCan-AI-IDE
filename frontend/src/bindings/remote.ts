@@ -15,4 +15,4 @@ export {
   RemoteListDir,
   RemoteExec,
   StartRemoteTerminalPort,
-} from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/remote/service";
+} from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/remote/service";

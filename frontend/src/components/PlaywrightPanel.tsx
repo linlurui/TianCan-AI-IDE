@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import { Play, Square, Plus, Trash2, ChevronRight, ChevronDown, Code2, Loader2, Download } from "lucide-react";
 import { Events } from "@wailsio/runtime";
-import * as pwAPI from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/playwright/service";
+import * as pwAPI from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/playwright/service";
 
 interface Script { id: string; name: string; code: string }
 

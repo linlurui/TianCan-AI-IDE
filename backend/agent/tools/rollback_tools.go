@@ -3,8 +3,8 @@ package tools
 import (
 	"context"
 
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/ralph"
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/ralph"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
 // ─── Rollback Tools ────────────────────────────────────────────────────

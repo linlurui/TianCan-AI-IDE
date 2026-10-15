@@ -1,7 +1,7 @@
 package agent
 
 import (
-	"github.com/rocky233/tiancan-ai-ide/backend/agent/ralph"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/ralph"
 )
 
 // TaskBindings provides Wails bindings for the task management system.

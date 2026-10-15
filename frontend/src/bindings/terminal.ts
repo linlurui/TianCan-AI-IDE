@@ -1,1 +1,1 @@
-export { StartAndGetPort } from "../../bindings/github.com/rocky233/tiancan-ai-ide/backend/terminal/service";
+export { StartAndGetPort } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/terminal/service";

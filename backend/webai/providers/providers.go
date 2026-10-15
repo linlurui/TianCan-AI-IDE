@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/rocky233/tiancan-ai-ide/backend/webai/parser"
-	"github.com/rocky233/tiancan-ai-ide/backend/webai/sse"
-	"github.com/rocky233/tiancan-ai-ide/backend/webai/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
+	"github.com/linlurui/tiancan-ai-ide/backend/webai/sse"
+	"github.com/linlurui/tiancan-ai-ide/backend/webai/types"
 )
 
 // Login opens a browser for the user to authenticate and captures auth tokens.
