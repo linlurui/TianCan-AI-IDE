@@ -139,6 +139,7 @@ func (hm *HardwareMonitor) StartMonitoring() {
 		return
 	}
 	hm.monitoringActive = true
+	stopCh := hm.stopCh // 捕获当前代 stopCh，避免与 StopMonitoring 的重建产生竞态
 	hm.mu.Unlock()
 
 	go func() {
@@ -148,7 +149,7 @@ func (hm *HardwareMonitor) StartMonitoring() {
 			select {
 			case <-ticker.C:
 				hm.refreshProfile()
-			case <-hm.stopCh:
+			case <-stopCh:
 				return
 			}
 		}
@@ -166,11 +167,12 @@ func (hm *HardwareMonitor) StopMonitoring() {
 	}
 }
 
-// GetProfile 返回最新的硬件配置
+// GetProfile 返回最新的硬件配置（快照拷贝，避免调用方在读字段时与后台刷新产生数据竞争）
 func (hm *HardwareMonitor) GetProfile() *HardwareProfile {
 	hm.mu.RLock()
 	defer hm.mu.RUnlock()
-	return hm.profile
+	snapshot := *hm.profile
+	return &snapshot
 }
 
 // refreshProfile 刷新硬件配置
