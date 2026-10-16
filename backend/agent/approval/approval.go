@@ -63,6 +63,7 @@ type Answerer interface {
 type ApprovalSystem struct {
 	answerer Answerer
 	never    map[string]bool
+	denyAll  bool // G10: preset "never" — short-circuit every request to Rejected
 	mu       sync.RWMutex
 }
 
@@ -105,6 +106,23 @@ func (s *ApprovalSystem) SetNever(tools []string) {
 	s.mu.Unlock()
 }
 
+// SetAnswerer reseats the answerer at runtime (used by G10 permission presets
+// to switch the approval knob between ask / allow / never behaviour).
+func (s *ApprovalSystem) SetAnswerer(a Answerer) {
+	s.mu.Lock()
+	s.answerer = a
+	s.mu.Unlock()
+}
+
+// SetDenyAll toggles a global deny-all that short-circuits Resolve to Rejected
+// before the never-set and before dispatching the answerer. Used by the G10
+// "never" preset — every tool is rejected regardless of name.
+func (s *ApprovalSystem) SetDenyAll(b bool) {
+	s.mu.Lock()
+	s.denyAll = b
+	s.mu.Unlock()
+}
+
 // Resolve returns the closed-set outcome for a request.
 //
 // Order:
@@ -115,9 +133,10 @@ func (s *ApprovalSystem) SetNever(tools []string) {
 //     (fail-closed). The returned Outcome is always one of the four values.
 func (s *ApprovalSystem) Resolve(ctx context.Context, req Request) (Outcome, error) {
 	s.mu.RLock()
+	denyAll := s.denyAll
 	never := s.never[req.ToolName]
 	s.mu.RUnlock()
-	if never {
+	if denyAll || never {
 		return OutcomeRejected, nil
 	}
 

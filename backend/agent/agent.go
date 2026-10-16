@@ -12,6 +12,7 @@ import (
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/approval"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/clarify"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/preset"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
@@ -85,6 +86,11 @@ type Agent struct {
 	clarifyTimeoutSec int
 	clarifyMaxRounds  int
 
+	// G10: permission preset manager — owns the active {sandbox, approval}
+	// tuple and applies it to the G4/G8 subsystems via the applier seams below.
+	presetMgr   *preset.Manager
+	sandboxMode preset.SandboxMode
+
 	mu          sync.Mutex
 	messages    []Message
 	configFiles []config.ConfigFile
@@ -128,7 +134,16 @@ func NewAgent(rootPath string) *Agent {
 		clarifyMachine:   clarify.NewMachine(),
 		clarifyTimeoutSec: clarify.DefaultTimeoutSec(),
 		clarifyMaxRounds:  clarify.DefaultMaxRounds(),
+		sandboxMode:       preset.SandboxOn,
 	}
+
+	// G10: permission-preset manager. The agent implements the two applier seams
+	// so the manager can drive the G4 sandbox + G8 approval subsystems when the
+	// active tuple changes. Default wiring already matches the `auto` preset
+	// ({sandbox:on, approval:ask}), so no explicit apply is needed at startup.
+	presetMgr, _ := preset.NewManager(preset.NewRegistry(), preset.NewMemoryPersister())
+	presetMgr.SetAppliers(a, a)
+	a.presetMgr = presetMgr
 
 	// Load config files
 	a.loadConfig()
@@ -186,6 +201,74 @@ func (a *Agent) SetApprovalSystem(s *approval.ApprovalSystem) {
 // clarify.NewDefault().
 func (a *Agent) SetClarifier(c clarify.Clarifier) {
 	a.clarifier = c
+}
+
+// --- G10: permission presets -------------------------------------------------
+//
+// The agent is the runtime applier for both preset knobs. The preset.Manager
+// calls these only when the active tuple actually changes; the agent never
+// imports the preset package's callers, keeping the leaf package dependency-free.
+
+// SetPresetManager overrides the permission-preset manager (G10). Primarily for
+// tests; the production default is wired in NewAgent.
+func (a *Agent) SetPresetManager(m *preset.Manager) {
+	a.presetMgr = m
+}
+
+// ApplySandbox implements preset.SandboxApplier (G10). Records the sandbox knob;
+// the actual enforcement on the G4 sandbox provider is a G13 concern and reads
+// this value.
+func (a *Agent) ApplySandbox(mode preset.SandboxMode) {
+	a.mu.Lock()
+	a.sandboxMode = mode
+	a.mu.Unlock()
+}
+
+// ApplyApproval implements preset.ApprovalApplier (G10). Translates the approval
+// knob into the four-value approval system's runtime configuration.
+func (a *Agent) ApplyApproval(mode preset.ApprovalMode) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch mode {
+	case preset.ApprovalAllow:
+		a.approvalSys.SetAnswerer(approval.NewPermissiveAnswerer())
+		a.approvalSys.SetDenyAll(false)
+	case preset.ApprovalNever:
+		a.approvalSys.SetDenyAll(true)
+	default: // ApprovalAsk — the fail-closed default
+		a.approvalSys.SetAnswerer(approval.NewRejectingAnswerer())
+		a.approvalSys.SetDenyAll(false)
+	}
+}
+
+// ApplyKnobs sets the active {sandbox, approval} tuple. It persists (and applies
+// to the runtime subsystems) only when a knob actually changed. Returns whether
+// a write happened.
+func (a *Agent) ApplyKnobs(k preset.Knobs) (bool, error) {
+	return a.presetMgr.ApplyKnobs(k)
+}
+
+// SelectPreset selects a named preset by name (see preset.Manager.SelectPreset).
+func (a *Agent) SelectPreset(name string) (bool, error) {
+	return a.presetMgr.SelectPreset(name)
+}
+
+// ActivePresetName returns the effective preset name: a matching named preset, or
+// `custom` if the active tuple diverged from every named preset.
+func (a *Agent) ActivePresetName() string {
+	return a.presetMgr.ActiveName()
+}
+
+// CurrentKnobs returns the active {sandbox, approval} tuple.
+func (a *Agent) CurrentKnobs() preset.Knobs {
+	return a.presetMgr.Current()
+}
+
+// SandboxMode returns the currently active sandbox knob.
+func (a *Agent) SandboxMode() preset.SandboxMode {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sandboxMode
 }
 
 // maybeClarify inspects the model response for a clarification request.
