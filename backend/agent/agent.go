@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/approval"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
@@ -74,6 +75,7 @@ type Agent struct {
 	skillMatcher  SkillMatcher
 	toolGuard     *toolguard.Guard
 	dupDetector   *toolguard.Detector
+	approvalSys   *approval.ApprovalSystem
 
 	mu          sync.Mutex
 	messages    []Message
@@ -113,6 +115,7 @@ func NewAgent(rootPath string) *Agent {
 		skillMatcher: skillMgr,
 		toolGuard:    toolguard.New(toolguard.DefaultConfig()),
 		dupDetector:  toolguard.NewDetector(0, 0),
+		approvalSys:  approval.NewDefault(),
 	}
 
 	// Load config files
@@ -159,6 +162,13 @@ func (a *Agent) SetDupDetector(d *toolguard.Detector) {
 	a.dupDetector = d
 }
 
+// SetApprovalSystem overrides the user-approval resolver (G8 four-value closed
+// set, fail-closed). Primarily for tests; the production default is wired in
+// NewAgent via approval.NewDefault().
+func (a *Agent) SetApprovalSystem(s *approval.ApprovalSystem) {
+	a.approvalSys = s
+}
+
 // executeRegisteredTool runs the safety check + deadline-guarded execution for a
 // registered tool, and tracks duplicate/rejected calls so a model hammering the
 // same denied call is redirected with a reminder (G6).
@@ -183,10 +193,29 @@ func (a *Agent) executeRegisteredTool(ctx context.Context, tool Tool, tc ToolCal
 		}
 		return fmt.Sprintf("Permission denied: %s", permResult.Reason), false, false, ""
 	case DecisionAsk:
+		// G8: resolve the four-value closed set instead of a hard non-interactive
+		// deny. allowed-once executes the tool; everything else is a fail-closed
+		// denial.
+		outcome := a.resolveApproval(ctx, tc.Name, tc.Args, permResult.Reason, int(level))
+		if !outcome.IsDenial() {
+			res := a.runToolGuarded(ctx, tool, tc)
+			if a.dupDetector != nil {
+				if res.Success {
+					a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeOK)
+				} else {
+					a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeFailed)
+				}
+			}
+			es := ""
+			if !res.Success {
+				es = res.Error
+			}
+			return res.Content, res.Success, true, es
+		}
 		if a.dupDetector != nil {
 			a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeDenied)
 		}
-		return fmt.Sprintf("Tool %s requires user confirmation (safety level %d). Denied in non-interactive mode.", tc.Name, level), false, false, ""
+		return fmt.Sprintf("Permission denied: %s", approval.DenialReason(outcome, tc.Name)), false, false, ""
 	case DecisionAllow:
 		res := a.runToolGuarded(ctx, tool, tc)
 		if a.dupDetector != nil {
@@ -204,6 +233,22 @@ func (a *Agent) executeRegisteredTool(ctx context.Context, tool Tool, tc ToolCal
 	}
 	// Unreachable: CheckPermission only returns Deny / Ask / Allow.
 	return fmt.Sprintf("Tool %s requires permission", tc.Name), false, false, ""
+}
+
+// resolveApproval consults the user-approval system for a DecisionAsk request
+// and returns one of the four closed-set outcomes (G8). If the approval system
+// is not wired, it fails closed to Unavailable (still a denial).
+func (a *Agent) resolveApproval(ctx context.Context, toolName string, args map[string]interface{}, reason string, level int) approval.Outcome {
+	if a.approvalSys == nil {
+		return approval.OutcomeUnavailable
+	}
+	out, _ := a.approvalSys.Resolve(ctx, approval.Request{
+		ToolName: toolName,
+		Args:     args,
+		Reason:   reason,
+		Level:    level,
+	})
+	return out
 }
 
 // runToolGuarded runs the tool under a per-tool deadline. The guard distinguishes
