@@ -12,18 +12,19 @@ import (
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/approval"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/clarify"
-	"github.com/linlurui/tiancan-ai-ide/backend/agent/goal"
-	"github.com/linlurui/tiancan-ai-ide/backend/agent/preset"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/goal"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/journal"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/memory"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/parallel"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/preset"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/ralph"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/roles"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
-	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/toolguard"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/skills"
 	webparser "github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
@@ -66,24 +67,24 @@ type ProgressCallback func(iteration int, toolName string, toolArgs map[string]i
 
 // Agent is the main orchestrator that wires all subsystems together.
 type Agent struct {
-	rootPath      string
-	homeDir       string
-	registry      *tools.Registry
-	safetySys     *safety.SafetySystem
-	memorySys     *memory.MemorySystem
-	compactSvc    *compact.CompactService
-	mcpClient     *mcp.Client
-	ralphLoop     *ralph.RalphLoop
-	parallelExec  *parallel.Executor
-	rollbackMgr   *ralph.RollbackManager
-	skillMatcher  SkillMatcher
-	toolGuard     *toolguard.Guard
-	dupDetector   *toolguard.Detector
-	approvalSys   *approval.ApprovalSystem
+	rootPath     string
+	homeDir      string
+	registry     *tools.Registry
+	safetySys    *safety.SafetySystem
+	memorySys    *memory.MemorySystem
+	compactSvc   *compact.CompactService
+	mcpClient    *mcp.Client
+	ralphLoop    *ralph.RalphLoop
+	parallelExec *parallel.Executor
+	rollbackMgr  *ralph.RollbackManager
+	skillMatcher SkillMatcher
+	toolGuard    *toolguard.Guard
+	dupDetector  *toolguard.Detector
+	approvalSys  *approval.ApprovalSystem
 
 	// G9: intent-clarification state machine + clarifier.
-	clarifier        clarify.Clarifier
-	clarifyMachine   *clarify.Machine
+	clarifier         clarify.Clarifier
+	clarifyMachine    *clarify.Machine
 	clarifyTimeoutSec int
 	clarifyMaxRounds  int
 
@@ -96,6 +97,13 @@ type Agent struct {
 	// CAS revision, round budget, and plan-mode flag). Nil-safe: the Run loops
 	// only touch it when non-nil, so callers that never set a goal are unaffected.
 	goalStore *goal.Store
+
+	// G14/G15: session event log + live projection. Every model turn and tool step
+	// is appended to journalLog and folded (in place) into sessionProj. The log is
+	// the single source of truth; state is its pure fold (G14), and G15 emits the
+	// turn/step events into it.
+	journalLog  *journal.Log
+	sessionProj *journal.Projector
 
 	mu          sync.Mutex
 	messages    []Message
@@ -123,26 +131,30 @@ func NewAgent(rootPath string) *Agent {
 	_ = skillMgr.LoadAll()
 
 	a := &Agent{
-		rootPath:     rootPath,
-		homeDir:      homeDir,
-		registry:     registry,
-		safetySys:    safetySys,
-		memorySys:    memorySys,
-		compactSvc:   compactSvc,
-		mcpClient:    mcpClient,
-		parallelExec: parallel.NewExecutor(4),
-		rollbackMgr:  rollbackMgr,
-		skillMatcher: skillMgr,
-		toolGuard:    toolguard.New(toolguard.DefaultConfig()),
-		dupDetector:  toolguard.NewDetector(0, 0),
-		approvalSys:      approval.NewDefault(),
-		clarifier:        clarify.NewDefault(),
-		clarifyMachine:   clarify.NewMachine(),
+		rootPath:          rootPath,
+		homeDir:           homeDir,
+		registry:          registry,
+		safetySys:         safetySys,
+		memorySys:         memorySys,
+		compactSvc:        compactSvc,
+		mcpClient:         mcpClient,
+		parallelExec:      parallel.NewExecutor(4),
+		rollbackMgr:       rollbackMgr,
+		skillMatcher:      skillMgr,
+		toolGuard:         toolguard.New(toolguard.DefaultConfig()),
+		dupDetector:       toolguard.NewDetector(0, 0),
+		approvalSys:       approval.NewDefault(),
+		clarifier:         clarify.NewDefault(),
+		clarifyMachine:    clarify.NewMachine(),
 		clarifyTimeoutSec: clarify.DefaultTimeoutSec(),
 		clarifyMaxRounds:  clarify.DefaultMaxRounds(),
 		sandboxMode:       preset.SandboxOn,
 		goalStore:         goal.NewStore(),
+		journalLog:        journal.NewLog(),
 	}
+	// G14/G15: build the live projection over the fresh (empty) session log. NewProjector
+	// replays any pre-existing events, so a log restored from disk replays correctly.
+	a.sessionProj, _ = journal.NewProjector(&sessionState{}, a.journalLog)
 
 	// G10: permission-preset manager. The agent implements the two applier seams
 	// so the manager can drive the G4 sandbox + G8 approval subsystems when the
@@ -581,16 +593,36 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 
 	totalTokens := 0
 
-	for i := 0; i < maxIterations; i++ {
+	// G15: turn/step loop with a double-queue inbox and a whenIdle do/while.
+	// The do/while re-prompts the model whenever the inbox is drained (no pending
+	// steps), so termination is driven by the model's final answer (no tool calls and
+	// no open clarification), not by the iteration cap. maxIterations is only a
+	// fail-closed backstop for non-terminating scripts.
+	iteration := 0
+	for {
+		if iteration >= maxIterations {
+			a.mu.Lock()
+			a.messages = messages
+			a.mu.Unlock()
+			return AgentRunResult{
+				Done:        true,
+				Messages:    messages,
+				TotalTokens: totalTokens,
+				DurationMs:  time.Since(start).Milliseconds(),
+			}
+		}
+		iteration++
+
 		select {
 		case <-ctx.Done():
+			a.mu.Lock()
+			a.messages = messages
+			a.mu.Unlock()
 			return AgentRunResult{Done: true, Error: "cancelled", Messages: messages, DurationMs: time.Since(start).Milliseconds()}
 		default:
 		}
 
 		// G12: spend a goal round; fail-closed when the budget is exhausted.
-		// Default budget is unlimited (MaxRounds==0), so existing behaviour is
-		// unchanged unless a goal budget was explicitly set.
 		if err := a.ConsumeRound(); err != nil {
 			a.mu.Lock()
 			a.messages = messages
@@ -614,9 +646,12 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 			}
 		}
 
-		// Get AI response
+		// ---- TURN: ask the model ----
 		response, err := chatFn(systemPrompt, messages)
 		if err != nil {
+			a.mu.Lock()
+			a.messages = messages
+			a.mu.Unlock()
 			return AgentRunResult{
 				Done:       true,
 				Error:      fmt.Sprintf("AI request failed: %v", err),
@@ -633,8 +668,10 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 		messages = append(messages, assistantMsg)
 		totalTokens += len(response) / 4
 
-		// Parse tool calls
+		// Parse tool calls and record the turn in the session log (G14/G15).
 		toolCalls := parseToolCallFromResponse(response)
+		a.emitTurn(response, len(toolCalls))
+
 		if len(toolCalls) == 0 {
 			// G9: the response may be a clarification request rather than a
 			// final answer. Resolve it before declaring done.
@@ -654,7 +691,7 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 			}
 			if isClar {
 				// The user's answer is fed back as a user message and the
-				// loop re-runs with it in context.
+				// loop re-runs with it in context (do/while re-prompt).
 				messages = append(messages, Message{
 					Role:      RoleUser,
 					Content:   answer,
@@ -674,7 +711,7 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 			a.memorySys.ExtractMemories(messages)
 
 			if cb != nil {
-				cb(i+1, "", nil, response, true, "")
+				cb(iteration, "", nil, response, true, "")
 			}
 
 			return AgentRunResult{
@@ -685,60 +722,31 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 			}
 		}
 
-		// Execute tool calls with safety checks
-		for _, tc := range toolCalls {
-			tool, found := a.registry.Get(tc.Name)
-			if !found {
-				// Check MCP tools
-				mcpResult, mcpErr := a.mcpClient.CallTool(ctx, tc.Name, tc.Args)
-				if mcpErr != nil {
-					messages = append(messages, Message{
-						Role:     RoleTool,
-						Content:  fmt.Sprintf("Tool not found: %s", tc.Name),
-						ToolName: tc.Name,
-						Success:  false,
-					})
-				} else {
-					messages = append(messages, Message{
-						Role:     RoleTool,
-						Content:  mcpResult.Content,
-						ToolName: tc.Name,
-						Success:  mcpResult.Success,
-					})
-				}
-				continue
-			}
-
-			// G6: safety check + deadline-guarded execution + duplicate/denied
-			// call redirect, all in one place shared with RunStream.
-			content, success, executed, errStr := a.executeRegisteredTool(ctx, tool, tc)
+		// ---- INBOX (request queue): execute the requested tool calls as steps,
+		// then commit their results in MODEL ORDER (double-queue: request inbox +
+		// result queue re-sequenced to model order). ----
+		outcomes := a.runSteps(ctx, toolCalls)
+		for i, tc := range toolCalls {
+			o := outcomes[i]
 			messages = append(messages, Message{
 				Role:     RoleTool,
-				Content:  content,
+				Content:  o.Content,
 				ToolName: tc.Name,
-				Success:  success,
+				Success:  o.Success,
 			})
-			if executed {
-				totalTokens += len(content) / 4
+			a.emitStep(tc, ToolResult{Content: o.Content, Success: o.Success})
+			if o.Executed {
+				totalTokens += len(o.Content) / 4
 				a.mu.Lock()
 				cb := a.progressCB
 				a.mu.Unlock()
 				if cb != nil {
-					cb(i+1, tc.Name, tc.Args, content, false, errStr)
+					cb(iteration, tc.Name, tc.Args, o.Content, false, o.ErrStr)
 				}
 			}
 		}
-	}
-
-	a.mu.Lock()
-	a.messages = messages
-	a.mu.Unlock()
-
-	return AgentRunResult{
-		Done:        true,
-		Messages:    messages,
-		TotalTokens: totalTokens,
-		DurationMs:  time.Since(start).Milliseconds(),
+		// whenIdle do/while: with the inbox drained we loop back and re-prompt the
+		// model, unless it just produced a final answer (handled in the branch above).
 	}
 }
 
@@ -752,7 +760,6 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 
 	go func() {
 		defer close(ch)
-		start := time.Now()
 
 		agentDef := roles.GeneralAgent
 		if roles.ShouldRoute(userMessage) {
@@ -777,10 +784,25 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 
 		totalTokens := 0
 
-		for i := 0; i < maxIterations; i++ {
+		// G15: turn/step loop with a double-queue inbox and a whenIdle do/while
+		// (see Run for the full rationale; this is the streaming twin).
+		iteration := 0
+		for {
+			if iteration >= maxIterations {
+				ch <- StreamEvent{Type: "error", Content: fmt.Sprintf("达到最大迭代次数 %d", maxIterations)}
+				a.mu.Lock()
+				a.messages = messages
+				a.mu.Unlock()
+				return
+			}
+			iteration++
+
 			select {
 			case <-ctx.Done():
 				ch <- StreamEvent{Type: "error", Content: "cancelled"}
+				a.mu.Lock()
+				a.messages = messages
+				a.mu.Unlock()
 				return
 			default:
 			}
@@ -813,6 +835,9 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 			})
 			if err != nil {
 				ch <- StreamEvent{Type: "error", Content: fmt.Sprintf("AI request failed: %v", err)}
+				a.mu.Lock()
+				a.messages = messages
+				a.mu.Unlock()
 				return
 			}
 
@@ -828,8 +853,10 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 			})
 			totalTokens += len(resp) / 4
 
-			// Parse tool calls
+			// Parse tool calls and record the turn in the session log (G14/G15).
 			toolCalls := parseToolCallFromResponse(resp)
+			a.emitTurn(resp, len(toolCalls))
+
 			if len(toolCalls) == 0 {
 				// G9: the response may be a clarification request.
 				answer, pending, isClar := a.maybeClarify(ctx, resp)
@@ -843,7 +870,7 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 				}
 				if isClar {
 					// The user's answer is fed back as a user message and the
-					// loop re-runs with it in context.
+					// loop re-runs with it in context (do/while re-prompt).
 					messages = append(messages, Message{
 						Role:      RoleUser,
 						Content:   answer,
@@ -858,37 +885,25 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 				a.mu.Unlock()
 				a.memorySys.ExtractMemories(messages)
 				ch <- StreamEvent{Type: "done", Content: resp}
-				_ = start
 				return
 			}
 
-			// Execute tool calls with safety checks
-			for _, tc := range toolCalls {
+			// ---- INBOX: execute requested tool calls as steps, commit results in
+			// model order (double-queue inbox + result re-sequencing). ----
+			outcomes := a.runSteps(ctx, toolCalls)
+			for i, tc := range toolCalls {
+				o := outcomes[i]
 				argsJSON, _ := json.Marshal(tc.Args)
 				ch <- StreamEvent{Type: "tool_call", Name: tc.Name, Content: string(argsJSON)}
-
-				tool, found := a.registry.Get(tc.Name)
-				if !found {
-					ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: fmt.Sprintf("Tool not found: %s", tc.Name), Success: false}
-					messages = append(messages, Message{Role: RoleTool, Content: fmt.Sprintf("Tool not found: %s", tc.Name), ToolName: tc.Name, Success: false})
-					continue
+				ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: o.Content, Success: o.Success}
+				messages = append(messages, Message{Role: RoleTool, Content: o.Content, ToolName: tc.Name, Success: o.Success})
+				a.emitStep(tc, ToolResult{Content: o.Content, Success: o.Success})
+				if o.Executed {
+					totalTokens += len(o.Content) / 4
 				}
-
-			// G6: safety check + deadline-guarded execution + duplicate/denied
-			// call redirect — same shared path as Run.
-			content, success, executed, _ := a.executeRegisteredTool(ctx, tool, tc)
-			ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: content, Success: success}
-			messages = append(messages, Message{Role: RoleTool, Content: content, ToolName: tc.Name, Success: success})
-			if executed {
-				totalTokens += len(content) / 4
 			}
+			// whenIdle do/while: re-prompt the model after the inbox drains.
 		}
-		}
-
-		ch <- StreamEvent{Type: "error", Content: fmt.Sprintf("达到最大迭代次数 %d", maxIterations)}
-		a.mu.Lock()
-		a.messages = messages
-		a.mu.Unlock()
 	}()
 
 	return ch, nil
