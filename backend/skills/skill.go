@@ -20,6 +20,7 @@ import (
 type Skill struct {
 	Name          string      `yaml:"name"`
 	Description   string      `yaml:"description"`
+	Body          string      `yaml:"body"`       // Freeform instruction text injected into the conversation when triggered (G5 pre-step).
 	Version       string      `yaml:"version"`
 	Triggers      []string    `yaml:"triggers"`
 	Steps         []SkillStep `yaml:"steps"`
@@ -27,6 +28,33 @@ type Skill struct {
 	FilePath      string      `yaml:"-"`
 	Validated     bool        `yaml:"-"` // Whether the skill has passed validation
 	ValidationMsg string      `yaml:"-"` // Validation result message
+}
+
+// RenderPreStep renders the skill's guidance as instruction text for pre-step
+// injection (G5). The text is intended for a user-role message — NOT the system
+// prompt — so the static system prompt stays cacheable and per-skill matches do
+// not bust the KV cache.
+//
+// Precedence: explicit Body wins; otherwise derive guidance from Description +
+// Steps, so legacy skills without a body still inject meaningful instructions.
+func (s *Skill) RenderPreStep() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Skill `%s` is now available. ", s.Name)
+	if s.Body != "" {
+		b.WriteString(s.Body)
+		return b.String()
+	}
+	if s.Description != "" {
+		b.WriteString(s.Description)
+		b.WriteString("\n")
+	}
+	if len(s.Steps) > 0 {
+		b.WriteString("Follow these steps:\n")
+		for i, st := range s.Steps {
+			fmt.Fprintf(&b, "  %d. call tool %q with arguments %v\n", i+1, st.Tool, st.Args)
+		}
+	}
+	return b.String()
 }
 
 // SkillStep is a single step within a skill.

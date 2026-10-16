@@ -20,6 +20,7 @@ import (
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
+	"github.com/linlurui/tiancan-ai-ide/backend/skills"
 	webparser "github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
 )
 
@@ -46,6 +47,14 @@ type StreamEvent struct {
 // It calls onToken for each token and returns the full accumulated response.
 type StreamChatFunc func(systemPrompt string, messages []Message, onToken func(token string)) (string, error)
 
+// SkillMatcher is the minimal skill-subsystem surface the agent needs.
+// The production implementation is *skills.Manager (in-memory registry loaded
+// from the filesystem — the "FSProvider"). It is an interface so tests can
+// inject a fake without touching disk (G5).
+type SkillMatcher interface {
+	MatchTrigger(input string) []*skills.Skill
+}
+
 // ProgressCallback is called by the agent loop to report iteration progress.
 type ProgressCallback func(iteration int, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string)
 
@@ -61,6 +70,7 @@ type Agent struct {
 	ralphLoop     *ralph.RalphLoop
 	parallelExec  *parallel.Executor
 	rollbackMgr   *ralph.RollbackManager
+	skillMatcher  SkillMatcher
 
 	mu          sync.Mutex
 	messages    []Message
@@ -82,6 +92,11 @@ func NewAgent(rootPath string) *Agent {
 	mcpClient := mcp.NewClient()
 	rollbackMgr := ralph.NewRollbackManager(rootPath)
 
+	// G5: skill registry + FSProvider — load skills from disk so the main loop
+	// can inject matched skill guidance as a pre-step user message.
+	skillMgr := skills.NewManager(rootPath)
+	_ = skillMgr.LoadAll()
+
 	a := &Agent{
 		rootPath:     rootPath,
 		homeDir:      homeDir,
@@ -92,6 +107,7 @@ func NewAgent(rootPath string) *Agent {
 		mcpClient:    mcpClient,
 		parallelExec: parallel.NewExecutor(4),
 		rollbackMgr:  rollbackMgr,
+		skillMatcher: skillMgr,
 	}
 
 	// Load config files
@@ -118,6 +134,38 @@ func (a *Agent) GetRollbackManager() *ralph.RollbackManager {
 // Registry returns the tool registry so callers can inject shared dependencies.
 func (a *Agent) Registry() *tools.Registry {
 	return a.registry
+}
+
+// SetSkillMatcher overrides the skill matcher (registry + FSProvider).
+// Primarily for tests; the production default is wired in NewAgent.
+func (a *Agent) SetSkillMatcher(sm SkillMatcher) {
+	a.skillMatcher = sm
+}
+
+// injectSkillPreSteps returns user-role messages for skills whose triggers match
+// the incoming user request. These are prepended before the actual user message
+// so the model sees the skill guidance as part of the first turn.
+//
+// KV-cache contract (G5): the guidance is rendered into user messages here and
+// must NEVER enter buildSystemPrompt — keeping the system prompt static lets the
+// provider reuse the cached prefix across skill matches.
+func (a *Agent) injectSkillPreSteps(userMessage string) []Message {
+	if a.skillMatcher == nil {
+		return nil
+	}
+	matched := a.skillMatcher.MatchTrigger(userMessage)
+	if len(matched) == 0 {
+		return nil
+	}
+	pre := make([]Message, 0, len(matched))
+	for _, s := range matched {
+		pre = append(pre, Message{
+			Role:      RoleUser,
+			Content:   s.RenderPreStep(),
+			Timestamp: time.Now(),
+		})
+	}
+	return pre
 }
 
 // loadConfig loads TIANCAN.md config files.
@@ -153,6 +201,11 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 
 	// Initialize messages
 	a.mu.Lock()
+	// G5: inject matched skill guidance as pre-step user messages, BEFORE the
+	// real user request (keeps it out of the system prompt for KV-cache safety).
+	for _, ps := range a.injectSkillPreSteps(userMessage) {
+		a.messages = append(a.messages, ps)
+	}
 	a.messages = append(a.messages, Message{
 		Role:      RoleUser,
 		Content:   userMessage,
@@ -327,6 +380,10 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 		systemPrompt := a.buildSystemPrompt(agentDef)
 
 		a.mu.Lock()
+		// G5: inject matched skill guidance as pre-step user messages (see Run).
+		for _, ps := range a.injectSkillPreSteps(userMessage) {
+			a.messages = append(a.messages, ps)
+		}
 		a.messages = append(a.messages, Message{
 			Role:      RoleUser,
 			Content:   userMessage,
