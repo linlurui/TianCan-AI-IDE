@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/config/schema"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
@@ -355,4 +356,62 @@ func (sm *SettingsManager) SaveToFile(path string) error {
 	}
 
 	return os.WriteFile(path, data, 0644)
+}
+
+// agentSchema is the builtin settings schema (G11). The env block is the
+// designated secret store (API keys / tokens) and is declared role('secret');
+// model is a normal field whose default is exercised by PublicSchema. Additional
+// branch schemas (global/project) can be unioned in via schema.Union — the
+// conservative merge keeps a field secret if ANY branch declares it so.
+func agentSchema() schema.Schema {
+	return schema.Schema{Fields: []schema.Field{
+		{Path: "env.*", Role: schema.RoleSecret, Default: map[string]interface{}{}},
+		{Path: "model", Role: schema.RoleNormal, Default: ""},
+		{Path: "permissions", Role: schema.RoleNormal},
+		{Path: "autoMode", Role: schema.RoleNormal},
+		{Path: "mcpServers", Role: schema.RoleNormal},
+		{Path: "hooks", Role: schema.RoleNormal},
+		{Path: "features", Role: schema.RoleNormal},
+		{Path: "allowedCommands", Role: schema.RoleNormal},
+		{Path: "deniedCommands", Role: schema.RoleNormal},
+	}}
+}
+
+// Schema returns the settings schema used for redaction (the builtin schema).
+func (sm *SettingsManager) Schema() schema.Schema {
+	return agentSchema()
+}
+
+// PublicSchema returns the UI-safe schema: a copy of the schema with every
+// secret field's default zeroed ("默认值也要脱敏"), so the UI can render masked
+// inputs without ever receiving a default secret value.
+func (sm *SettingsManager) PublicSchema() schema.Schema {
+	return agentSchema().Public()
+}
+
+// RedactedJSON returns the current settings serialized to JSON with all
+// role('secret') fields structurally removed — the exact payload safe to send
+// across the UI boundary.
+func (sm *SettingsManager) RedactedJSON() ([]byte, error) {
+	sm.mu.RLock()
+	data, err := json.Marshal(sm.settings)
+	sm.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	return sm.Schema().RedactJSON(data)
+}
+
+// RedactedForUI is a convenience wrapper returning the redacted settings as a
+// generic map (the decoded form the UI layer typically consumes).
+func (sm *SettingsManager) RedactedForUI() (map[string]interface{}, error) {
+	redacted, err := sm.RedactedJSON()
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(redacted, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
