@@ -199,11 +199,11 @@ func (s *cliStreamState) consumeCodex(event map[string]interface{}) {
 
 func (s *cliStreamState) emitThought(text string) {
 	text = strings.TrimSpace(text)
-	if text == "" || text == s.lastThought || s.service.App == nil {
+	if text == "" || text == s.lastThought || !s.service.hasEmitter() {
 		return
 	}
 	s.lastThought = text
-	s.service.App.Event.Emit("ai:reasoning", map[string]string{
+	s.service.emit("ai:reasoning", map[string]string{
 		"provider": s.provider,
 		"content":  truncateString(text, 4000),
 	})

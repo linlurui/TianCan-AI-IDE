@@ -23,6 +23,7 @@ import (
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent"
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
+	"github.com/linlurui/tiancan-ai-ide/backend/events"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
 	agenttypes "github.com/linlurui/tiancan-ai-ide/backend/agent/types"
@@ -62,7 +63,8 @@ type Service struct {
 	webConvID      string              // persisted conversation_id for web providers
 	webLastRequest string              // last user request for follow-up context
 	webLastActions string              // last turn actions+results summary for follow-up context
-	App            *application.App    // set by main.go; used for Events.Emit
+	App            *application.App    // set by main.go; used for Events.Emit（G3 起为 sink 的兜底桥）
+	sink           events.Sink         // G3 ProgressSink：非空时优先于 App
 	Router         *router.SmartRouter // hardware-aware model tier routing
 	sandboxMgr     *sandbox.Manager    // persistent sandbox manager (shared state)
 	requestCtx     context.Context
@@ -72,6 +74,25 @@ type Service struct {
 	providerRegistry *aiprovider.Registry
 	activeProvider   string // ID of active provider
 	// Agent mode
+}
+
+// SetSink 注入 G3 ProgressSink（PC 端/测试用）；传 nil 恢复 App 桥接。
+func (s *Service) SetSink(sink events.Sink) { s.sink = sink }
+
+// hasEmitter 报告当前是否有可用事件出口（Sink 或 Wails App 桥）。
+func (s *Service) hasEmitter() bool { return s.sink != nil || s.App != nil }
+
+// emit 发射事件：优先注入的 Sink，其次 Wails App 桥，最后包级默认（静默）。
+func (s *Service) emit(event string, payload interface{}) {
+	if s.sink != nil {
+		s.sink.Emit(event, payload)
+		return
+	}
+	if s.App != nil {
+		s.App.Event.Emit(event, payload)
+		return
+	}
+	events.Default().Emit(event, payload)
 }
 
 func (s *Service) beginRequest() (context.Context, uint64) {
@@ -1135,8 +1156,8 @@ func (s *Service) chatOpenAIStream(ctx context.Context, baseURL, apiKey, model s
 	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("读取 %s 流失败: %w", provider, err)
 	}
-	if reasoning.Len() > 0 && s.App != nil {
-		s.App.Event.Emit("ai:reasoning", map[string]string{"provider": provider, "content": truncateString(reasoning.String(), 4000)})
+	if reasoning.Len() > 0 && s.hasEmitter() {
+		s.emit("ai:reasoning", map[string]string{"provider": provider, "content": truncateString(reasoning.String(), 4000)})
 	}
 	if full.Len() == 0 {
 		var result ChatResponse
@@ -1149,8 +1170,8 @@ func (s *Service) chatOpenAIStream(ctx context.Context, baseURL, apiKey, model s
 	if strings.TrimSpace(full.String()) == "" {
 		return "", fmt.Errorf("%s 返回空响应", provider)
 	}
-	if thinking, _ := splitThinkingContent(full.String()); thinking != "" && s.App != nil {
-		s.App.Event.Emit("ai:reasoning", map[string]string{
+	if thinking, _ := splitThinkingContent(full.String()); thinking != "" && s.hasEmitter() {
+		s.emit("ai:reasoning", map[string]string{
 			"provider": provider,
 			"content":  truncateString(thinking, 4000),
 		})
@@ -1340,8 +1361,8 @@ func findLocalCLI(name string, candidates ...string) string {
 }
 
 func (s *Service) emitLLMProviderEvent(status, provider, detail string) {
-	if s.App != nil {
-		s.App.Event.Emit("ai:provider", map[string]string{
+	if s.hasEmitter() {
+		s.emit("ai:provider", map[string]string{
 			"status":   status,
 			"provider": provider,
 			"detail":   truncateString(detail, 240),
@@ -1350,10 +1371,10 @@ func (s *Service) emitLLMProviderEvent(status, provider, detail string) {
 }
 
 func (s *Service) emitModelStream(phase, provider, content string) {
-	if s.App == nil {
+	if !s.hasEmitter() {
 		return
 	}
-	s.App.Event.Emit("ai:model-stream", map[string]string{
+	s.emit("ai:model-stream", map[string]string{
 		"phase":    phase,
 		"provider": provider,
 		"content":  content,
@@ -1375,7 +1396,7 @@ func (s *Service) emitChunkedModelOutput(provider, content string) {
 		}
 		s.emitModelStream("token", provider, string(runes[:size]))
 		runes = runes[size:]
-		if s.App != nil && len(runes) > 0 {
+		if s.hasEmitter() && len(runes) > 0 {
 			time.Sleep(6 * time.Millisecond)
 		}
 	}
@@ -2796,8 +2817,8 @@ func isAlphaUnderscore(ch byte) bool {
 
 // emitProgress emits a subagent:progress event to the frontend via Wails.
 func (s *Service) emitProgress(iteration int, agentType, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string) {
-	if s.App != nil {
-		s.App.Event.Emit("subagent:progress", map[string]interface{}{
+	if s.hasEmitter() {
+		s.emit("subagent:progress", map[string]interface{}{
 			"agentId":   "main",
 			"agentType": agentType,
 			"iteration": iteration,
@@ -3030,8 +3051,8 @@ func (s *Service) SmartAgentRun(userMessage string, rootPath string, maxIteratio
 	tier := rr.Tier
 
 	// Emit routing decision to frontend
-	if s.App != nil {
-		s.App.Event.Emit("router:decision", SmartRouteResult{
+	if s.hasEmitter() {
+		s.emit("router:decision", SmartRouteResult{
 			Tier:       string(rr.Tier),
 			Category:   string(rr.Category),
 			Confidence: rr.Confidence,
@@ -3065,8 +3086,8 @@ func (s *Service) SmartAgentRun(userMessage string, rootPath string, maxIteratio
 			return result
 		}
 		if result.Error == "" {
-			if s.App != nil {
-				s.App.Event.Emit("router:fallback", map[string]string{
+			if s.hasEmitter() {
+				s.emit("router:fallback", map[string]string{
 					"from":   string(tier),
 					"to":     string(fallback),
 					"reason": originalErr,
@@ -3107,9 +3128,9 @@ func (s *Service) SmartAgentRunV2(userMessage string, rootPath string, maxIterat
 	agentChatFn := func(systemPrompt string, msgs []agent.Message) (string, error) {
 		messages := agentMessagesToChatMessages(systemPrompt, msgs)
 		response, err := s.ChatWithModel(messages)
-		if err == nil && len(parser.ParseToolCalls(response)) > 0 && s.App != nil {
+		if err == nil && len(parser.ParseToolCalls(response)) > 0 && s.hasEmitter() {
 			if thinking := extractVisibleThinking(response); thinking != "" {
-				s.App.Event.Emit("ai:reasoning", map[string]string{"content": thinking})
+				s.emit("ai:reasoning", map[string]string{"content": thinking})
 			}
 		}
 		return response, err
@@ -3400,8 +3421,8 @@ func (s *Service) SmartAgentStream(userMessage string, rootPath string, maxItera
 	rr := s.Router.Route(userMessage)
 
 	// Emit routing decision
-	if s.App != nil {
-		s.App.Event.Emit("router:decision", SmartRouteResult{
+	if s.hasEmitter() {
+		s.emit("router:decision", SmartRouteResult{
 			Tier:       string(rr.Tier),
 			Category:   string(rr.Category),
 			Confidence: rr.Confidence,
@@ -3859,13 +3880,13 @@ func (s *Service) StartAgentStream(userMessage string, rootPath string, maxItera
 	}
 	go func() {
 		for evt := range ch {
-			if s.App != nil {
-				s.App.Event.Emit("agent:stream", evt)
+			if s.hasEmitter() {
+				s.emit("agent:stream", evt)
 			}
 		}
 		// Signal completion so the frontend knows the stream ended
-		if s.App != nil {
-			s.App.Event.Emit("agent:stream", AgentStreamEvent{Type: "stream_end"})
+		if s.hasEmitter() {
+			s.emit("agent:stream", AgentStreamEvent{Type: "stream_end"})
 		}
 	}()
 	return nil
@@ -3972,8 +3993,8 @@ func (s *Service) LoginWeb(providerID string) error {
 		}
 		cmd.SysProcAttr = hideWindowAttr()
 		_ = cmd.Start()
-		if s.App != nil {
-			s.App.Event.Emit("webai:login-fallback", map[string]string{"provider": providerID})
+		if s.hasEmitter() {
+			s.emit("webai:login-fallback", map[string]string{"provider": providerID})
 		}
 		return nil
 	}
@@ -3983,8 +4004,8 @@ func (s *Service) LoginWeb(providerID string) error {
 		authResult, err := browser.RunLogin(providerID)
 		if err != nil {
 			log.Printf("ai: Playwright login failed for %s: %v", providerID, err)
-			if s.App != nil {
-				s.App.Event.Emit("webai:login-error", map[string]string{
+			if s.hasEmitter() {
+				s.emit("webai:login-error", map[string]string{
 					"provider": providerID,
 					"error":    err.Error(),
 				})
@@ -4008,8 +4029,8 @@ func (s *Service) LoginWeb(providerID string) error {
 			providerID, len(authResult.Cookie), len(authResult.Bearer))
 
 		// Emit success event
-		if s.App != nil {
-			s.App.Event.Emit("webai:login-success", map[string]interface{}{
+		if s.hasEmitter() {
+			s.emit("webai:login-success", map[string]interface{}{
 				"provider":     providerID,
 				"cookie":       authResult.Cookie,
 				"bearer":       authResult.Bearer,
@@ -4192,8 +4213,8 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 
 	// Wire agent loop progress to frontend via Wails events
 	a.SetProgressCallback(func(iteration int, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string) {
-		if s.App != nil {
-			s.App.Event.Emit("subagent:progress", map[string]interface{}{
+		if s.hasEmitter() {
+			s.emit("subagent:progress", map[string]interface{}{
 				"agentId":   "main",
 				"agentType": mode,
 				"iteration": iteration,
@@ -4274,8 +4295,8 @@ func (s *Service) chatWebConv(message string, convID string, providerID string) 
 		resp, newConvID, err := s.chatWithProvider(message, convID, pid)
 		if err == nil {
 			thinking, answer := splitThinkingContent(resp)
-			if thinking != "" && s.App != nil {
-				s.App.Event.Emit("ai:reasoning", map[string]string{
+			if thinking != "" && s.hasEmitter() {
+				s.emit("ai:reasoning", map[string]string{
 					"provider": "Web AI",
 					"content":  truncateString(thinking, 4000),
 				})
@@ -4690,8 +4711,8 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 			messages = append(messages, ChatMessage{Role: "tool_result", Content: res, Name: tc.Name})
 			toolResults = append(toolResults, res)
 			// Emit filetree refresh event for write operations so frontend updates directory tree
-			if !isReadOnlyTool(tc.Name) && s.App != nil {
-				s.App.Event.Emit("filetree:refresh", rootPath)
+			if !isReadOnlyTool(tc.Name) && s.hasEmitter() {
+				s.emit("filetree:refresh", rootPath)
 			}
 		}
 

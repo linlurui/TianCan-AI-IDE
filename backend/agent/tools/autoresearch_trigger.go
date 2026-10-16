@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
-	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/linlurui/tiancan-ai-ide/backend/events"
 )
 
 // ─── AutoResearch Dual-Trigger System ────────────────────────────────────
@@ -47,7 +47,7 @@ type TriggerDecision struct {
 type AutoResearchTrigger struct {
 	mu          sync.Mutex
 	llm         LLMCaller
-	app         *application.App
+	sink        events.Sink
 	eventMap    map[string]bool // event types that are mapped as triggerable
 	pending     []AutoResearchEvent
 	cooldown    time.Duration // minimum time between triggers
@@ -55,15 +55,26 @@ type AutoResearchTrigger struct {
 }
 
 // NewAutoResearchTrigger creates a new trigger instance.
-func NewAutoResearchTrigger(llm LLMCaller, app *application.App) *AutoResearchTrigger {
+// sink 为事件出口（G3 ProgressSink 抽象）；传 nil 时使用包级默认 Sink（静默）。
+func NewAutoResearchTrigger(llm LLMCaller, sink events.Sink) *AutoResearchTrigger {
+	if sink == nil {
+		sink = events.Default()
+	}
 	t := &AutoResearchTrigger{
 		llm:      llm,
-		app:      app,
+		sink:     sink,
 		eventMap: loadEventMapFromEnv(),
 		pending:  make([]AutoResearchEvent, 0),
 		cooldown: 5 * time.Minute, // don't re-trigger within 5 minutes
 	}
 	return t
+}
+
+// emit 发射事件到 Sink（ nil 安全）。
+func (t *AutoResearchTrigger) emit(event string, payload interface{}) {
+	if t.sink != nil {
+		t.sink.Emit(event, payload)
+	}
 }
 
 // loadEventMapFromEnv loads triggerable event types from TIANCAN_AUTORESEARCH_EVENTS.
@@ -105,9 +116,7 @@ func (t *AutoResearchTrigger) OnEvent(evt AutoResearchEvent) {
 	}
 
 	// Emit event to frontend for visibility
-	if t.app != nil {
-		t.app.Event.Emit("autoresearch:event", evt)
-	}
+	t.emit("autoresearch:event", evt)
 
 	log.Printf("autoresearch_trigger: event queued: %s (%s)", evt.Type, evt.Details)
 }
@@ -177,9 +186,7 @@ Respond in JSON format only:
 		t.pending = t.pending[:0]
 		t.lastTrigger = time.Now()
 
-		if t.app != nil {
-			t.app.Event.Emit("autoresearch:triggered", decision)
-		}
+		t.emit("autoresearch:triggered", decision)
 
 		log.Printf("autoresearch_trigger: TRIGGERED (confidence=%.2f): %s", decision.Confidence, decision.Reason)
 		return &decision

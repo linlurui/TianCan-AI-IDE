@@ -14,6 +14,7 @@ import (
 	"github.com/shirou/gopsutil/v3/cpu"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
+	"github.com/linlurui/tiancan-ai-ide/backend/events"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -112,7 +113,8 @@ type HardwareMonitor struct {
 	monitoringActive bool
 	stopCh           chan struct{}
 	updateInterval   time.Duration
-	app              *application.App // Wails 应用实例
+	app              *application.App // Wails 应用实例（G3 起为 sink 兜底桥）
+	sink             events.Sink      // G3 ProgressSink：非空时优先于 app
 }
 
 // NewHardwareMonitor 创建新的硬件监控器
@@ -129,6 +131,29 @@ func (hm *HardwareMonitor) SetApp(app *application.App) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 	hm.app = app
+}
+
+// SetSink 注入 G3 ProgressSink（PC 端/测试用）。
+func (hm *HardwareMonitor) SetSink(sink events.Sink) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	hm.sink = sink
+}
+
+// emit 发射事件：优先 Sink，其次 Wails App 桥，最后包级默认（静默）。
+func (hm *HardwareMonitor) emit(event string, payload interface{}) {
+	hm.mu.RLock()
+	sink, app := hm.sink, hm.app
+	hm.mu.RUnlock()
+	if sink != nil {
+		sink.Emit(event, payload)
+		return
+	}
+	if app != nil {
+		app.Event.Emit(event, payload)
+		return
+	}
+	events.Default().Emit(event, payload)
 }
 
 // StartMonitoring 启动后台硬件监控
@@ -218,13 +243,12 @@ func (hm *HardwareMonitor) refreshProfile() {
 		}
 	}
 
-	app := hm.app
-	profile := hm.profile // 复制当前状态
+	profile := *hm.profile // 快照拷贝，避免发射后字段被下一轮刷新改写
 	hm.mu.Unlock()
 
-	// 发射事件
-	if shouldEmit && app != nil {
-		app.Event.Emit("router:hardware-changed", profile)
+	// 发射事件（G3：经 Sink 抽象，不再直连 Wails）
+	if shouldEmit {
+		hm.emit("router:hardware-changed", &profile)
 	}
 }
 
@@ -845,7 +869,8 @@ type SmartRouterConfig struct {
 	CPUCores            int                    `json:"cpuCores"`            // Number of CPU cores (auto-detected)
 	Strategy            ModelSelectionStrategy `json:"strategy"`            // Model selection strategy based on hardware
 	SystemLoadThreshold float64                `json:"systemLoadThreshold"` // Memory usage % threshold for killing LM Studio (default 0.9)
-	App                 *application.App       `json:"-"`                   // For emitting events to frontend
+	App                 *application.App       `json:"-"`                   // For emitting events to frontend（G3 起为 Sink 兜底桥）
+	Sink                events.Sink            `json:"-"`                   // G3 ProgressSink：非空时优先于 App
 }
 
 // DefaultConfig returns the default Smart Router configuration with hardware detection.
@@ -995,6 +1020,19 @@ func NewSmartRouter(cfg SmartRouterConfig) *SmartRouter {
 		config:   cfg,
 		failures: make([]FailureRecord, 0, 10),
 	}
+}
+
+// emit 发射事件（G3 ProgressSink 抽象）：优先 config.Sink，其次 config.App 桥，最后包级默认（静默）。
+func (sr *SmartRouter) emit(event string, payload interface{}) {
+	if sr.config.Sink != nil {
+		sr.config.Sink.Emit(event, payload)
+		return
+	}
+	if sr.config.App != nil {
+		sr.config.App.Event.Emit(event, payload)
+		return
+	}
+	events.Default().Emit(event, payload)
 }
 
 // Route determines the best model tier for a given user message.
@@ -1569,9 +1607,7 @@ func (sr *SmartRouter) UpdateModelStatuses(statuses []LocalModelStatus) {
 	sr.modelStatuses = statuses
 
 	// Emit event to frontend so model dropdown can grey out unavailable models
-	if sr.config.App != nil {
-		sr.config.App.Event.Emit("router:local-models-updated", statuses)
-	}
+		sr.emit("router:local-models-updated", statuses)
 
 	// Check if ALL local models are unavailable → should kill LM Studio
 	allUnavailable := true
@@ -1581,8 +1617,8 @@ func (sr *SmartRouter) UpdateModelStatuses(statuses []LocalModelStatus) {
 			break
 		}
 	}
-	if allUnavailable && len(statuses) > 0 && sr.config.App != nil {
-		sr.config.App.Event.Emit("router:kill-lm-studio", "所有本地模型均不可用，建议关闭 LM Studio 释放内存")
+	if allUnavailable && len(statuses) > 0 {
+		sr.emit("router:kill-lm-studio", "所有本地模型均不可用，建议关闭 LM Studio 释放内存")
 	}
 }
 
@@ -1611,9 +1647,7 @@ func (sr *SmartRouter) RefreshHardwareState() {
 		}
 	}
 
-	if sr.config.App != nil {
-		sr.config.App.Event.Emit("router:local-models-updated", sr.modelStatuses)
-	}
+	sr.emit("router:local-models-updated", sr.modelStatuses)
 }
 
 // HasRecentFailure checks if a tier has had a failure in the last 5 minutes.

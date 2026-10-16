@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
+	"github.com/linlurui/tiancan-ai-ide/backend/events"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -35,7 +36,8 @@ type RunResult struct {
 // Service manages Playwright script execution.
 type Service struct {
 	mu       sync.Mutex
-	app      *application.App
+	app      *application.App // G3 起为 sink 兜底桥
+	sink     events.Sink      // G3 ProgressSink：非空时优先于 app
 	scripts  map[string]*Script
 	runDir   string // directory for temporary script files
 	nodePath string // path to node executable
@@ -63,6 +65,24 @@ func NewService() *Service {
 // SetApp sets the Wails app reference for event emission.
 func (s *Service) SetApp(app *application.App) {
 	s.app = app
+}
+
+// SetSink 注入 G3 ProgressSink（PC 端/测试用）。
+func (s *Service) SetSink(sink events.Sink) {
+	s.sink = sink
+}
+
+// emit 发射事件：优先 Sink，其次 Wails App 桥，最后包级默认（静默）。
+func (s *Service) emit(event string, payload interface{}) {
+	if s.sink != nil {
+		s.sink.Emit(event, payload)
+		return
+	}
+	if s.app != nil {
+		s.app.Event.Emit(event, payload)
+		return
+	}
+	events.Default().Emit(event, payload)
 }
 
 // checkPlaywrightInstalled verifies that @playwright/test is available.
@@ -188,16 +208,14 @@ func (s *Service) RunScript(scriptID string) error {
 		return fmt.Errorf("start node: %w", err)
 	}
 
-	// Stream stdout lines
+	// Stream stdout lines（G3：emit 内部已处理无 Sink/App 的静默分支，不再需要 app 空值守卫）
 	emitLine := func(lineType, text string) {
-		if s.app != nil {
-			eventData, _ := json.Marshal(map[string]string{
-				"scriptId": scriptID,
-				"type":     lineType,
-				"line":     text,
-			})
-			s.app.Event.Emit("playwright:output", string(eventData))
-		}
+		eventData, _ := json.Marshal(map[string]string{
+			"scriptId": scriptID,
+			"type":     lineType,
+			"line":     text,
+		})
+		s.emit("playwright:output", string(eventData))
 	}
 
 	var wg sync.WaitGroup
@@ -233,7 +251,7 @@ func (s *Service) RunScript(scriptID string) error {
 	}
 
 	// Emit final result
-	if s.app != nil {
+	{
 		result := RunResult{
 			ExitCode: exitCode,
 			Duration: duration,
@@ -246,7 +264,7 @@ func (s *Service) RunScript(scriptID string) error {
 			"type":     "done",
 			"result":   result,
 		})
-		s.app.Event.Emit("playwright:output", string(data))
+		s.emit("playwright:output", string(data))
 	}
 
 	return nil
