@@ -12,6 +12,7 @@ import (
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/approval"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/clarify"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/goal"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/preset"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
@@ -91,6 +92,11 @@ type Agent struct {
 	presetMgr   *preset.Manager
 	sandboxMode preset.SandboxMode
 
+	// G12: goal-driven + plan-mode state machine. Holds the active goal (with a
+	// CAS revision, round budget, and plan-mode flag). Nil-safe: the Run loops
+	// only touch it when non-nil, so callers that never set a goal are unaffected.
+	goalStore *goal.Store
+
 	mu          sync.Mutex
 	messages    []Message
 	configFiles []config.ConfigFile
@@ -135,6 +141,7 @@ func NewAgent(rootPath string) *Agent {
 		clarifyTimeoutSec: clarify.DefaultTimeoutSec(),
 		clarifyMaxRounds:  clarify.DefaultMaxRounds(),
 		sandboxMode:       preset.SandboxOn,
+		goalStore:         goal.NewStore(),
 	}
 
 	// G10: permission-preset manager. The agent implements the two applier seams
@@ -269,6 +276,88 @@ func (a *Agent) SandboxMode() preset.SandboxMode {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.sandboxMode
+}
+
+// --- G12: goal-driven + plan mode ---------------------------------------------
+//
+// The goal state machine lives in the leaf `goal` package; the agent owns a
+// Store and exposes a thin, dependency-injectable API. Plan-mode enforcement is
+// delegated to the G8 approval system (SetDenyAll), NOT to a tool interceptor:
+// entering plan mode flips the approval system to deny-all, so any tool that
+// requires approval is rejected by the fail-closed path. The plan-mode paragraph
+// injected into the system prompt is guidance only.
+
+// SetGoalStore overrides the goal store (G12). Primarily for tests; the production
+// default is wired in NewAgent via goal.NewStore().
+func (a *Agent) SetGoalStore(s *goal.Store) {
+	a.goalStore = s
+}
+
+// GetGoal returns a snapshot of the current goal.
+func (a *Agent) GetGoal() goal.Goal {
+	if a.goalStore == nil {
+		return goal.Goal{}
+	}
+	return a.goalStore.Get()
+}
+
+// SetGoal applies a goal via compare-and-swap against the expected revision.
+func (a *Agent) SetGoal(g goal.Goal, expect int64) (goal.Goal, error) {
+	if a.goalStore == nil {
+		return goal.Goal{}, goal.ErrTerminal
+	}
+	return a.goalStore.Set(g, expect)
+}
+
+// ConsumeRound spends one round of the goal budget. Returns the budget-exhausted
+// or terminal error so the caller can stop the loop fail-closed.
+func (a *Agent) ConsumeRound() error {
+	if a.goalStore == nil {
+		return nil
+	}
+	_, err := a.goalStore.ConsumeRound()
+	return err
+}
+
+// SetRoundBudget sets the goal's round budget (0 = unlimited).
+func (a *Agent) SetRoundBudget(n int) error {
+	if a.goalStore == nil {
+		return goal.ErrTerminal
+	}
+	_, err := a.goalStore.SetBudget(n)
+	return err
+}
+
+// EnterPlanMode flips the goal into plan mode and enforces it independently via the
+// G8 approval system: any tool requiring approval is now denied by the fail-closed
+// path. Read-only tools (DecisionAllow) still run — that is appropriate for
+// planning. The system prompt is updated on the next buildSystemPrompt call.
+func (a *Agent) EnterPlanMode(description string) error {
+	if a.goalStore == nil {
+		return goal.ErrTerminal
+	}
+	if _, err := a.goalStore.EnterPlanMode(description); err != nil {
+		return err
+	}
+	if a.approvalSys != nil {
+		a.approvalSys.SetDenyAll(true)
+	}
+	return nil
+}
+
+// ExitPlanMode leaves plan mode and re-syncs the approval subsystem to the active
+// permission preset's knob (so deny-all is cleared unless the preset itself denies).
+func (a *Agent) ExitPlanMode() error {
+	if a.goalStore == nil {
+		return goal.ErrTerminal
+	}
+	if _, err := a.goalStore.ExitPlanMode(); err != nil {
+		return err
+	}
+	if a.approvalSys != nil && a.presetMgr != nil {
+		a.ApplyApproval(a.presetMgr.Current().Approval)
+	}
+	return nil
 }
 
 // maybeClarify inspects the model response for a clarification request.
@@ -499,6 +588,22 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 		default:
 		}
 
+		// G12: spend a goal round; fail-closed when the budget is exhausted.
+		// Default budget is unlimited (MaxRounds==0), so existing behaviour is
+		// unchanged unless a goal budget was explicitly set.
+		if err := a.ConsumeRound(); err != nil {
+			a.mu.Lock()
+			a.messages = messages
+			a.mu.Unlock()
+			return AgentRunResult{
+				Done:        true,
+				Error:       "goal round budget exhausted",
+				Messages:    messages,
+				TotalTokens: totalTokens,
+				DurationMs:  time.Since(start).Milliseconds(),
+			}
+		}
+
 		// Check auto-compact
 		if a.compactSvc.ShouldAutoCompact(messages) {
 			result, err := a.compactSvc.CompactConversation(messages, func(prompt string) (string, error) {
@@ -678,6 +783,15 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 				ch <- StreamEvent{Type: "error", Content: "cancelled"}
 				return
 			default:
+			}
+
+			// G12: spend a goal round; fail-closed when the budget is exhausted.
+			if err := a.ConsumeRound(); err != nil {
+				ch <- StreamEvent{Type: "error", Content: "goal round budget exhausted"}
+				a.mu.Lock()
+				a.messages = messages
+				a.mu.Unlock()
+				return
 			}
 
 			// Auto-compact check
@@ -886,6 +1000,16 @@ func (a *Agent) buildSystemPrompt(agentDef AgentDefinition) string {
 	// Safety mode indicator
 	if a.safetySys.IsAutoMode() {
 		sb.WriteString("Running in **auto mode** — tool calls are automatically classified for safety.\n\n")
+	}
+
+	// G12: plan mode — guidance only. The hard enforcement is delegated to the
+	// approval system (deny-all), so this paragraph never needs to be trusted as
+	// the enforcement boundary.
+	if a.goalStore != nil && a.goalStore.Get().Mode == goal.ModePlan {
+		sb.WriteString("## Plan Mode\n\n")
+		sb.WriteString("You are in **PLAN MODE**. Propose the change and explain your plan clearly. ")
+		sb.WriteString("Do NOT execute mutating tools — any tool that requires approval is blocked by the ")
+		sb.WriteString("environment. Present a plan for review instead of carrying it out.\n\n")
 	}
 
 	// Project root
