@@ -19,6 +19,7 @@ import (
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/roles"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/toolguard"
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/skills"
 	webparser "github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
@@ -71,6 +72,8 @@ type Agent struct {
 	parallelExec  *parallel.Executor
 	rollbackMgr   *ralph.RollbackManager
 	skillMatcher  SkillMatcher
+	toolGuard     *toolguard.Guard
+	dupDetector   *toolguard.Detector
 
 	mu          sync.Mutex
 	messages    []Message
@@ -108,6 +111,8 @@ func NewAgent(rootPath string) *Agent {
 		parallelExec: parallel.NewExecutor(4),
 		rollbackMgr:  rollbackMgr,
 		skillMatcher: skillMgr,
+		toolGuard:    toolguard.New(toolguard.DefaultConfig()),
+		dupDetector:  toolguard.NewDetector(0, 0),
 	}
 
 	// Load config files
@@ -140,6 +145,97 @@ func (a *Agent) Registry() *tools.Registry {
 // Primarily for tests; the production default is wired in NewAgent.
 func (a *Agent) SetSkillMatcher(sm SkillMatcher) {
 	a.skillMatcher = sm
+}
+
+// SetToolGuard overrides the per-tool execution guard (deadline + the
+// parent-cancel vs own-deadline distinction). Primarily for tests.
+func (a *Agent) SetToolGuard(g *toolguard.Guard) {
+	a.toolGuard = g
+}
+
+// SetDupDetector overrides the duplicate/rejected-call detector. Primarily for
+// tests — a low threshold makes the redirect observable within a few iterations.
+func (a *Agent) SetDupDetector(d *toolguard.Detector) {
+	a.dupDetector = d
+}
+
+// executeRegisteredTool runs the safety check + deadline-guarded execution for a
+// registered tool, and tracks duplicate/rejected calls so a model hammering the
+// same denied call is redirected with a reminder (G6).
+//
+// Returns the tool-result content, whether it succeeded, whether the tool
+// actually executed (the allow path, so callers can emit progress callbacks),
+// and the error string to surface on failure.
+func (a *Agent) executeRegisteredTool(ctx context.Context, tool Tool, tc ToolCall) (content string, success bool, executed bool, errStr string) {
+	// G6: duplicate / rejected-call reminder — short-circuit before re-running.
+	if a.dupDetector != nil {
+		if remind, reason := a.dupDetector.ShouldRemind(tc.Name, tc.Args); remind {
+			a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeReminded)
+			return reason, false, false, ""
+		}
+	}
+
+	permResult, level := a.safetySys.CheckPermission(tool, tc.Args, a.rootPath)
+	switch permResult.Decision {
+	case DecisionDeny:
+		if a.dupDetector != nil {
+			a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeDenied)
+		}
+		return fmt.Sprintf("Permission denied: %s", permResult.Reason), false, false, ""
+	case DecisionAsk:
+		if a.dupDetector != nil {
+			a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeDenied)
+		}
+		return fmt.Sprintf("Tool %s requires user confirmation (safety level %d). Denied in non-interactive mode.", tc.Name, level), false, false, ""
+	case DecisionAllow:
+		res := a.runToolGuarded(ctx, tool, tc)
+		if a.dupDetector != nil {
+			if res.Success {
+				a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeOK)
+			} else {
+				a.dupDetector.Record(tc.Name, tc.Args, toolguard.OutcomeFailed)
+			}
+		}
+		es := ""
+		if !res.Success {
+			es = res.Error
+		}
+		return res.Content, res.Success, true, es
+	}
+	// Unreachable: CheckPermission only returns Deny / Ask / Allow.
+	return fmt.Sprintf("Tool %s requires permission", tc.Name), false, false, ""
+}
+
+// runToolGuarded runs the tool under a per-tool deadline. The guard distinguishes
+// a parent-context cancellation from the tool's own deadline (G6).
+func (a *Agent) runToolGuarded(ctx context.Context, tool Tool, tc ToolCall) ToolResult {
+	if a.toolGuard == nil {
+		res, err := tool.Execute(ctx, tc.Args)
+		if err != nil {
+			return ToolResult{Content: err.Error(), Success: false, Error: err.Error()}
+		}
+		return res
+	}
+	res, err := a.toolGuard.Execute(ctx, func(c context.Context) (ToolResult, error) {
+		return tool.Execute(c, tc.Args)
+	})
+	if err != nil {
+		switch e := err.(type) {
+		case *toolguard.ErrParentCancelled:
+			return ToolResult{
+				Content: fmt.Sprintf("Tool %s cancelled: parent context done (%v)", tc.Name, e.Err),
+				Success: false, Error: err.Error(),
+			}
+		case *toolguard.ErrDeadline:
+			return ToolResult{
+				Content: fmt.Sprintf("Tool %s timed out after %s", tc.Name, e.Deadline),
+				Success: false, Error: err.Error(),
+			}
+		default:
+			return ToolResult{Content: err.Error(), Success: false, Error: err.Error()}
+		}
+	}
+	return res
 }
 
 // injectSkillPreSteps returns user-role messages for skills whose triggers match
@@ -301,48 +397,22 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 				continue
 			}
 
-			// Safety check
-			permResult, level := a.safetySys.CheckPermission(tool, tc.Args, a.rootPath)
-			switch permResult.Decision {
-			case DecisionDeny:
-				messages = append(messages, Message{
-					Role:     RoleTool,
-					Content:  fmt.Sprintf("Permission denied: %s", permResult.Reason),
-					ToolName: tc.Name,
-					Success:  false,
-				})
-			case DecisionAsk:
-				// In non-interactive mode, deny
-				messages = append(messages, Message{
-					Role:     RoleTool,
-					Content:  fmt.Sprintf("Tool %s requires user confirmation (safety level %d). Denied in non-interactive mode.", tc.Name, level),
-					ToolName: tc.Name,
-					Success:  false,
-				})
-			case DecisionAllow:
+			// G6: safety check + deadline-guarded execution + duplicate/denied
+			// call redirect, all in one place shared with RunStream.
+			content, success, executed, errStr := a.executeRegisteredTool(ctx, tool, tc)
+			messages = append(messages, Message{
+				Role:     RoleTool,
+				Content:  content,
+				ToolName: tc.Name,
+				Success:  success,
+			})
+			if executed {
+				totalTokens += len(content) / 4
 				a.mu.Lock()
 				cb := a.progressCB
 				a.mu.Unlock()
 				if cb != nil {
-					cb(i+1, tc.Name, tc.Args, "", false, "")
-				}
-				result, err := tool.Execute(ctx, tc.Args)
-				if err != nil {
-					result = ToolResult{Content: err.Error(), Success: false, Error: err.Error()}
-				}
-				messages = append(messages, Message{
-					Role:     RoleTool,
-					Content:  result.Content,
-					ToolName: tc.Name,
-					Success:  result.Success,
-				})
-				totalTokens += len(result.Content) / 4
-				if cb != nil {
-					errStr := ""
-					if !result.Success {
-						errStr = result.Error
-					}
-					cb(i+1, tc.Name, tc.Args, result.Content, false, errStr)
+					cb(i+1, tc.Name, tc.Args, content, false, errStr)
 				}
 			}
 		}
@@ -461,26 +531,15 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 					continue
 				}
 
-				permResult, level := a.safetySys.CheckPermission(tool, tc.Args, a.rootPath)
-				switch permResult.Decision {
-				case DecisionDeny:
-					content := fmt.Sprintf("Permission denied: %s", permResult.Reason)
-					ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: content, Success: false}
-					messages = append(messages, Message{Role: RoleTool, Content: content, ToolName: tc.Name, Success: false})
-				case DecisionAsk:
-					content := fmt.Sprintf("Tool %s requires user confirmation (safety level %d). Denied in non-interactive mode.", tc.Name, level)
-					ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: content, Success: false}
-					messages = append(messages, Message{Role: RoleTool, Content: content, ToolName: tc.Name, Success: false})
-				case DecisionAllow:
-					result, err := tool.Execute(ctx, tc.Args)
-					if err != nil {
-						result = ToolResult{Content: err.Error(), Success: false, Error: err.Error()}
-					}
-					ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: result.Content, Success: result.Success}
-					messages = append(messages, Message{Role: RoleTool, Content: result.Content, ToolName: tc.Name, Success: result.Success})
-					totalTokens += len(result.Content) / 4
-				}
+			// G6: safety check + deadline-guarded execution + duplicate/denied
+			// call redirect — same shared path as Run.
+			content, success, executed, _ := a.executeRegisteredTool(ctx, tool, tc)
+			ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: content, Success: success}
+			messages = append(messages, Message{Role: RoleTool, Content: content, ToolName: tc.Name, Success: success})
+			if executed {
+				totalTokens += len(content) / 4
 			}
+		}
 		}
 
 		ch <- StreamEvent{Type: "error", Content: fmt.Sprintf("达到最大迭代次数 %d", maxIterations)}
