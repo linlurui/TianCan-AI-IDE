@@ -189,7 +189,7 @@ go build -tags production -o tiancan-ai-ide .
 - LSP 安装引导
 - 全局设置（模型 / LSP / 主题 / 快捷键）
 - CI/CD（GitHub Actions 多平台构建）
-- Playwright 测试集成
+- 浏览器自动化（go-rod 纯 Go CDP，移除 Playwright Node 运行时，事件合成输入被 isTrusted 硬墙拦截）
 - 部署工具（SSH/SCP 上传）
 - 运行环境自动检测 + 多配置切换
 - 全局搜索面板
@@ -261,6 +261,25 @@ go build -tags production -o tiancan-ai-ide .
 - **Git 面板项目切换**：顶部可直接切换当前项目，适合多仓同时打开时快速查看状态
 - **文件树自动跟随**：从 Git 面板切换项目后，文件树会自动高亮并展开对应项目
 - **项目关键记忆压缩**：项目记忆会做去重、归并、画像提炼，并在 token 预算内优先注入关键上下文
+
+---
+
+---
+
+## 近期更新 (2026-10) · 开源发版 v0.3.0
+
+本次发版聚焦 **agent 内核的可信度与可开源性**（流 G · G5–G13），所有改动均附完整测试并以 `go test -race ./...` 全绿为门禁：
+
+- **失败关闭的批准模型**：用户批准升级为四值闭集 `{allowed-once, rejected, cancelled, unavailable}`，`never` 策略在任何工具调度之前决定，交互式 answerer 抛错即失败关闭。
+- **权限预设**：`{sandbox, approval}` 二元组 + 保留名 `auto`/`custom`，仅当旋钮真变才写盘与通知运行时。
+- **设置密钥脱敏**：`role('secret')` 字段在跨 UI 边界前被结构化移除，默认值也不泄漏。
+- **计划模式**：目标状态机（revision CAS + 轮次预算），计划态靠 system prompt 段落 + 批准 deny-all 独立执法，而非工具层拦截。
+- **意图澄清状态机**：`open → continued/settled`，超时/无应答返回 `{pending:true}` 而非错误。
+- **工具守卫**：每工具独立 deadline 区分父取消/自身超时；重复被拒调用重定向为提醒，打破死循环。
+- **上下文压缩**：压缩区间退到平衡切点，绝不切掉半个 tool/result 对。
+- **浏览器自动化**：以纯 Go 的 go-rod（CDP）替换 playwright-go，移除 Node 运行时；页面 JS 合成输入被 isTrusted 硬墙拦截。
+
+详见 [docs/RELEASE-0.3.0.md](docs/RELEASE-0.3.0.md) 与 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 

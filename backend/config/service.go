@@ -222,7 +222,7 @@ func (s *Service) HasSettingsChanged() bool {
 
 // ---- Auto Update ----
 
-const currentVersion = "0.2.0"
+const currentVersion = "0.3.0"
 const githubReleaseAPI = "https://api.github.com/repos/linlurui/tiancan-ai-ide/releases/latest"
 
 // GetCurrentVersion returns the running IDE version.

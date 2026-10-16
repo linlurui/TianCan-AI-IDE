@@ -2,8 +2,6 @@ package providers
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
