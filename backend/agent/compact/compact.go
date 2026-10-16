@@ -121,14 +121,20 @@ func (c *CompactService) CompactConversation(messages []types.Message, chatFn Ch
 
 	preCompactTokens := EstimateTokens(messages)
 
-	// Split messages: summarize older ones, keep recent ones
+	// Split messages: summarize older ones, keep recent ones. Back the cut up to
+	// a balanced boundary so a tool-call/result pair is never split (G7).
 	keepCount := c.calculateMessagesToKeep(messages)
 	if keepCount >= len(messages) {
 		return nil, fmt.Errorf("nothing to compact")
 	}
+	desiredCut := len(messages) - keepCount
+	cut := findBalancedCut(messages, desiredCut)
+	if cut <= 0 || cut >= len(messages) {
+		return nil, fmt.Errorf("nothing to compact")
+	}
 
-	toSummarize := messages[:len(messages)-keepCount]
-	toKeep := messages[len(messages)-keepCount:]
+	toSummarize := messages[:cut]
+	toKeep := messages[cut:]
 
 	// Build summary prompt using Claude Code's detailed analysis+summary structure
 	summaryPrompt := GetCompactPrompt("")
@@ -170,6 +176,7 @@ func (c *CompactService) CompactConversation(messages []types.Message, chatFn Ch
 		SummaryMessages:       []types.Message{summaryMsg},
 		PreCompactTokenCount:  preCompactTokens,
 		PostCompactTokenCount: postCompactTokens,
+		Source:                types.CompactSource{Kind: types.CompactSourceAuto},
 	}
 
 	c.state.Compacted = true
@@ -215,12 +222,16 @@ func (c *CompactService) PartialCompactConversation(
 ) (*types.CompactionResult, error) {
 	var toSummarize, toKeep []types.Message
 
+	// Back the pivot up to a balanced boundary so a tool-call/result pair is
+	// never split across the summary/keep divide (G7).
+	pivot := findBalancedCut(allMessages, pivotIndex)
+
 	if direction == CompactUpTo {
-		toSummarize = allMessages[:pivotIndex]
-		toKeep = filterCompactBoundaries(allMessages[pivotIndex:])
+		toSummarize = allMessages[:pivot]
+		toKeep = filterCompactBoundaries(allMessages[pivot:])
 	} else {
-		toSummarize = allMessages[pivotIndex:]
-		toKeep = allMessages[:pivotIndex]
+		toSummarize = allMessages[pivot:]
+		toKeep = allMessages[:pivot]
 	}
 
 	if len(toSummarize) == 0 {
@@ -270,6 +281,7 @@ func (c *CompactService) PartialCompactConversation(
 		SummaryMessages:       []types.Message{summaryMsg},
 		PreCompactTokenCount:  preCompactTokens,
 		PostCompactTokenCount: postCompactTokens,
+		Source:                types.CompactSource{Kind: types.CompactSourcePartial},
 	}, nil
 }
 
@@ -299,6 +311,34 @@ func (c *CompactService) calculateMessagesToKeep(messages []types.Message) int {
 	}
 
 	return keepCount
+}
+
+// findBalancedCut retreats desiredCut earlier until it lands on a boundary that
+// does not split a tool-call/result pair (G7: "向前退到平衡切点，绝不切掉半个
+// tool-call/result 对").
+//
+// A tool-call/result pair is an assistant message carrying tool calls together
+// with the tool-result messages that follow it. The only unsafe place to cut is
+// at a tool-result message: that would leave the assistant call in the
+// summarized side while its result would be kept, splitting the pair. So we back
+// up while the first kept message is a RoleTool. After backing up, the first
+// kept message is a user or assistant message, and every tool-call/result pair
+// stays whole on one side of the cut.
+//
+// Backing up (a smaller cut index) keeps more messages and summarizes less — the
+// safe, conservative choice; it never corrupts a pair.
+func findBalancedCut(messages []types.Message, desiredCut int) int {
+	if desiredCut < 0 {
+		desiredCut = 0
+	}
+	if desiredCut > len(messages) {
+		desiredCut = len(messages)
+	}
+	cut := desiredCut
+	for cut > 0 && cut < len(messages) && messages[cut].Role == types.RoleTool {
+		cut--
+	}
+	return cut
 }
 
 // --- Compact prompts (mirrors Claude Code's prompt.ts) ---

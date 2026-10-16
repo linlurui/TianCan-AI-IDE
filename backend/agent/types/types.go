@@ -110,12 +110,30 @@ type AgentDefinition struct {
 	WhenToUse       string    `json:"whenToUse,omitempty"`
 }
 
+// CompactSourceKind classifies what triggered a compaction checkpoint (G7).
+// The checkpoint must carry source.kind so downstream can tell an auto-triggered
+// compaction from a manual or partial one.
+type CompactSourceKind string
+
+const (
+	CompactSourceAuto    CompactSourceKind = "auto"
+	CompactSourceManual  CompactSourceKind = "manual"
+	CompactSourcePartial CompactSourceKind = "partial"
+	CompactSourceUnknown CompactSourceKind = "unknown"
+)
+
+// CompactSource records the provenance of a compaction checkpoint.
+type CompactSource struct {
+	Kind CompactSourceKind `json:"kind"`
+}
+
 // CompactionResult holds the result of context compression.
 type CompactionResult struct {
-	BoundaryMarker        string    `json:"boundaryMarker"`
-	SummaryMessages       []Message `json:"summaryMessages"`
-	PreCompactTokenCount  int       `json:"preCompactTokenCount"`
-	PostCompactTokenCount int       `json:"postCompactTokenCount"`
+	BoundaryMarker        string          `json:"boundaryMarker"`
+	SummaryMessages       []Message       `json:"summaryMessages"`
+	PreCompactTokenCount  int             `json:"preCompactTokenCount"`
+	PostCompactTokenCount int             `json:"postCompactTokenCount"`
+	Source                CompactSource   `json:"source"`
 }
 
 // MemoryType classifies the source layer of a memory file.
