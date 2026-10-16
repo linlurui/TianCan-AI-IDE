@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
@@ -46,7 +47,7 @@ func NewRollbackManager(rootPath string) *RollbackManager {
 		snapshots:   make(map[string][]FileSnapshot),
 		checkpoints: make(map[string]*Checkpoint),
 		rootPath:    rootPath,
-		enabled:    os.Getenv("TIANCAN_DISABLE_ROLLBACK") != "1",
+		enabled:    !envconfig.EnvBool("TIANCAN_DISABLE_ROLLBACK"),
 	}
 }
 

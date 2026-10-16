@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
@@ -192,7 +193,7 @@ func NewCoordinator(rootPath string, chatFn types.ChatFunc) *Coordinator {
 		chatFn:          chatFn,
 		activeWorkers:   make(map[string]*AgentResult),
 		rootPath:        rootPath,
-		isCoordinator:   os.Getenv("TIANCAN_COORDINATOR_MODE") == "1",
+		isCoordinator:   envconfig.EnvBool("TIANCAN_COORDINATOR_MODE"),
 		maxDepth:        3, // default max nesting depth
 		worktreeManager: NewWorktreeManager(rootPath),
 	}
@@ -247,7 +248,7 @@ func (c *Coordinator) emitProgress(p SubAgentProgress) {
 // loadAgentDefsFromConfig loads agent definitions from TIANCAN_AGENT_DEFS_DIR env.
 // Each file is a JSON agent definition matching the AgentDefinition struct.
 func (c *Coordinator) loadAgentDefsFromConfig() {
-	defsDir := os.Getenv("TIANCAN_AGENT_DEFS_DIR")
+	defsDir := envconfig.EnvString("TIANCAN_AGENT_DEFS_DIR")
 	if defsDir == "" {
 		return // no config dir, use built-in only
 	}

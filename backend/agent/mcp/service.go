@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
@@ -25,8 +26,7 @@ type Service struct {
 
 // NewService creates a new MCP service instance.
 func NewService() *Service {
-	dir, _ := os.UserHomeDir()
-	cfgDir := filepath.Join(dir, ".tiancan")
+	cfgDir := envconfig.ConfigHome()
 	_ = os.MkdirAll(cfgDir, 0o755)
 
 	svc := &Service{

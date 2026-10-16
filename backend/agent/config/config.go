@@ -10,12 +10,13 @@ import (
 	"strings"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // ConfigName is the project-level config file name (analogous to TIANCAN.md).
 const ConfigName = "TIANCAN.md"
 const LocalConfigName = "TIANCAN.local.md"
-const DotDir = ".tiancan"
+const DotDir = envconfig.DotDir
 const RulesDir = "rules"
 
 // MaxMemoryCharacterCount is the recommended max chars for a config file.
@@ -29,12 +30,9 @@ var textFileExtensions = loadTextFileExtensions()
 // TIANCAN_TEXT_EXTENSIONS=.md,.txt,.json,.yaml,.go,.py,...
 func loadTextFileExtensions() map[string]bool {
 	m := make(map[string]bool)
-	if v := os.Getenv("TIANCAN_TEXT_EXTENSIONS"); v != "" {
-		for _, e := range strings.Split(v, ",") {
-			e = strings.TrimSpace(e)
-			if e != "" {
-				m[e] = true
-			}
+	if list := envconfig.EnvList("TIANCAN_TEXT_EXTENSIONS"); list != nil {
+		for _, e := range list {
+			m[e] = true
 		}
 		return m
 	}
@@ -325,7 +323,7 @@ func walkToRoot(cwd string) []string {
 
 func getManagedConfigPath() string {
 	// Check environment variable first
-	if p := os.Getenv("TIANCAN_MANAGED_CONFIG"); p != "" {
+	if p := envconfig.EnvString("TIANCAN_MANAGED_CONFIG"); p != "" {
 		return p
 	}
 	// Default: /etc/tiancan/TIANCAN.md (Linux/macOS)

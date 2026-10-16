@@ -22,6 +22,7 @@ import (
 	"log"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
 	agenttypes "github.com/linlurui/tiancan-ai-ide/backend/agent/types"
@@ -140,8 +141,7 @@ func NewService() *Service {
 
 // managedLMStudioPath returns the path where we cache LM Studio binary.
 func managedLMStudioPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tiancan-ide", "bin", "lm-studio")
+	return filepath.Join(envconfig.DataHome(), "bin", "lm-studio")
 }
 
 // IsLMStudioInstalled reports whether LM Studio is available (running or installed).
@@ -451,10 +451,8 @@ func (s *Service) detectSystemMemory() (float64, float64) {
 	}
 
 	// GPU VRAM from env (TIANCAN_GPU_MEMORY_GB) — we can't reliably detect this programmatically
-	if gpuStr := os.Getenv("TIANCAN_GPU_MEMORY_GB"); gpuStr != "" {
-		if v, err := strconv.ParseFloat(gpuStr, 64); err == nil {
-			vramGB = v
-		}
+	if v := envconfig.EnvFloat("TIANCAN_GPU_MEMORY_GB", 0); v != 0 {
+		vramGB = v
 	}
 
 	return ramGB, vramGB
@@ -1386,7 +1384,7 @@ func (s *Service) emitChunkedModelOutput(provider, content string) {
 
 func firstNonEmptyEnv(keys ...string) string {
 	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		if value := strings.TrimSpace(envconfig.EnvString(key)); value != "" {
 			return value
 		}
 	}
@@ -3200,7 +3198,7 @@ type TaskAnalysisV2 struct {
 
 // shouldUseRalphLoop 判断是否应该使用 Ralph 自纠错循环
 func shouldUseRalphLoop(task string) bool {
-	if os.Getenv("TIANCAN_DISABLE_RALPH") == "1" {
+	if envconfig.EnvBool("TIANCAN_DISABLE_RALPH") {
 		return false
 	}
 	indicators := []string{

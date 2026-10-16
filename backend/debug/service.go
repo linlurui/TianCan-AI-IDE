@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 const dlvVersion = "1.24.2"
@@ -29,8 +31,7 @@ const dlvVersion = "1.24.2"
 // debugTmpBase is the managed directory for debug binaries.
 // Keeping them here avoids polluting project roots with __debug_bin* files.
 func debugTmpBase() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tiancan-ide", "debug-tmp")
+	return filepath.Join(envconfig.DataHome(), "debug-tmp")
 }
 
 // debugOutputPath returns the path for the compiled debug binary,
@@ -162,8 +163,7 @@ func debugPath() string {
 
 // managedDlvPath returns the path where we cache our own dlv copy.
 func managedDlvPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tiancan-ide", "bin", "dlv")
+	return filepath.Join(envconfig.DataHome(), "bin", "dlv")
 }
 
 // ensureDlv returns an absolute path to a working dlv binary.
@@ -563,8 +563,7 @@ func (s *Service) StartGoDebug(rootPath string) (int, error) {
 
 // managedLldbDapPath returns the path where we cache our own lldb-dap copy.
 func managedLldbDapPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tiancan-ide", "bin", "lldb-dap")
+	return filepath.Join(envconfig.DataHome(), "bin", "lldb-dap")
 }
 
 // ensureLldbDap returns an absolute path to a working lldb-dap binary.
@@ -857,8 +856,7 @@ func (s *Service) StartDebugpyDebug(rootPath string) (int, error) {
 
 // managedJsDebugPath returns the path where we cache js-debug-dap.
 func managedJsDebugPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tiancan-ide", "bin", "js-debug-dap")
+	return filepath.Join(envconfig.DataHome(), "bin", "js-debug-dap")
 }
 
 const jsDebugVersion = "1.96.0"
@@ -1026,8 +1024,7 @@ func (s *Service) StartJsDebug(rootPath string) (int, error) {
 
 // managedJavaDebugPath returns the path where we cache java-debug JAR.
 func managedJavaDebugPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tiancan-ide", "bin", "java-debug.jar")
+	return filepath.Join(envconfig.DataHome(), "bin", "java-debug.jar")
 }
 
 const javaDebugVersion = "0.53.0"

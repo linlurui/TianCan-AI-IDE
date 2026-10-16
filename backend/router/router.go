@@ -3,7 +3,6 @@ package router
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/cpu"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -238,15 +238,13 @@ func abs(x float64) float64 {
 // detectGPU 增强的 GPU 检测逻辑
 func (hm *HardwareMonitor) detectGPU() {
 	// 首先检查环境变量
-	if gpuStr := os.Getenv("TIANCAN_GPU_MEMORY_GB"); gpuStr != "" {
-		if v, err := strconv.ParseFloat(gpuStr, 64); err == nil {
-			hm.profile.GPUMemoryGB = v
-			hm.profile.HasGPU = true
-			if hm.profile.GPUName == "" {
-				hm.profile.GPUName = os.Getenv("TIANCAN_GPU_NAME")
-			}
-			return
+	if v := envconfig.EnvFloat("TIANCAN_GPU_MEMORY_GB", 0); v > 0 {
+		hm.profile.GPUMemoryGB = v
+		hm.profile.HasGPU = true
+		if hm.profile.GPUName == "" {
+			hm.profile.GPUName = envconfig.EnvString("TIANCAN_GPU_NAME")
 		}
+		return
 	}
 
 	// 尝试通过系统命令检测 NVIDIA GPU
@@ -1680,7 +1678,7 @@ var routeKeywordsOnce sync.Once
 func loadRouteKeywords() map[TaskCategory][]string {
 	routeKeywordsOnce.Do(func() {
 		routeKeywordsCache = defaultKeywords()
-		if envVal := os.Getenv("TIANCAN_ROUTE_KEYWORDS"); envVal != "" {
+		if envVal := envconfig.EnvString("TIANCAN_ROUTE_KEYWORDS"); envVal != "" {
 			var parsed map[TaskCategory][]string
 			if err := json.Unmarshal([]byte(envVal), &parsed); err == nil {
 				routeKeywordsCache = parsed
@@ -1720,10 +1718,8 @@ func (c *SmartRouterConfig) detectHardware() {
 	}
 	// GPU memory: read from TIANCAN_GPU_MEMORY_GB env if not set
 	if c.GPUMemoryGB == 0 {
-		if gpuStr := os.Getenv("TIANCAN_GPU_MEMORY_GB"); gpuStr != "" {
-			if v, err := strconv.ParseFloat(gpuStr, 64); err == nil {
-				c.GPUMemoryGB = v
-			}
+		if v := envconfig.EnvFloat("TIANCAN_GPU_MEMORY_GB", 0); v > 0 {
+			c.GPUMemoryGB = v
 		}
 	}
 }

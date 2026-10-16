@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // ProjectRoot holds the current project root path (set from frontend).
@@ -22,7 +24,7 @@ func GetProjectRoot() string {
 		return ProjectRoot
 	}
 	// Try to detect from environment
-	if envRoot := os.Getenv("TIANCAN_PROJECT_ROOT"); envRoot != "" {
+	if envRoot := envconfig.EnvString("TIANCAN_PROJECT_ROOT"); envRoot != "" {
 		return envRoot
 	}
 	// Fallback: use cwd

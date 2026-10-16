@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 const defaultBudget = 1200
@@ -65,8 +67,7 @@ func storePath() string {
 	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
 		return filepath.Join(dir, "tiancan-ai-ide", "project-memory.json")
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".tiancan-ai-ide", "project-memory.json")
+	return filepath.Join(envconfig.MemoryHome(), "project-memory.json")
 }
 
 func readStore() (storeFile, error) {

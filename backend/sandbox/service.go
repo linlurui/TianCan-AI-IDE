@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // Service wraps the Manager for Wails binding.
@@ -58,7 +61,7 @@ func (s *Service) SetProvider(name string) error {
 
 // GetCurrentProvider returns the name of the current provider.
 func (s *Service) GetCurrentProvider() string {
-	provider := os.Getenv("TIANCAN_SANDBOX_PROVIDER")
+	provider := envconfig.EnvString("TIANCAN_SANDBOX_PROVIDER")
 	if provider == "" {
 		provider = "docker" // default
 	}
@@ -127,8 +130,8 @@ func (s *Service) InstallPlaywright() (string, error) {
 		return "Playwright 已安装", nil
 	}
 
-	home, _ := os.UserHomeDir()
-	runDir := fmt.Sprintf("%s/.tiancan-ide/playwright", home)
+	home := envconfig.DataHome()
+	runDir := filepath.Join(home, "playwright")
 	os.MkdirAll(runDir, 0o755)
 
 	cmd := exec.Command("npm", "install", "playwright")

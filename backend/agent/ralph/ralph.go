@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 	webparser "github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
@@ -48,12 +47,10 @@ type ToolExecFunc func(ctx context.Context, toolName string, args map[string]int
 
 // NewRalphLoop creates a new Ralph Loop instance.
 func NewRalphLoop(chatFn ChatFunc, toolExec ToolExecFunc) *RalphLoop {
-	enabled := os.Getenv("TIANCAN_DISABLE_RALPH") != "1"
+	enabled := !envconfig.EnvBool("TIANCAN_DISABLE_RALPH")
 	maxIter := MaxIterations
-	if v := os.Getenv("TIANCAN_RALPH_MAX_ITER"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxIter = n
-		}
+	if n := envconfig.EnvInt("TIANCAN_RALPH_MAX_ITER", 0); n > 0 {
+		maxIter = n
 	}
 	return &RalphLoop{
 		chatFn:        chatFn,

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // Extension represents a VS Code extension
@@ -136,8 +138,7 @@ type Service struct {
 
 // NewService creates a new extension service
 func NewService() *Service {
-	homeDir, _ := os.UserHomeDir()
-	extensionsDir := filepath.Join(homeDir, ".tiancan", "extensions")
+	extensionsDir := filepath.Join(envconfig.ConfigHome(), "extensions")
 	os.MkdirAll(extensionsDir, 0755)
 	return &Service{extensionsDir: extensionsDir}
 }

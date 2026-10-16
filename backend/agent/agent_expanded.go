@@ -11,6 +11,7 @@ import (
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/memory"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/parallel"
@@ -545,12 +546,9 @@ var tagSetOnce sync.Once
 func loadTagSet() map[string]bool {
 	tagSetOnce.Do(func() {
 		tagSetCache = make(map[string]bool)
-		if v := os.Getenv("TIANCAN_TAG_SET"); v != "" {
-			for _, t := range strings.Split(v, ",") {
-				t = strings.TrimSpace(t)
-				if t != "" {
-					tagSetCache[t] = true
-				}
+		if list := envconfig.EnvList("TIANCAN_TAG_SET"); list != nil {
+			for _, t := range list {
+				tagSetCache[t] = true
 			}
 		}
 		if len(tagSetCache) == 0 {

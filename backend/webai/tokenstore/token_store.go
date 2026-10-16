@@ -8,24 +8,14 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/webai/types"
 )
 
-var (
-	mu   sync.Mutex
-	home string
-)
-
-func tiancanHome() string {
-	if home != "" {
-		return home
-	}
-	h, _ := os.UserHomeDir()
-	return h
-}
+var mu sync.Mutex
 
 func tokensPath() string {
-	return filepath.Join(tiancanHome(), ".tiancan", "zero_token_tokens.json")
+	return filepath.Join(envconfig.ConfigHome(), "zero_token_tokens.json")
 }
 
 // LoadAll loads all stored tokens from disk. Returns {provider_id: AuthResult}.

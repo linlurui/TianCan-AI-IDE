@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // validatePath ensures the path is within the project root and not in a protected directory.
@@ -51,12 +53,9 @@ var binaryExtsOnce sync.Once
 func loadBinaryExts() map[string]bool {
 	binaryExtsOnce.Do(func() {
 		binaryExtsCache = make(map[string]bool)
-		if v := os.Getenv("TIANCAN_BINARY_EXTS"); v != "" {
-			for _, e := range strings.Split(v, ",") {
-				e = strings.TrimSpace(e)
-				if e != "" {
-					binaryExtsCache[e] = true
-				}
+		if list := envconfig.EnvList("TIANCAN_BINARY_EXTS"); list != nil {
+			for _, e := range list {
+				binaryExtsCache[e] = true
 			}
 		}
 		if len(binaryExtsCache) == 0 {

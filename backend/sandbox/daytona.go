@@ -11,10 +11,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // SandboxProvider defines the interface for sandbox backends.
@@ -130,10 +133,9 @@ type Manager struct {
 }
 
 func NewManager() *Manager {
-	installDir := os.Getenv("TIANCAN_SANDBOX_INSTALL_DIR")
+	installDir := envconfig.EnvString("TIANCAN_SANDBOX_INSTALL_DIR")
 	if installDir == "" {
-		home, _ := os.UserHomeDir()
-		installDir = home + "/.tiancan/bin"
+		installDir = filepath.Join(envconfig.ConfigHome(), "bin")
 	}
 	m := &Manager{
 		client:     NewDaytonaClient(),
@@ -147,7 +149,7 @@ func NewManager() *Manager {
 // resolveProvider selects the sandbox provider based on TIANCAN_SANDBOX_PROVIDER env.
 // Options: "daytona", "docker", "e2b". Default: auto-detect (daytona if available, else docker).
 func (m *Manager) resolveProvider() SandboxProvider {
-	switch os.Getenv("TIANCAN_SANDBOX_PROVIDER") {
+	switch envconfig.EnvString("TIANCAN_SANDBOX_PROVIDER") {
 	case "e2b":
 		return &E2BProvider{apiKey: os.Getenv("E2B_API_KEY")}
 	case "daytona":

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // CustomAPIDiscoverer 自定义 API Provider 发现器
@@ -82,10 +84,10 @@ var customProvidersOnce sync.Once
 // GetCustomProvidersManager 获取全局管理器
 func GetCustomProvidersManager() *CustomProvidersManager {
 	customProvidersOnce.Do(func() {
-		home, _ := os.UserHomeDir()
+		configDir := filepath.Join(envconfig.ConfigHome(), "providers")
 		customProvidersManager = &CustomProvidersManager{
 			providers: make(map[string]*Provider),
-			configDir: filepath.Join(home, ".tiancan", "providers"),
+			configDir: configDir,
 		}
 	})
 	return customProvidersManager
@@ -150,8 +152,7 @@ func (m *CustomProvidersManager) Get(id string) *Provider {
 
 // LoadCustomProviders 从文件加载已保存的 Provider
 func LoadCustomProviders() ([]*Provider, error) {
-	home, _ := os.UserHomeDir()
-	configPath := filepath.Join(home, ".tiancan", "providers", "custom.json")
+	configPath := filepath.Join(envconfig.ConfigHome(), "providers", "custom.json")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
@@ -1467,8 +1468,8 @@ func runPprofAnalysis(rootPath, target string) string {
 	}
 
 	// Try to run go test -cpuprofile
-	profileFile := filepath.Join(rootPath, ".tiancan", "cpuprofile.out")
-	os.MkdirAll(filepath.Join(rootPath, ".tiancan"), 0755)
+	profileFile := filepath.Join(envconfig.ProjectDataDir(rootPath), "cpuprofile.out")
+	os.MkdirAll(envconfig.ProjectDataDir(rootPath), 0755)
 
 	testCmd := fmt.Sprintf("cd %s && go test -cpuprofile=%s ./... 2>&1 | tail -5", rootPath, profileFile)
 	cmd := exec.Command("sh", "-c", testCmd)
@@ -1629,7 +1630,7 @@ type WebSearchTool struct {
 
 func NewWebSearchTool() *WebSearchTool {
 	return &WebSearchTool{
-		defaultSource: SearchSource(os.Getenv("TIANCAN_SEARCH_SOURCE")),
+		defaultSource: SearchSource(envconfig.EnvString("TIANCAN_SEARCH_SOURCE")),
 	}
 }
 
@@ -1748,7 +1749,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}
 
 // searchSearXNG 使用 SearXNG 元搜索引擎
 func (t *WebSearchTool) searchSearXNG(ctx context.Context, query string, page, perPage int, category string, safe bool, language, timeRange string) ([]SearchResult, error) {
-	baseURL := os.Getenv("TIANCAN_SEARXNG_URL")
+	baseURL := envconfig.EnvString("TIANCAN_SEARXNG_URL")
 	if baseURL == "" {
 		baseURL = "https://searx.be"
 	}

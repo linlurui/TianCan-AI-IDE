@@ -19,6 +19,7 @@ import (
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/roles"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	webparser "github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
 )
 
@@ -436,7 +437,7 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 
 // shouldUseRalphLoop determines if a task should use the Ralph Loop.
 func (a *Agent) shouldUseRalphLoop(task string) bool {
-	if os.Getenv("TIANCAN_DISABLE_RALPH") == "1" {
+	if envconfig.EnvBool("TIANCAN_DISABLE_RALPH") {
 		return false
 	}
 	// Use Ralph Loop for tasks that involve multiple file edits or API changes

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
@@ -70,30 +71,24 @@ type MemorySystem struct {
 
 // NewMemorySystem creates a new memory system.
 func NewMemorySystem(homeDir string) *MemorySystem {
-	if os.Getenv("TIANCAN_DISABLE_AUTO_MEMORY") == "1" {
+	if envconfig.EnvBool("TIANCAN_DISABLE_AUTO_MEMORY") {
 		return &MemorySystem{enabled: false, config: DefaultSessionMemoryConfig()}
 	}
 
 	cfg := DefaultSessionMemoryConfig()
 	// Allow env overrides
-	if v := os.Getenv("TIANCAN_MEMORY_MIN_TOKENS_INIT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.MinimumMessageTokensToInit = n
-		}
+	if n := envconfig.EnvInt("TIANCAN_MEMORY_MIN_TOKENS_INIT", 0); n > 0 {
+		cfg.MinimumMessageTokensToInit = n
 	}
-	if v := os.Getenv("TIANCAN_MEMORY_MIN_TOKENS_UPDATE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.MinimumTokensBetweenUpdate = n
-		}
+	if n := envconfig.EnvInt("TIANCAN_MEMORY_MIN_TOKENS_UPDATE", 0); n > 0 {
+		cfg.MinimumTokensBetweenUpdate = n
 	}
-	if v := os.Getenv("TIANCAN_MEMORY_TOOL_CALLS_UPDATE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.ToolCallsBetweenUpdates = n
-		}
+	if n := envconfig.EnvInt("TIANCAN_MEMORY_TOOL_CALLS_UPDATE", 0); n > 0 {
+		cfg.ToolCallsBetweenUpdates = n
 	}
 
 	var autoDir string
-	if override := os.Getenv("TIANCAN_MEMORY_DIR"); override != "" {
+	if override := envconfig.EnvString("TIANCAN_MEMORY_DIR"); override != "" {
 		autoDir = filepath.Join(override, AutoMemDirName)
 	} else {
 		autoDir = filepath.Join(homeDir, config.DotDir, AutoMemDirName)

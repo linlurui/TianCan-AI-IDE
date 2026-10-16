@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -51,8 +52,7 @@ func NewService() *Service {
 		s.nodePath = p
 	}
 	// Create temp dir for scripts
-	home, _ := os.UserHomeDir()
-	s.runDir = filepath.Join(home, ".tiancan-ide", "playwright")
+	s.runDir = filepath.Join(envconfig.DataHome(), "playwright")
 	os.MkdirAll(s.runDir, 0o755)
 
 	// Check if playwright is installed

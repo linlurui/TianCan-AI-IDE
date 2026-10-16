@@ -2,13 +2,12 @@ package compact
 
 import (
 	"fmt"
-	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 const (
@@ -69,21 +68,17 @@ type CompactService struct {
 
 // NewCompactService creates a new compaction service.
 func NewCompactService() *CompactService {
-	enabled := os.Getenv("TIANCAN_DISABLE_COMPACT") != "1"
+	enabled := !envconfig.EnvBool("TIANCAN_DISABLE_COMPACT")
 	contextWindow := DefaultContextWindow
-	if cw := os.Getenv("TIANCAN_CONTEXT_WINDOW"); cw != "" {
-		if v, err := strconv.Atoi(cw); err == nil && v > 0 {
-			contextWindow = v
-		}
+	if v := envconfig.EnvInt("TIANCAN_CONTEXT_WINDOW", 0); v > 0 {
+		contextWindow = v
 	}
 	// Allow percentage override — mirrors Claude Code's CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
-	if pct := os.Getenv("TIANCAN_AUTOCOMPACT_PCT_OVERRIDE"); pct != "" {
-		if v, err := strconv.ParseFloat(pct, 64); err == nil && v > 0 && v <= 100 {
-			pctThreshold := int(float64(contextWindow-MaxOutputTokensForSummary) * v / 100)
-			normalThreshold := contextWindow - MaxOutputTokensForSummary - AutoCompactBufferTokens
-			if pctThreshold < normalThreshold {
-				contextWindow = pctThreshold + MaxOutputTokensForSummary + AutoCompactBufferTokens
-			}
+	if v := envconfig.EnvFloat("TIANCAN_AUTOCOMPACT_PCT_OVERRIDE", 0); v > 0 && v <= 100 {
+		pctThreshold := int(float64(contextWindow-MaxOutputTokensForSummary) * v / 100)
+		normalThreshold := contextWindow - MaxOutputTokensForSummary - AutoCompactBufferTokens
+		if pctThreshold < normalThreshold {
+			contextWindow = pctThreshold + MaxOutputTokensForSummary + AutoCompactBufferTokens
 		}
 	}
 	return &CompactService{

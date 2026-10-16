@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
@@ -85,7 +85,7 @@ type classifierChatFn func(prompt string) (string, error)
 // NewYOLOClassifier creates a new YOLO classifier.
 func NewYOLOClassifier(chatFn types.ChatFunc) *YOLOClassifier {
 	mode := ModeBoth
-	if m := os.Getenv("TIANCAN_CLASSIFIER_MODE"); m != "" {
+	if m := envconfig.EnvString("TIANCAN_CLASSIFIER_MODE"); m != "" {
 		switch m {
 		case "fast":
 			mode = ModeFast
@@ -94,7 +94,7 @@ func NewYOLOClassifier(chatFn types.ChatFunc) *YOLOClassifier {
 		}
 	}
 
-	model := os.Getenv("TIANCAN_CLASSIFIER_MODEL")
+	model := envconfig.EnvString("TIANCAN_CLASSIFIER_MODEL")
 	if model == "" {
 		model = "default"
 	}

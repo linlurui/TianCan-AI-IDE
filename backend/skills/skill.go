@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // Skill represents a parsed .skill.yaml file.
@@ -54,7 +56,7 @@ func (m *Manager) LoadAll() error {
 	defer m.mu.Unlock()
 
 	dirs := []string{
-		filepath.Join(m.rootPath, ".tiancan", "skills"),
+		filepath.Join(envconfig.ProjectDataDir(m.rootPath), "skills"),
 		filepath.Join(m.rootPath, "skills"),
 	}
 
@@ -295,7 +297,7 @@ func (m *Manager) InstallLocal(yamlContent string) error {
 		return fmt.Errorf("skill has no steps")
 	}
 
-	skillDir := filepath.Join(m.rootPath, ".tiancan", "skills")
+	skillDir := filepath.Join(envconfig.ProjectDataDir(m.rootPath), "skills")
 	os.MkdirAll(skillDir, 0755)
 	destPath := filepath.Join(skillDir, skill.Name+".skill.yaml")
 	if err := os.WriteFile(destPath, []byte(yamlContent), 0644); err != nil {
@@ -472,7 +474,7 @@ func (m *Manager) RateSkill(name string, rating int) error {
 	defer m.mu.Unlock()
 
 	// Store rating in a local JSON file
-	ratingsPath := filepath.Join(m.rootPath, ".tiancan", "skill-ratings.json")
+	ratingsPath := filepath.Join(envconfig.ProjectDataDir(m.rootPath), "skill-ratings.json")
 	var ratings map[string]int
 	data, _ := os.ReadFile(ratingsPath)
 	if data != nil {
@@ -490,7 +492,7 @@ func (m *Manager) RateSkill(name string, rating int) error {
 func (m *Manager) GetSkillRating(name string) int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	ratingsPath := filepath.Join(m.rootPath, ".tiancan", "skill-ratings.json")
+	ratingsPath := filepath.Join(envconfig.ProjectDataDir(m.rootPath), "skill-ratings.json")
 	data, err := os.ReadFile(ratingsPath)
 	if err != nil {
 		return 0
@@ -506,12 +508,12 @@ func (m *Manager) GetSkillRating(name string) int {
 // Falls back to local skill search if marketURL is not configured.
 func (m *Manager) SearchMarket(query, category string) ([]MarketEntry, error) {
 	// If no market URL configured, search local skills
-	if os.Getenv("TIANCAN_MARKET_URL") == "" {
+	marketURL := envconfig.EnvString("TIANCAN_MARKET_URL")
+	if marketURL == "" {
 		return m.searchLocal(query, category), nil
 	}
 
 	// Try to query the community market API
-	marketURL := os.Getenv("TIANCAN_MARKET_URL")
 	url := fmt.Sprintf("%s/skills/search?q=%s&category=%s", marketURL, query, category)
 	resp, err := httpGet(url)
 	if err != nil {

@@ -3,13 +3,13 @@ package safety
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
@@ -113,14 +113,7 @@ func (s *SafetySystem) SetToolRegistry(registry ToolRegistry) {
 // TIANCAN_PROTECTED_PATHS=.git,.ssh,.gnupg,...
 // Falls back to sensible defaults only if no env is set.
 func loadProtectedPathsFromEnv() []string {
-	if v := os.Getenv("TIANCAN_PROTECTED_PATHS"); v != "" {
-		var paths []string
-		for _, p := range strings.Split(v, ",") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				paths = append(paths, p)
-			}
-		}
+	if paths := envconfig.EnvList("TIANCAN_PROTECTED_PATHS"); paths != nil {
 		return paths
 	}
 	// Defaults — only used when no env/config override exists
@@ -131,12 +124,9 @@ func loadProtectedPathsFromEnv() []string {
 // TIANCAN_READONLY_TOOLS=read_file,grep,glob,...
 func loadReadOnlyToolsFromEnv() map[string]bool {
 	m := make(map[string]bool)
-	if v := os.Getenv("TIANCAN_READONLY_TOOLS"); v != "" {
-		for _, t := range strings.Split(v, ",") {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				m[t] = true
-			}
+	if list := envconfig.EnvList("TIANCAN_READONLY_TOOLS"); list != nil {
+		for _, t := range list {
+			m[t] = true
 		}
 		return m
 	}
@@ -439,30 +429,26 @@ func (s *SafetySystem) getContentRule(toolName string, args map[string]interface
 // loadRulesFromEnv loads permission rules from environment variables.
 func (s *SafetySystem) loadRulesFromEnv() {
 	// TIANCAN_DENY_TOOLS=tool1,tool2,tool3
-	if denyTools := os.Getenv("TIANCAN_DENY_TOOLS"); denyTools != "" {
-		for _, t := range strings.Split(denyTools, ",") {
-			s.config.DenyRules = append(s.config.DenyRules, Rule{
-				ToolName:     strings.TrimSpace(t),
-				RuleBehavior: "deny",
-				Description:  fmt.Sprintf("Denied by environment: %s", t),
-			})
-		}
+	for _, t := range envconfig.EnvList("TIANCAN_DENY_TOOLS") {
+		s.config.DenyRules = append(s.config.DenyRules, Rule{
+			ToolName:     t,
+			RuleBehavior: "deny",
+			Description:  fmt.Sprintf("Denied by environment: %s", t),
+		})
 	}
 
 	// TIANCAN_ASK_TOOLS=tool1,tool2
-	if askTools := os.Getenv("TIANCAN_ASK_TOOLS"); askTools != "" {
-		for _, t := range strings.Split(askTools, ",") {
-			s.config.AskRules = append(s.config.AskRules, Rule{
-				ToolName:     strings.TrimSpace(t),
-				RuleBehavior: "ask",
-				Description:  fmt.Sprintf("Ask rule from environment: %s", t),
-			})
-		}
+	for _, t := range envconfig.EnvList("TIANCAN_ASK_TOOLS") {
+		s.config.AskRules = append(s.config.AskRules, Rule{
+			ToolName:     t,
+			RuleBehavior: "ask",
+			Description:  fmt.Sprintf("Ask rule from environment: %s", t),
+		})
 	}
 
 	// TIANCAN_AUTO_MODE=1 enables YOLO classifier
-	s.config.AutoMode = os.Getenv("TIANCAN_AUTO_MODE") == "1"
-	s.config.BypassMode = os.Getenv("TIANCAN_BYPASS_PERMISSIONS") == "1"
+	s.config.AutoMode = envconfig.EnvBool("TIANCAN_AUTO_MODE")
+	s.config.BypassMode = envconfig.EnvBool("TIANCAN_BYPASS_PERMISSIONS")
 }
 
 // SetConfig updates the safety configuration.

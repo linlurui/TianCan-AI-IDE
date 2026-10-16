@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
 
@@ -294,15 +295,13 @@ func (pm *PermissionManager) logDecision(toolName string, decision types.Permiss
 }
 
 func (pm *PermissionManager) loadRulesFromEnv() {
-	if denyTools := os.Getenv("TIANCAN_DENY_TOOLS"); denyTools != "" {
-		for _, t := range strings.Split(denyTools, ",") {
-			pm.rules = append(pm.rules, PermissionRule{
-				ID: "env-deny-" + t, ToolName: strings.TrimSpace(t), Action: "deny",
-				Priority: 70, Description: "Denied by env", Source: "env",
-			})
-		}
+	for _, t := range envconfig.EnvList("TIANCAN_DENY_TOOLS") {
+		pm.rules = append(pm.rules, PermissionRule{
+			ID: "env-deny-" + t, ToolName: t, Action: "deny",
+			Priority: 70, Description: "Denied by env", Source: "env",
+		})
 	}
-	if os.Getenv("TIANCAN_AUTO_MODE") == "1" {
+	if envconfig.EnvBool("TIANCAN_AUTO_MODE") {
 		pm.mode = ModeAuto
 	}
 }

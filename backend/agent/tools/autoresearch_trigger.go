@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -75,14 +75,11 @@ func loadEventMapFromEnv() map[string]bool {
 		"slow_test":       true,
 		"test_failure":    true,
 	}
-	if envStr := os.Getenv("TIANCAN_AUTORESEARCH_EVENTS"); envStr != "" {
+	if list := envconfig.EnvList("TIANCAN_AUTORESEARCH_EVENTS"); list != nil {
 		// Override with env-specified events
 		m = make(map[string]bool)
-		for _, e := range strings.Split(envStr, ",") {
-			e = strings.TrimSpace(e)
-			if e != "" {
-				m[e] = true
-			}
+		for _, e := range list {
+			m[e] = true
 		}
 	}
 	return m

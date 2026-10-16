@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // ExpandTilde expands ~ to the user's home directory.
@@ -105,13 +107,8 @@ var protectedDirsOnce sync.Once
 // TIANCAN_PROTECTED_PATHS=.git,.ssh,.gnupg,...
 func loadProtectedDirs() []string {
 	protectedDirsOnce.Do(func() {
-		if v := os.Getenv("TIANCAN_PROTECTED_PATHS"); v != "" {
-			for _, p := range strings.Split(v, ",") {
-				p = strings.TrimSpace(p)
-				if p != "" {
-					protectedDirsCache = append(protectedDirsCache, p)
-				}
-			}
+		if list := envconfig.EnvList("TIANCAN_PROTECTED_PATHS"); list != nil {
+			protectedDirsCache = list
 		}
 		if len(protectedDirsCache) == 0 {
 			protectedDirsCache = []string{".git", ".tiancan", ".ssh", ".gnupg"}

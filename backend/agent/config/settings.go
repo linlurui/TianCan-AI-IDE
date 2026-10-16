@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 // Settings represents the user/project settings file.
@@ -221,19 +222,19 @@ func (sm *SettingsManager) loadFromEnv() {
 	defer sm.mu.Unlock()
 
 	// TIANCAN_MODEL overrides model
-	if m := os.Getenv("TIANCAN_MODEL"); m != "" {
+	if m := envconfig.EnvString("TIANCAN_MODEL"); m != "" {
 		sm.settings.Model = m
 	}
 
 	// TIANCAN_AUTO_MODE=1 enables auto mode
-	if os.Getenv("TIANCAN_AUTO_MODE") == "1" {
+	if envconfig.EnvBool("TIANCAN_AUTO_MODE") {
 		if sm.settings.AutoMode == nil {
 			sm.settings.AutoMode = &AutoModeSettings{}
 		}
 	}
 
 	// TIANCAN_BYPASS_PERMISSIONS=1
-	if os.Getenv("TIANCAN_BYPASS_PERMISSIONS") == "1" {
+	if envconfig.EnvBool("TIANCAN_BYPASS_PERMISSIONS") {
 		sm.settings.Permissions.Allow = append(sm.settings.Permissions.Allow, "*")
 	}
 }
