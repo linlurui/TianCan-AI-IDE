@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/approval"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/clarify"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
@@ -30,6 +31,7 @@ import (
 type AgentRunResult struct {
 	Done        bool             `json:"done"`
 	Error       string           `json:"error,omitempty"`
+	Pending     bool             `json:"pending,omitempty"` // G9: clarification awaiting user (not an error)
 	Messages    []Message        `json:"messages"`
 	AgentType   string           `json:"agentType,omitempty"`
 	TotalTokens int              `json:"totalTokens"`
@@ -77,6 +79,12 @@ type Agent struct {
 	dupDetector   *toolguard.Detector
 	approvalSys   *approval.ApprovalSystem
 
+	// G9: intent-clarification state machine + clarifier.
+	clarifier        clarify.Clarifier
+	clarifyMachine   *clarify.Machine
+	clarifyTimeoutSec int
+	clarifyMaxRounds  int
+
 	mu          sync.Mutex
 	messages    []Message
 	configFiles []config.ConfigFile
@@ -115,7 +123,11 @@ func NewAgent(rootPath string) *Agent {
 		skillMatcher: skillMgr,
 		toolGuard:    toolguard.New(toolguard.DefaultConfig()),
 		dupDetector:  toolguard.NewDetector(0, 0),
-		approvalSys:  approval.NewDefault(),
+		approvalSys:      approval.NewDefault(),
+		clarifier:        clarify.NewDefault(),
+		clarifyMachine:   clarify.NewMachine(),
+		clarifyTimeoutSec: clarify.DefaultTimeoutSec(),
+		clarifyMaxRounds:  clarify.DefaultMaxRounds(),
 	}
 
 	// Load config files
@@ -167,6 +179,45 @@ func (a *Agent) SetDupDetector(d *toolguard.Detector) {
 // NewAgent via approval.NewDefault().
 func (a *Agent) SetApprovalSystem(s *approval.ApprovalSystem) {
 	a.approvalSys = s
+}
+
+// SetClarifier overrides the clarifier (G9). Primarily for tests; the production
+// default (fail-closed silent clarifier) is wired in NewAgent via
+// clarify.NewDefault().
+func (a *Agent) SetClarifier(c clarify.Clarifier) {
+	a.clarifier = c
+}
+
+// maybeClarify inspects the model response for a clarification request.
+//
+// Return contract:
+//   - ok == false: not a clarification (or already settled / rounds exhausted) —
+//     the machine is moved to Settled and the caller proceeds as normal.
+//   - ok == true && pending == true: clarification is open but no answer is
+//     available yet. The caller MUST treat this as {pending:true}, never as an
+//     error (G9: timeout is not an error).
+//   - ok == true && pending == false: answer holds the user's answer, ready to
+//     be fed back as a user message.
+func (a *Agent) maybeClarify(ctx context.Context, response string) (answer string, pending bool, ok bool) {
+	prompt, isClar := clarify.IsClarification(response)
+	if !isClar {
+		a.clarifyMachine.Settle()
+		return "", false, false
+	}
+	if a.clarifyMachine.IsSettled() {
+		return "", false, false
+	}
+	state, _ := a.clarifyMachine.Open()
+	_ = state
+	if a.clarifyMachine.Rounds() > a.clarifyMaxRounds {
+		// Too many rounds without settling — stop clarifying to avoid an
+		// ask/answer loop, and let the response stand.
+		a.clarifyMachine.Settle()
+		return "", false, false
+	}
+	timeout := time.Duration(a.clarifyTimeoutSec) * time.Second
+	ans, pend, _ := a.clarifier.Clarify(ctx, prompt, timeout)
+	return ans, pend, true
 }
 
 // executeRegisteredTool runs the safety check + deadline-guarded execution for a
@@ -397,6 +448,34 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 		// Parse tool calls
 		toolCalls := parseToolCallFromResponse(response)
 		if len(toolCalls) == 0 {
+			// G9: the response may be a clarification request rather than a
+			// final answer. Resolve it before declaring done.
+			answer, pending, isClar := a.maybeClarify(ctx, response)
+			if isClar && pending {
+				// Timeout / offline user → {pending:true}, NOT an error.
+				a.mu.Lock()
+				a.messages = messages
+				a.mu.Unlock()
+				return AgentRunResult{
+					Done:        true,
+					Pending:     true,
+					Messages:    messages,
+					TotalTokens: totalTokens,
+					DurationMs:  time.Since(start).Milliseconds(),
+				}
+			}
+			if isClar {
+				// The user's answer is fed back as a user message and the
+				// loop re-runs with it in context.
+				messages = append(messages, Message{
+					Role:      RoleUser,
+					Content:   answer,
+					Timestamp: time.Now(),
+				})
+				totalTokens += len(answer) / 4
+				continue
+			}
+
 			// No more tool calls - done
 			a.mu.Lock()
 			a.messages = messages
@@ -555,6 +634,28 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 			// Parse tool calls
 			toolCalls := parseToolCallFromResponse(resp)
 			if len(toolCalls) == 0 {
+				// G9: the response may be a clarification request.
+				answer, pending, isClar := a.maybeClarify(ctx, resp)
+				if isClar && pending {
+					// Timeout / offline user → {pending:true}, NOT an error.
+					a.mu.Lock()
+					a.messages = messages
+					a.mu.Unlock()
+					ch <- StreamEvent{Type: "pending", Content: resp}
+					return
+				}
+				if isClar {
+					// The user's answer is fed back as a user message and the
+					// loop re-runs with it in context.
+					messages = append(messages, Message{
+						Role:      RoleUser,
+						Content:   answer,
+						Timestamp: time.Now(),
+					})
+					totalTokens += len(answer) / 4
+					continue
+				}
+
 				a.mu.Lock()
 				a.messages = messages
 				a.mu.Unlock()
