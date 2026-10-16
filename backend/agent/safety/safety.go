@@ -41,6 +41,44 @@ type Rule struct {
 	Description   string         `json:"description"`
 }
 
+// DefaultContentDenyRules 返回 G4 危险命令默认 deny 规则（针对 bash 命令内容的正则）。
+//
+// 契约溯源：G4 计划——rm -rf /、mkfs、dd if=、curl|sh、git push --force、
+// npm publish、chmod -R 777 / 纳入默认 deny。规则按内容正则匹配 args["command"]，
+// 在 getContentRule 阶段生效，优先级高于一切后续检查（不可被 env 覆盖移除）。
+//
+// 模式设计注意：避免误伤合法命令——
+//   - rm 仅锚定根级/家目录/当前目录裸目标（/、~、.），不误伤 rm -rf ./build、rm -rf /tmp/x
+//   - git push -f 会同时命中 --force/--force-with-lease（前缀匹配）
+func DefaultContentDenyRules() []Rule {
+	return []Rule{
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `rm\s+-[A-Za-z]*([rR][A-Za-z]*[fF]|[fF][A-Za-z]*[rR])[A-Za-z]*\s+(--no-preserve-root\s+)?(/\s|/$|/\*|/home|/etc|/usr|/var|/boot|~\s|~$|~/\*|\.\s|\.$)`,
+			Description: "禁止对根级/家目录/当前目录的递归强制删除"},
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `mkfs(\.|\s|$)`,
+			Description: "禁止文件系统格式化 (mkfs)"},
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `dd\s+[^|]*of=/dev/`,
+			Description: "禁止 dd 直接写块设备"},
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|fi)?sh\b`,
+			Description: "禁止远程脚本管道执行 (curl|sh)"},
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `git\s+push\b[^|]*(--force|-f\b)`,
+			Description: "禁止 git 强制推送 (push --force)"},
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `(npm|yarn|pnpm)\s+publish\b`,
+			Description: "禁止包发布 (npm publish)"},
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `chmod\s+-[A-Za-z]*R[A-Za-z]*\s+(-[A-Za-z]+\s+)*777\s+(/|~|\.)`,
+			Description: "禁止对根级/家目录递归 777 提权"},
+		{ToolName: "bash", RuleBehavior: "deny",
+			Pattern:     `>\s*/dev/sd[a-z]`,
+			Description: "禁止直接覆写块设备 (/dev/sd*)"},
+	}
+}
+
 // DenialRecord tracks a denied tool invocation for fallback analysis.
 // Mirrors Claude Code's denial tracking for the YOLO classifier fallback.
 type DenialRecord struct {
@@ -54,8 +92,8 @@ type DenialRecord struct {
 
 // SafetySystem provides multi-level defense for tool execution.
 // Mirrors Claude Code's permissions.ts + toolHooks.ts architecture.
-// All classification decisions are AI-driven via the YOLO classifier —
-// no hardcoded regex or pattern lists are used for security decisions.
+// 两层防线：G4 默认内容 deny 规则（DefaultContentDenyRules，兜底硬规则）
+// + YOLO 分类器（AI 驱动的弹性分类）。
 type SafetySystem struct {
 	config SafetyConfig
 
@@ -95,6 +133,8 @@ func NewSafetySystem() *SafetySystem {
 		readOnlyTools:  loadReadOnlyToolsFromEnv(),
 		maxDenials:     100,
 	}
+	// G4：默认内容 deny 规则先行装载（先于 env 规则，且不可被 env 移除）
+	s.config.DenyRules = append(s.config.DenyRules, DefaultContentDenyRules()...)
 	s.loadRulesFromEnv()
 	return s
 }
@@ -381,6 +421,10 @@ func (s *SafetySystem) isProtectedPath(path string, rootPath string) bool {
 
 func (s *SafetySystem) getDenyRule(toolName string) *Rule {
 	for i := range s.config.DenyRules {
+		// 带 Pattern 的是内容规则（G4），由 getContentRule 评估，不参与整工具 deny
+		if s.config.DenyRules[i].Pattern != "" {
+			continue
+		}
 		if s.config.DenyRules[i].ToolName == toolName || s.config.DenyRules[i].ToolName == "*" {
 			return &s.config.DenyRules[i]
 		}

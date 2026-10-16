@@ -42,6 +42,8 @@ func (t *BashTool) Execute(ctx context.Context, args map[string]interface{}) (ty
 	if command == "" {
 		return types.ToolResult{}, fmt.Errorf("missing required argument: command")
 	}
+	// G4：进程级沙箱——前插 ulimit 资源限制（TIANCAN_RLIMIT_* 可调/可关）
+	command = wrapWithResourceLimits(command, DefaultResourceLimits())
 	timeoutSec := toInt(args["timeout"], 120)
 	if timeoutSec <= 0 {
 		timeoutSec = 120
