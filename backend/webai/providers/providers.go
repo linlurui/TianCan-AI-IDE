@@ -18,43 +18,33 @@ import (
 	"github.com/linlurui/tiancan-ai-ide/backend/webai/types"
 )
 
-// Login opens a browser for the user to authenticate and captures auth tokens.
-// This requires playwright-go to be installed.
+// Login is retained for API compatibility only; it never actually drove a
+// browser and always returned an error.
+//
+// The real, working implementation is backend/webai/browser.RunLogin, which
+// drives a real Chrome/Chromium through go-rod (pure-Go CDP) — no external Node
+// runtime or driver install involved.
 func Login(providerID string, headless bool, timeout int) (*types.AuthResult, error) {
 	cfg := types.GetProviderConfig(providerID)
 	if cfg == nil {
 		return nil, fmt.Errorf("unknown provider: %s", providerID)
 	}
-
-	// Note: Full Playwright integration requires playwright-go dependency.
-	// This provides the login flow structure; actual browser automation
-	// uses the playwright-community/playwright-go package.
-	//
-	// Usage pattern:
-	//   pw, _ := playwright.Run()
-	//   browser, _ := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Headless: &headless})
-	//   context, _ := browser.NewContext(...)
-	//   page, _ := context.NewPage()
-	//   page.Goto(cfg.LoginURL)
-	//   ... poll cookies until auth detected ...
+	_ = headless
+	_ = timeout
 
 	result := &types.AuthResult{
 		ProviderID: providerID,
 		Extra:      map[string]string{},
 	}
 
-	// The login flow structure (to be used with playwright-go):
-	// 1. Launch browser, navigate to cfg.LoginURL
-	// 2. Poll cookies every 2s until cfg.AuthCookies found
-	// 3. If cfg.CapturesBearer, listen to request headers
-	// 4. Extract provider-specific tokens
-	// 5. Return AuthResult
-
-	return result, fmt.Errorf("login requires playwright-go runtime; use LoginWithBrowser() for full implementation")
+	return result, fmt.Errorf("providers.Login is not implemented; use backend/webai/browser.RunLogin")
 }
 
-// LoginWithBrowser performs login using an existing playwright page.
-// This is the main entry point when you have a browser context already.
+// LoginWithBrowser builds an AuthResult from cookies captured by the rod-driven
+// login flow (backend/webai/browser.RunLogin). Once RunLogin detects that
+// authentication completed, the provider-specific token extraction below is
+// delegated here.
+// This is the main entry point when you have the captured page state already.
 func LoginWithBrowser(providerID string, cookieStr string, userAgent string, extra map[string]string) *types.AuthResult {
 	cfg := types.GetProviderConfig(providerID)
 	if cfg == nil {

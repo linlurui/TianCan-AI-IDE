@@ -3978,9 +3978,9 @@ func (s *Service) LoginWeb(providerID string) error {
 		return fmt.Errorf("未知的 Web 提供商: %s", providerID)
 	}
 
-	// Check if Playwright is available
-	if !browser.IsPlaywrightReady() {
-		log.Printf("ai: Playwright not available, opening default browser as fallback")
+	// Check if a local browser is available (rod drives Chrome/Chromium directly)
+	if !browser.IsBrowserReady() {
+		log.Printf("ai: no local browser available, opening default browser as fallback")
 		// Fallback: open login URL in default browser
 		var cmd *exec.Cmd
 		switch runtime.GOOS {

@@ -170,6 +170,8 @@ func (r *Registry) registerBuiltinTools() {
 	r.Register(&GrepTool{rootPath: r.rootPath})
 	r.Register(&GlobTool{rootPath: r.rootPath})
 	r.Register(&WebFetchTool{})
+	// Browser tool (G13): rod-backed real browser with isTrusted hard wall.
+	r.Register(NewBrowserTool())
 	// Git tools (git_tools.go)
 	r.Register(&GitDiffTool{rootPath: r.rootPath})
 	r.Register(&GitLogTool{rootPath: r.rootPath})
