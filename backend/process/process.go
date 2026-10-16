@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	ossupport "github.com/linlurui/tiancan-ai-ide/backend/internal/ossupport"
 )
 
 // Service manages running project processes.
@@ -255,7 +257,7 @@ func (s *Service) StartProject(rootPath string) error {
 
 	cmd := exec.Command(name, args...)
 	cmd.Dir = rootPath
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ossupport.SetProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动失败: %w", err)
@@ -319,12 +321,12 @@ func tryKillPort(line string) {
 }
 
 func killPGroup(cmd *exec.Cmd) {
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	pgid, err := ossupport.ProcessGroupID(cmd.Process.Pid)
 	if err != nil {
 		cmd.Process.Kill()
 		return
 	}
-	syscall.Kill(-pgid, syscall.SIGKILL)
+	ossupport.KillProcessGroup(pgid, syscall.SIGKILL)
 }
 
 // StopProject kills the running process for the given project.
@@ -486,7 +488,7 @@ func (s *Service) StartProjectWithCmd(rootPath string, cmdStr string) error {
 		cmd := exec.Command(fields[0], fields[1:]...)
 		cmd.Dir = rootPath
 		cmd.Env = baseEnv
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		ossupport.SetProcessGroup(cmd)
 
 		stdoutPipe, _ := cmd.StdoutPipe()
 		stderrPipe, _ := cmd.StderrPipe()

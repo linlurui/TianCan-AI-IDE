@@ -24,6 +24,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
+	ossupport "github.com/linlurui/tiancan-ai-ide/backend/internal/ossupport"
 )
 
 const dlvVersion = "1.24.2"
@@ -516,7 +517,7 @@ func (s *Service) StartGoDebug(rootPath string) (int, error) {
 	newEnv = append(newEnv, "PATH="+debugPath())
 	cmd.Env = newEnv
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ossupport.SetProcessGroup(cmd)
 
 	// Pipe both stdout and stderr so we can forward all dlv/debuggee output.
 	stdoutPipe, _ := cmd.StdoutPipe()
@@ -529,7 +530,7 @@ func (s *Service) StartGoDebug(rootPath string) (int, error) {
 
 	done := make(chan struct{})
 	stderrCh := make(chan string, 256)
-	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
+	pgid, _ := ossupport.ProcessGroupID(cmd.Process.Pid)
 	sess := &debugSession{adapter: AdapterDlv, cmd: cmd, port: dlvPort, done: done, stderrCh: stderrCh, pgid: pgid}
 	s.sessions[rootPath] = sess
 	s.mu.Unlock()
@@ -695,7 +696,7 @@ func (s *Service) StartLldbDapDebug(rootPath string) (int, error) {
 	cmd.Dir = rootPath
 	cmd.Env = os.Environ()
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ossupport.SetProcessGroup(cmd)
 
 	stdoutPipe, _ := cmd.StdoutPipe()
 	stderrPipe, _ := cmd.StderrPipe()
@@ -707,7 +708,7 @@ func (s *Service) StartLldbDapDebug(rootPath string) (int, error) {
 
 	done := make(chan struct{})
 	stderrCh := make(chan string, 256)
-	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
+	pgid, _ := ossupport.ProcessGroupID(cmd.Process.Pid)
 	sess := &debugSession{adapter: AdapterLldbDap, cmd: cmd, port: port, done: done, stderrCh: stderrCh, pgid: pgid}
 	s.sessions[rootPath] = sess
 	s.mu.Unlock()
@@ -810,7 +811,7 @@ func (s *Service) StartDebugpyDebug(rootPath string) (int, error) {
 	cmd.Dir = rootPath
 	cmd.Env = os.Environ()
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ossupport.SetProcessGroup(cmd)
 
 	stdoutPipe, _ := cmd.StdoutPipe()
 	stderrPipe, _ := cmd.StderrPipe()
@@ -822,7 +823,7 @@ func (s *Service) StartDebugpyDebug(rootPath string) (int, error) {
 
 	done := make(chan struct{})
 	stderrCh := make(chan string, 256)
-	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
+	pgid, _ := ossupport.ProcessGroupID(cmd.Process.Pid)
 	sess := &debugSession{adapter: AdapterDebugpy, cmd: cmd, port: port, done: done, stderrCh: stderrCh, pgid: pgid}
 	s.sessions[rootPath] = sess
 	s.mu.Unlock()
@@ -978,7 +979,7 @@ func (s *Service) StartJsDebug(rootPath string) (int, error) {
 	cmd.Dir = rootPath
 	cmd.Env = os.Environ()
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ossupport.SetProcessGroup(cmd)
 
 	stdoutPipe, _ := cmd.StdoutPipe()
 	stderrPipe, _ := cmd.StderrPipe()
@@ -990,7 +991,7 @@ func (s *Service) StartJsDebug(rootPath string) (int, error) {
 
 	done := make(chan struct{})
 	stderrCh := make(chan string, 256)
-	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
+	pgid, _ := ossupport.ProcessGroupID(cmd.Process.Pid)
 	sess := &debugSession{adapter: AdapterJsDebug, cmd: cmd, port: port, done: done, stderrCh: stderrCh, pgid: pgid}
 	s.sessions[rootPath] = sess
 	s.mu.Unlock()
@@ -1107,7 +1108,7 @@ func (s *Service) StartJavaDebug(rootPath string) (int, error) {
 	cmd.Dir = rootPath
 	cmd.Env = os.Environ()
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ossupport.SetProcessGroup(cmd)
 
 	stdoutPipe, _ := cmd.StdoutPipe()
 	stderrPipe, _ := cmd.StderrPipe()
@@ -1119,7 +1120,7 @@ func (s *Service) StartJavaDebug(rootPath string) (int, error) {
 
 	done := make(chan struct{})
 	stderrCh := make(chan string, 256)
-	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
+	pgid, _ := ossupport.ProcessGroupID(cmd.Process.Pid)
 	sess := &debugSession{adapter: AdapterJavaDebug, cmd: cmd, port: port, done: done, stderrCh: stderrCh, pgid: pgid}
 	s.sessions[rootPath] = sess
 	s.mu.Unlock()
@@ -1228,7 +1229,7 @@ func (s *Service) StartDartDebug(rootPath string) (int, error) {
 	cmd.Dir = rootPath
 	cmd.Env = os.Environ()
 	cmd.Stdin = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	ossupport.SetProcessGroup(cmd)
 
 	stdoutPipe, _ := cmd.StdoutPipe()
 	stderrPipe, _ := cmd.StderrPipe()
@@ -1240,7 +1241,7 @@ func (s *Service) StartDartDebug(rootPath string) (int, error) {
 
 	done := make(chan struct{})
 	stderrCh := make(chan string, 256)
-	pgid, _ := syscall.Getpgid(cmd.Process.Pid)
+	pgid, _ := ossupport.ProcessGroupID(cmd.Process.Pid)
 	adapter := AdapterDart
 	sess := &debugSession{adapter: adapter, cmd: cmd, port: port, done: done, stderrCh: stderrCh, pgid: pgid}
 	s.sessions[rootPath] = sess
@@ -1446,7 +1447,7 @@ func (s *Service) killSession(rootPath string, sess *debugSession) {
 	// Always kill the stored process group – this catches the case where dlv has
 	// already exited but its child (the HTTP server) is still running as an orphan.
 	if sess.pgid > 0 {
-		syscall.Kill(-sess.pgid, syscall.SIGKILL) //nolint:errcheck
+		ossupport.KillProcessGroup(sess.pgid, syscall.SIGKILL) //nolint:errcheck
 	}
 	select {
 	case <-sess.done:
