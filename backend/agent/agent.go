@@ -150,7 +150,7 @@ func NewAgent(rootPath string) *Agent {
 		clarifyMaxRounds:  clarify.DefaultMaxRounds(),
 		sandboxMode:       preset.SandboxOn,
 		goalStore:         goal.NewStore(),
-		journalLog:        journal.NewLog(),
+		journalLog:        openSessionJournal(),
 	}
 	// G14/G15: build the live projection over the fresh (empty) session log. NewProjector
 	// replays any pre-existing events, so a log restored from disk replays correctly.
@@ -171,6 +171,20 @@ func NewAgent(rootPath string) *Agent {
 	memorySys.EnsureDirExists()
 
 	return a
+}
+
+// openSessionJournal returns a file-backed session journal when TIANCAN_JOURNAL_PATH
+// is set, otherwise an in-memory log. A failure to open the file (e.g. bad path,
+// permission) silently falls back to an in-memory log so agent construction never
+// breaks because of journaling.
+func openSessionJournal() *journal.Log {
+	if p := os.Getenv("TIANCAN_JOURNAL_PATH"); p != "" {
+		if fl, err := journal.OpenLog(p); err == nil {
+			return fl
+		}
+		// fall back to in-memory on any open error
+	}
+	return journal.NewLog()
 }
 
 // SetProgressCallback sets the callback for agent loop progress reporting.
