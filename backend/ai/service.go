@@ -1279,6 +1279,70 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 		attempts = append(attempts, "Codex CLI 未发现")
 	}
 
+	// Qwen Code（阿里通义千问 CLI，基于 Gemini CLI；支持 -p 非交互模式 + --yolo 自动放行）
+	if bin := findLocalCLI("qwen", filepath.Join(homeDir(), ".local", "bin", "qwen")); bin != "" {
+		s.emitLLMProviderEvent("attempt", "Qwen Code", "正在调用本地 Qwen Code")
+		resp, err := s.chatGenericLocalCLI(ctx, "Qwen Code", bin, 90*time.Second,
+			[]string{"-p", chatMessagesToCLIPrompt(messages), "--yolo"})
+		if err == nil && strings.TrimSpace(resp) != "" {
+			s.emitLLMProviderEvent("success", "Qwen Code", "已返回响应")
+			return resp, nil
+		}
+		s.emitLLMProviderEvent("error", "Qwen Code", formatLLMAttemptError("Qwen Code", resp, err))
+		attempts = append(attempts, formatLLMAttemptError("Qwen Code CLI", resp, err))
+	} else {
+		s.emitLLMProviderEvent("skip", "Qwen Code", "未发现本地命令")
+		attempts = append(attempts, "Qwen Code CLI 未发现")
+	}
+
+	// DeepSeek（本地 DeepSeek CLI / harness；非交互 -p 模式）
+	if bin := findLocalCLI("deepseek"); bin != "" {
+		s.emitLLMProviderEvent("attempt", "DeepSeek", "正在调用本地 DeepSeek CLI")
+		resp, err := s.chatGenericLocalCLI(ctx, "DeepSeek", bin, 90*time.Second,
+			[]string{"-p", chatMessagesToCLIPrompt(messages)})
+		if err == nil && strings.TrimSpace(resp) != "" {
+			s.emitLLMProviderEvent("success", "DeepSeek", "已返回响应")
+			return resp, nil
+		}
+		s.emitLLMProviderEvent("error", "DeepSeek", formatLLMAttemptError("DeepSeek", resp, err))
+		attempts = append(attempts, formatLLMAttemptError("DeepSeek CLI", resp, err))
+	} else {
+		s.emitLLMProviderEvent("skip", "DeepSeek", "未发现本地命令")
+		attempts = append(attempts, "DeepSeek CLI 未发现")
+	}
+
+	// WorkBuddy（codebuddy CLI；非交互 -p 模式 + --yolo 自动放行）
+	if bin := findLocalCLI("codebuddy", filepath.Join(homeDir(), ".local", "bin", "codebuddy")); bin != "" {
+		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (codebuddy)")
+		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 90*time.Second,
+			[]string{"-p", chatMessagesToCLIPrompt(messages), "--yolo"})
+		if err == nil && strings.TrimSpace(resp) != "" {
+			s.emitLLMProviderEvent("success", "WorkBuddy", "已返回响应")
+			return resp, nil
+		}
+		s.emitLLMProviderEvent("error", "WorkBuddy", formatLLMAttemptError("WorkBuddy", resp, err))
+		attempts = append(attempts, formatLLMAttemptError("WorkBuddy CLI", resp, err))
+	} else {
+		s.emitLLMProviderEvent("skip", "WorkBuddy", "未发现本地命令")
+		attempts = append(attempts, "WorkBuddy CLI 未发现")
+	}
+
+	// zcode（本地 zcode CLI；非交互 -p 模式）
+	if bin := findLocalCLI("zcode"); bin != "" {
+		s.emitLLMProviderEvent("attempt", "zcode", "正在调用本地 zcode")
+		resp, err := s.chatGenericLocalCLI(ctx, "zcode", bin, 90*time.Second,
+			[]string{"-p", chatMessagesToCLIPrompt(messages)})
+		if err == nil && strings.TrimSpace(resp) != "" {
+			s.emitLLMProviderEvent("success", "zcode", "已返回响应")
+			return resp, nil
+		}
+		s.emitLLMProviderEvent("error", "zcode", formatLLMAttemptError("zcode", resp, err))
+		attempts = append(attempts, formatLLMAttemptError("zcode CLI", resp, err))
+	} else {
+		s.emitLLMProviderEvent("skip", "zcode", "未发现本地命令")
+		attempts = append(attempts, "zcode CLI 未发现")
+	}
+
 	return "", fmt.Errorf("%s", strings.Join(attempts, "；"))
 }
 
@@ -1774,6 +1838,35 @@ func (s *Service) chatCodexCLI(parent context.Context, messages []ChatMessage) (
 		return strings.TrimSpace(streamOutput), nil
 	}
 	return strings.TrimSpace(string(content)), nil
+}
+
+// chatGenericLocalCLI runs an arbitrary local coding CLI in non-interactive
+// single-shot mode: it feeds the conversation as a prompt, captures the final
+// stdout, and bounds the run with a timeout so a misbehaving CLI cannot hang
+// Auto forever. Discovery and attempt/success/error events are the caller's
+// responsibility. Used for providers that don't yet have a bespoke stream
+// parser (Qwen Code, DeepSeek, WorkBuddy, zcode, ...).
+func (s *Service) chatGenericLocalCLI(ctx context.Context, provider, bin string, timeout time.Duration, args []string) (string, error) {
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	configureCommandCancellation(cmd)
+	cmd.Dir = s.cliWorkDir()
+
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("%s CLI 超时", provider)
+		}
+		return "", fmt.Errorf("%s CLI 执行失败: %w", provider, err)
+	}
+	return strings.TrimSpace(buf.String()), nil
 }
 
 func codexExecApprovalArgs() []string {
