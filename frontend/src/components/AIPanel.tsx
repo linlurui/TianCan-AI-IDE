@@ -16,14 +16,36 @@ export type { ActivityItem, ActivityKind } from "../aiActivity";
 // ─── <think> block component ────────────────────────────────
 function ThinkBlock({ content, streaming, title }: { content: string; streaming?: boolean; title?: string }) {
   const [open, setOpen] = useState(streaming ?? false);
+  const liveRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const displayContent = content.trim() || (streaming ? "正在准备模型和项目上下文..." : "");
+  // 实时思考行：只显示最新一句，单行展示、超出一行隐藏
+  const liveLines = content.split("\n").map((l) => l.trim()).filter(Boolean);
+  const liveText = liveLines.length ? liveLines[liveLines.length - 1] : "";
+  useEffect(() => {
+    // 折叠态：内容更新时快速横向滚动到最新（跑马灯效果）
+    if (streaming && !open && liveRef.current) {
+      liveRef.current.scrollLeft = liveRef.current.scrollWidth;
+    }
+  }, [liveText, streaming, open]);
+  useEffect(() => {
+    // 展开态：流式期间自动滚到最新思考内容
+    if (streaming && open && contentRef.current) {
+      contentRef.current.scrollTop = contentRef.current.scrollHeight;
+    }
+  }, [content, streaming, open]);
   return (
     <div className={`ai-think-block${streaming ? " ai-think-streaming" : ""}`}>
       <button className="ai-think-toggle" onClick={() => setOpen(o => !o)}>
         <span className="ai-think-chevron">{open ? "▾" : "▸"}</span>
         <span>{title || (streaming ? "思考中…" : "思考过程")}</span>
       </button>
-      {open && <div className="ai-think-content">{displayContent}</div>}
+      {streaming && !open && (
+        <div className="ai-think-live" ref={liveRef}>
+          <span>{liveText || "正在准备模型和项目上下文..."}</span>
+        </div>
+      )}
+      {open && <div className="ai-think-content" ref={contentRef}>{displayContent}</div>}
     </div>
   );
 }

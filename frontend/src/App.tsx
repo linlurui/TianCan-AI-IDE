@@ -250,7 +250,21 @@ export default function App() {
       if (!aiRunSourceRef.current) return;
       const data = evt?.data ?? evt;
       const content = String(data?.content || "").trim();
-      if (content) pushAIActivity("thinking", "思考过程", content);
+      if (!content) return;
+      pushAIActivity("thinking", "思考过程", content);
+      // 追加到末尾的 thinking 消息，供「思考中…」下方的单行实时思考条展示
+      setMessages((p) => {
+        const updated = [...p];
+        const last = updated[updated.length - 1];
+        if (last && last.role === "thinking") {
+          updated[updated.length - 1] = { ...last, content: last.content + "\n" + content };
+          return updated;
+        }
+        // 流式回答进行中不打断；否则新开一个思考块
+        if (last && (last.role === "assistant" || last.streaming)) return p;
+        updated.push({ role: "thinking", content });
+        return updated;
+      });
     });
     return () => { off(); offReasoning(); };
   }, [pushAIActivity]);

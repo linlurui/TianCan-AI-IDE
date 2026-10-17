@@ -1302,6 +1302,20 @@ body {
   border-top: 1px solid var(--border-light);
 }
 
+/* 思考中…下方的单行实时思考条：最新一句、超出隐藏、内容更新时快速滚动 */
+.ai-think-live {
+  padding: 3px 10px 5px 22px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  border-top: 1px solid var(--border-light);
+  opacity: 0.9;
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 14px, #000 calc(100% - 26px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 14px, #000 calc(100% - 26px), transparent);
+}
+
 .ai-input-area {
   padding: 16px;
   border-top: none;
