@@ -1255,9 +1255,11 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 	// 实测可用，故排在本地 CLI 档最前，优先命中。
 	if bin := ensureZCodeCLI(); bin != "" {
 		s.emitLLMProviderEvent("attempt", "zcode", "正在调用本地 ZCode (zcode CLI)")
-		// -p 单次非交互；--mode yolo 自动放行（--prompt 默认即 yolo，显式指定更稳）；
-		// --no-color 避免 ANSI 转义混入答案；--cwd 限定工作目录。
-		resp, err := s.chatGenericLocalCLI(ctx, "zcode", bin, 90*time.Second,
+		// 必须带工具定义与工具指令：天蚕是 AI IDE，本地 CLI 档要以 agent 身份
+		// 用各自的原生工具读改项目（与 Claude Code/Codex 档一致）。
+		// zcode 是 agent，项目活耗时较长，故给足超时。
+		// -p 单次非交互；--mode yolo 自动放行；--no-color 避免 ANSI 混入；--cwd 限定目录。
+		resp, err := s.chatGenericLocalCLI(ctx, "zcode", bin, 150*time.Second,
 			[]string{"-p", chatMessagesToCLIPrompt(messages), "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()})
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "zcode", "已返回响应")
@@ -1279,7 +1281,7 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (CodeBuddy CLI)")
 		// -p 非交互打印；--permission-mode bypassPermissions 自动放行避免卡交互；
 		// --no-session-persistence 不落盘；--output-format text 取纯文本答案。
-		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 45*time.Second,
+		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 120*time.Second,
 			[]string{"-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--no-session-persistence", chatMessagesToCLIPrompt(messages)})
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "WorkBuddy", "已返回响应")
@@ -1328,7 +1330,7 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 	// Qwen Code（阿里通义千问 CLI，基于 Gemini CLI；支持 -p 非交互模式 + --yolo 自动放行）
 	if bin := findLocalCLI("qwen", filepath.Join(homeDir(), ".local", "bin", "qwen")); bin != "" {
 		s.emitLLMProviderEvent("attempt", "Qwen Code", "正在调用本地 Qwen Code")
-		resp, err := s.chatGenericLocalCLI(ctx, "Qwen Code", bin, 90*time.Second,
+		resp, err := s.chatGenericLocalCLI(ctx, "Qwen Code", bin, 120*time.Second,
 			[]string{"-p", chatMessagesToCLIPrompt(messages), "--yolo"})
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "Qwen Code", "已返回响应")
@@ -1344,7 +1346,7 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 	// DeepSeek（本地 DeepSeek CLI / harness；非交互 -p 模式）
 	if bin := findLocalCLI("deepseek"); bin != "" {
 		s.emitLLMProviderEvent("attempt", "DeepSeek", "正在调用本地 DeepSeek CLI")
-		resp, err := s.chatGenericLocalCLI(ctx, "DeepSeek", bin, 90*time.Second,
+		resp, err := s.chatGenericLocalCLI(ctx, "DeepSeek", bin, 120*time.Second,
 			[]string{"-p", chatMessagesToCLIPrompt(messages)})
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "DeepSeek", "已返回响应")
