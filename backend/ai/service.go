@@ -1251,6 +1251,28 @@ func (s *Service) ChatLocalCLI(messages []ChatMessage) (string, error) {
 func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (string, error) {
 	var attempts []string
 
+	// WorkBuddy：本机安装的 WorkBuddy.app 内自带 CodeBuddy CLI（bin 名 codebuddy/cbc）。
+	// 放在本地 CLI 档最前，确保优先被尝试、不被 claude/codex 的超时吃掉预算。
+	if bin := findLocalCLI("codebuddy",
+		"/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
+		filepath.Join(homeDir(), ".local", "bin", "codebuddy"),
+	); bin != "" {
+		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (CodeBuddy CLI)")
+		// -p 非交互打印；--permission-mode bypassPermissions 自动放行避免卡交互；
+		// --no-session-persistence 不落盘；--output-format text 取纯文本答案。
+		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 90*time.Second,
+			[]string{"-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--no-session-persistence", chatMessagesToCLIPrompt(messages)})
+		if err == nil && strings.TrimSpace(resp) != "" {
+			s.emitLLMProviderEvent("success", "WorkBuddy", "已返回响应")
+			return resp, nil
+		}
+		s.emitLLMProviderEvent("error", "WorkBuddy", formatLLMAttemptError("WorkBuddy", resp, err))
+		attempts = append(attempts, formatLLMAttemptError("WorkBuddy CLI", resp, err))
+	} else {
+		s.emitLLMProviderEvent("skip", "WorkBuddy", "未发现本地命令")
+		attempts = append(attempts, "WorkBuddy CLI 未发现")
+	}
+
 	if claudePath := findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude")); claudePath != "" {
 		s.emitLLMProviderEvent("attempt", "Claude Code", "正在调用本地 Claude Code，允许它读取当前项目进行分析")
 		resp, err := s.chatClaudeCodeCLI(ctx, messages)
@@ -1309,28 +1331,6 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 	} else {
 		s.emitLLMProviderEvent("skip", "DeepSeek", "未发现本地命令")
 		attempts = append(attempts, "DeepSeek CLI 未发现")
-	}
-
-	// WorkBuddy：本机安装的 WorkBuddy.app 内自带 CodeBuddy CLI（bin 名 codebuddy/cbc）。
-	// 优先 PATH 上的 codebuddy，再回退到 WorkBuddy.app 包内二进制（macOS 常见安装位置）。
-	if bin := findLocalCLI("codebuddy",
-		"/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
-		filepath.Join(homeDir(), ".local", "bin", "codebuddy"),
-	); bin != "" {
-		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (CodeBuddy CLI)")
-		// -p 非交互打印；--permission-mode bypassPermissions 自动放行避免卡交互；
-		// --no-session-persistence 不落盘；--output-format text 取纯文本答案。
-		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 150*time.Second,
-			[]string{"-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--no-session-persistence", chatMessagesToCLIPrompt(messages)})
-		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "WorkBuddy", "已返回响应")
-			return resp, nil
-		}
-		s.emitLLMProviderEvent("error", "WorkBuddy", formatLLMAttemptError("WorkBuddy", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("WorkBuddy CLI", resp, err))
-	} else {
-		s.emitLLMProviderEvent("skip", "WorkBuddy", "未发现本地命令")
-		attempts = append(attempts, "WorkBuddy CLI 未发现")
 	}
 
 	// zcode（本地 zcode CLI；非交互 -p 模式）
@@ -1765,7 +1765,7 @@ func quoteSQLiteIdent(name string) string {
 }
 
 func (s *Service) chatClaudeCodeCLI(parent context.Context, messages []ChatMessage) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, 75*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
 
 	claudePath := findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude"))
@@ -1795,7 +1795,7 @@ func (s *Service) chatClaudeCodeCLI(parent context.Context, messages []ChatMessa
 }
 
 func (s *Service) chatCodexCLI(parent context.Context, messages []ChatMessage) (string, error) {
-	ctx, cancel := context.WithTimeout(parent, 75*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
 
 	codexPath := findLocalCLI("codex", filepath.Join(homeDir(), ".local", "bin", "codex"))
@@ -3383,7 +3383,7 @@ func (s *Service) ChatWithModel(messages []ChatMessage) (string, error) {
 	attempts = append(attempts, formatLLMAttemptError("OpenRelay", resp, err))
 
 	s.emitLLMProviderEvent("attempt", "Claude Code / Codex", "正在尝试本地 CLI")
-	resp, err = callCandidate(150*time.Second, func(ctx context.Context) (string, error) {
+	resp, err = callCandidate(200*time.Second, func(ctx context.Context) (string, error) {
 		return s.chatLocalCLI(ctx, messages)
 	})
 	if err == nil && strings.TrimSpace(resp) != "" {
