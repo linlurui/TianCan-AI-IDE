@@ -26,10 +26,14 @@
 package journal
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -77,6 +81,20 @@ func samePointer(a, b State) bool {
 	return va.Pointer() == vb.Pointer()
 }
 
+// record is one append-only line in a persisted journal file. Exactly one of
+// Event / Anchor is set, discriminated by Type. The file is pure JSON-lines so it
+// can be replayed after a crash without any binary-format coupling.
+type record struct {
+	Type   string  `json:"t"`
+	Event  *Event  `json:"e,omitempty"`
+	Anchor *Anchor `json:"a,omitempty"`
+}
+
+const (
+	recEvent  = "ev"
+	recAnchor = "an"
+)
+
 // Anchor is a periodic snapshot of the projected state at a point in the log. It
 // lets recovery start "one level down" (from this anchor) instead of replaying the
 // entire log from seq 1.
@@ -92,10 +110,138 @@ type Log struct {
 	events  []Event
 	seq     int64
 	anchors []Anchor // stack, oldest first
+
+	// persistence (optional): when file != nil, every append / anchor is also
+	// written as a JSON line so the log can be reopened and replayed after a
+	// crash / restart (see OpenLog). An in-memory log created with NewLog keeps
+	// file == nil and never touches disk.
+	path string
+	file *os.File
 }
 
-// NewLog returns an empty log.
+// NewLog returns an empty, in-memory-only log.
 func NewLog() *Log { return &Log{} }
+
+// OpenLog opens (creating if needed) a persisted journal at path and replays any
+// existing content into memory. The returned Log keeps appending to the same file,
+// so state is durable across restarts and recoverable after a crash. Call Close
+// when done to flush / sync.
+func OpenLog(path string) (*Log, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("journal: open log %s: %w", path, err)
+	}
+	l := &Log{path: path, file: f}
+	if err := l.replayFile(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return l, nil
+}
+
+// Path returns the backing file path, or "" for an in-memory log.
+func (l *Log) Path() string { return l.path }
+
+// Sync flushes the backing file to stable storage, if any.
+func (l *Log) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
+	return l.file.Sync()
+}
+
+// Close flushes and closes the backing file. After Close the Log becomes
+// in-memory only (further appends are not persisted). Safe to call multiple
+// times; returns nil if the log was never bound to a file.
+func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
+	err := l.file.Sync()
+	if cerr := l.file.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	l.file = nil
+	return err
+}
+
+// writeRecord appends r as a single JSON line to the backing file, if any. It must
+// be called while l.mu is held so on-disk order matches in-memory append order. A
+// nil file (in-memory log) is a no-op.
+func (l *Log) writeRecord(r record) error {
+	if l.file == nil {
+		return nil
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("journal: marshal record: %w", err)
+	}
+	if _, err := l.file.Write(append(b, '\n')); err != nil {
+		return fmt.Errorf("journal: write record: %w", err)
+	}
+	return nil
+}
+
+// replayFile reads the backing file from the start and rebuilds the in-memory
+// events / anchors. It tolerates a single truncated / garbage final line (the tail
+// of an interrupted write) by skipping it; mid-file corruption is likewise skipped
+// to stay robust, though a well-formed append-only file never has it.
+func (l *Log) replayFile(f *os.File) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("journal: seek log: %w", err)
+	}
+	rd := bufio.NewReader(f)
+	for {
+		line, err := rd.ReadString('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\n")
+			if trimmed != "" {
+				if perr := l.applyRecordLine(trimmed); perr != nil {
+					if err == io.EOF {
+						// torn final line — safe to ignore
+						return nil
+					}
+					_ = perr // skip other unparseable lines
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("journal: read log: %w", err)
+		}
+	}
+}
+
+func (l *Log) applyRecordLine(line string) error {
+	var r record
+	if err := json.Unmarshal([]byte(line), &r); err != nil {
+		return err
+	}
+	switch r.Type {
+	case recEvent:
+		if r.Event == nil {
+			return errors.New("journal: event record missing event")
+		}
+		l.events = append(l.events, *r.Event)
+		if r.Event.Seq > l.seq {
+			l.seq = r.Event.Seq
+		}
+	case recAnchor:
+		if r.Anchor == nil {
+			return errors.New("journal: anchor record missing anchor")
+		}
+		l.anchors = append(l.anchors, *r.Anchor)
+	default:
+		return fmt.Errorf("journal: unknown record type %q", r.Type)
+	}
+	return nil
+}
 
 // Append creates and appends a new event with the given kind and payload. payload
 // may be nil, a json.RawMessage, or any value that json.Marshal can encode. The
@@ -113,6 +259,9 @@ func (l *Log) Append(kind string, payload interface{}) (Event, error) {
 		Kind:    kind,
 		Payload: raw,
 		Time:    time.Now().UnixMilli(),
+	}
+	if err := l.writeRecord(record{Type: recEvent, Event: &e}); err != nil {
+		return Event{}, err
 	}
 	l.events = append(l.events, e)
 	return e, nil
@@ -168,6 +317,9 @@ func (l *Log) Anchor(snapshot json.RawMessage) (Anchor, error) {
 		coverFrom = l.anchors[n-1].Seq
 	}
 	a := Anchor{Seq: l.seq, CoverFrom: coverFrom, Snapshot: snapshot}
+	if err := l.writeRecord(record{Type: recAnchor, Anchor: &a}); err != nil {
+		return Anchor{}, err
+	}
 	for i := range l.events {
 		if l.events[i].Seq > coverFrom {
 			l.events[i].Refs++
