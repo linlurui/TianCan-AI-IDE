@@ -1260,14 +1260,19 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (CodeBuddy CLI)")
 		// -p 非交互打印；--permission-mode bypassPermissions 自动放行避免卡交互；
 		// --no-session-persistence 不落盘；--output-format text 取纯文本答案。
-		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 90*time.Second,
+		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 45*time.Second,
 			[]string{"-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--no-session-persistence", chatMessagesToCLIPrompt(messages)})
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "WorkBuddy", "已返回响应")
 			return resp, nil
 		}
-		s.emitLLMProviderEvent("error", "WorkBuddy", formatLLMAttemptError("WorkBuddy", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("WorkBuddy CLI", resp, err))
+		// 超时通常意味着 codebuddy 卡在等待交互式登录（未登录时它会静默挂住）。
+		attemptText := formatLLMAttemptError("WorkBuddy CLI", resp, err)
+		if strings.Contains(attemptText, "超时") {
+			attemptText += "（codebuddy 未登录时会静默卡住：请在终端交互登录一次 codebuddy）"
+		}
+		s.emitLLMProviderEvent("error", "WorkBuddy", attemptText)
+		attempts = append(attempts, attemptText)
 	} else {
 		s.emitLLMProviderEvent("skip", "WorkBuddy", "未发现本地命令")
 		attempts = append(attempts, "WorkBuddy CLI 未发现")
