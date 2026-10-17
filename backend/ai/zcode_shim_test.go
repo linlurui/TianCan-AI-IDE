@@ -51,7 +51,8 @@ func TestZCodeCLI_Live(t *testing.T) {
 
 	svc := &Service{}
 	start := time.Now()
-	resp, err := svc.chatGenericLocalCLI(context.Background(), "zcode", bin, 150*time.Second,
+	resp, err := svc.chatGenericLocalCLI(context.Background(), "zcode", bin,
+		cliLimits{FirstOutput: 90 * time.Second, Idle: 150 * time.Second},
 		[]string{"-p", prompt, "--no-color", "--mode", "yolo", "--cwd", svc.cliWorkDir()})
 	elapsed := time.Since(start).Seconds()
 	if err != nil {

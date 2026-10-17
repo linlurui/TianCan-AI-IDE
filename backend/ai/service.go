@@ -1248,117 +1248,174 @@ func (s *Service) ChatLocalCLI(messages []ChatMessage) (string, error) {
 	return s.chatLocalCLI(s.currentRequestContext(), messages)
 }
 
+// ── 本地 CLI 供应商粘性 + 失败熔断 ──────────────────────────────────
+// 把「上次成功的是谁 / 谁最近失败过」持久化到磁盘：Auto 下次优先用上次成功的，
+// 并跳过近期反复失败的（如未登录必挂的 codebuddy），不再让 hopeless 档白吃预算。
+
+type llmProviderState struct {
+	LastSuccessKey string           `json:"lastSuccessKey"`
+	LastSuccessAt  int64            `json:"lastSuccessAt"`
+	Failures       map[string]int64 `json:"failures"`
+}
+
+var llmProviderStateMu sync.Mutex
+
+func llmProviderStatePath() string {
+	return filepath.Join(homeDir(), ".tiancan-ai-ide", "llm-provider-state.json")
+}
+
+func loadLLMProviderState() llmProviderState {
+	state := llmProviderState{Failures: map[string]int64{}}
+	if data, err := os.ReadFile(llmProviderStatePath()); err == nil {
+		_ = json.Unmarshal(data, &state)
+	}
+	if state.Failures == nil {
+		state.Failures = map[string]int64{}
+	}
+	return state
+}
+
+func saveLLMProviderState(state llmProviderState) {
+	if err := os.MkdirAll(filepath.Dir(llmProviderStatePath()), 0o755); err != nil {
+		return
+	}
+	if data, err := json.MarshalIndent(state, "", "  "); err == nil {
+		_ = os.WriteFile(llmProviderStatePath(), data, 0o644)
+	}
+}
+
+func llmRecordSuccess(key string) {
+	llmProviderStateMu.Lock()
+	defer llmProviderStateMu.Unlock()
+	state := loadLLMProviderState()
+	state.LastSuccessKey = key
+	state.LastSuccessAt = time.Now().Unix()
+	delete(state.Failures, key)
+	saveLLMProviderState(state)
+}
+
+func llmRecordFailure(key string) {
+	llmProviderStateMu.Lock()
+	defer llmProviderStateMu.Unlock()
+	state := loadLLMProviderState()
+	state.Failures[key] = time.Now().Unix()
+	saveLLMProviderState(state)
+}
+
+// llmRecentFailure 报告 key 是否在 within 窗口内失败过（熔断窗口）。
+func llmRecentFailure(key string, within time.Duration) bool {
+	llmProviderStateMu.Lock()
+	defer llmProviderStateMu.Unlock()
+	state := loadLLMProviderState()
+	at, ok := state.Failures[key]
+	return ok && time.Since(time.Unix(at, 0)) < within
+}
+
+func llmLastSuccessKey() string {
+	llmProviderStateMu.Lock()
+	defer llmProviderStateMu.Unlock()
+	return loadLLMProviderState().LastSuccessKey
+}
+
+// cliTry 描述本地 CLI 档里的一个候选：key 用于粘性/熔断持久化，label 用于事件展示。
+type cliTry struct {
+	key   string
+	label string
+	run   func(ctx context.Context) (string, error)
+}
+
+var errCLINotFound = fmt.Errorf("未发现本地命令")
+
 func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (string, error) {
+	prompt := chatMessagesToCLIPrompt(messages)
+
+	// 默认顺序即优先级；实际顺序会按「上次成功」粘性动态调整。
+	tries := []cliTry{
+		// zcode：ZCode.app（智谱 Z.ai）自带 CLI，登录态与 ZCode app 共享，实测可用。
+		// 自适应时限：首包 90s；之后只要持续有输出就一直等（agent 跑工具可能长时间静默，
+		// 故空闲阈值放宽到 150s），不再用固定总超时误杀长任务。
+		{key: "zcode", label: "zcode", run: func(c context.Context) (string, error) {
+			bin := ensureZCodeCLI()
+			if bin == "" {
+				return "", errCLINotFound
+			}
+			// -p 单次非交互；--mode yolo 自动放行；--no-color 避免 ANSI 混入；--cwd 限定目录。
+			return s.chatGenericLocalCLI(c, "zcode", bin, cliLimits{FirstOutput: 90 * time.Second, Idle: 150 * time.Second},
+				[]string{"-p", prompt, "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()})
+		}},
+		{key: "claude", label: "Claude Code", run: func(c context.Context) (string, error) {
+			if findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude")) == "" {
+				return "", errCLINotFound
+			}
+			return s.chatClaudeCodeCLI(c, messages)
+		}},
+		{key: "codex", label: "Codex", run: func(c context.Context) (string, error) {
+			if findLocalCLI("codex", filepath.Join(homeDir(), ".local", "bin", "codex")) == "" {
+				return "", errCLINotFound
+			}
+			return s.chatCodexCLI(c, messages)
+		}},
+		// Qwen Code（阿里通义千问 CLI；-p 非交互 + --yolo 自动放行）
+		{key: "qwen", label: "Qwen Code", run: func(c context.Context) (string, error) {
+			bin := findLocalCLI("qwen", filepath.Join(homeDir(), ".local", "bin", "qwen"))
+			if bin == "" {
+				return "", errCLINotFound
+			}
+			return s.chatGenericLocalCLI(c, "Qwen Code", bin, defaultCLILimits, []string{"-p", prompt, "--yolo"})
+		}},
+		// DeepSeek（本地 DeepSeek CLI / harness；-p 非交互）
+		{key: "deepseek", label: "DeepSeek", run: func(c context.Context) (string, error) {
+			bin := findLocalCLI("deepseek")
+			if bin == "" {
+				return "", errCLINotFound
+			}
+			return s.chatGenericLocalCLI(c, "DeepSeek", bin, defaultCLILimits, []string{"-p", prompt})
+		}},
+	}
+
+	// 粘性：上次成功的供应商排最前。
+	ordered := tries
+	if sticky := llmLastSuccessKey(); sticky != "" {
+		for i, tr := range tries {
+			if tr.key == sticky && i > 0 {
+				reordered := []cliTry{tries[i]}
+				reordered = append(reordered, tries[:i]...)
+				reordered = append(reordered, tries[i+1:]...)
+				ordered = reordered
+				break
+			}
+		}
+	}
+
+	// 熔断：冷却窗口内失败过的直接跳过（如未登录必挂的 codebuddy），
+	// 不再白吃整档预算；全部都在冷却期时照常兜底重试。
+	const failureCooldown = 10 * time.Minute
+	runnable := make([]cliTry, 0, len(ordered))
+	for _, tr := range ordered {
+		if llmRecentFailure(tr.key, failureCooldown) {
+			s.emitLLMProviderEvent("skip", tr.label, "近期失败，熔断跳过（稍后自动恢复）")
+			continue
+		}
+		runnable = append(runnable, tr)
+	}
+	if len(runnable) == 0 {
+		runnable = ordered
+	}
+
 	var attempts []string
-
-	// zcode：ZCode.app（智谱 Z.ai）自带 CLI，非交互 -p 模式，登录态与 ZCode app 共享。
-	// 实测可用，故排在本地 CLI 档最前，优先命中。
-	if bin := ensureZCodeCLI(); bin != "" {
-		s.emitLLMProviderEvent("attempt", "zcode", "正在调用本地 ZCode (zcode CLI)")
-		// 必须带工具定义与工具指令：天蚕是 AI IDE，本地 CLI 档要以 agent 身份
-		// 用各自的原生工具读改项目（与 Claude Code/Codex 档一致）。
-		// zcode 是 agent，项目活耗时较长，故给足超时。
-		// -p 单次非交互；--mode yolo 自动放行；--no-color 避免 ANSI 混入；--cwd 限定目录。
-		resp, err := s.chatGenericLocalCLI(ctx, "zcode", bin, 150*time.Second,
-			[]string{"-p", chatMessagesToCLIPrompt(messages), "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()})
+	for _, tr := range runnable {
+		s.emitLLMProviderEvent("attempt", tr.label, "正在调用本地 "+tr.label)
+		resp, err := tr.run(ctx)
 		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "zcode", "已返回响应")
+			llmRecordSuccess(tr.key)
+			s.emitLLMProviderEvent("success", tr.label, "已返回响应")
 			return resp, nil
 		}
-		s.emitLLMProviderEvent("error", "zcode", formatLLMAttemptError("zcode", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("zcode CLI", resp, err))
-	} else {
-		s.emitLLMProviderEvent("skip", "zcode", "未发现 ZCode.app 或 PATH 上的 zcode")
-		attempts = append(attempts, "zcode CLI 未发现")
+		llmRecordFailure(tr.key)
+		text := formatLLMAttemptError(tr.label+" CLI", resp, err)
+		s.emitLLMProviderEvent("error", tr.label, text)
+		attempts = append(attempts, text)
 	}
-
-	// WorkBuddy：本机安装的 WorkBuddy.app 内自带 CodeBuddy CLI（bin 名 codebuddy/cbc）。
-	// 放在本地 CLI 档最前，确保优先被尝试、不被 claude/codex 的超时吃掉预算。
-	if bin := findLocalCLI("codebuddy",
-		"/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
-		filepath.Join(homeDir(), ".local", "bin", "codebuddy"),
-	); bin != "" {
-		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (CodeBuddy CLI)")
-		// -p 非交互打印；--permission-mode bypassPermissions 自动放行避免卡交互；
-		// --no-session-persistence 不落盘；--output-format text 取纯文本答案。
-		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 120*time.Second,
-			[]string{"-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--no-session-persistence", chatMessagesToCLIPrompt(messages)})
-		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "WorkBuddy", "已返回响应")
-			return resp, nil
-		}
-		// 超时通常意味着 codebuddy 卡在等待交互式登录（未登录时它会静默挂住）。
-		attemptText := formatLLMAttemptError("WorkBuddy CLI", resp, err)
-		if strings.Contains(attemptText, "超时") {
-			attemptText += "（codebuddy 未登录时会静默卡住：请在终端交互登录一次 codebuddy）"
-		}
-		s.emitLLMProviderEvent("error", "WorkBuddy", attemptText)
-		attempts = append(attempts, attemptText)
-	} else {
-		s.emitLLMProviderEvent("skip", "WorkBuddy", "未发现本地命令")
-		attempts = append(attempts, "WorkBuddy CLI 未发现")
-	}
-
-	if claudePath := findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude")); claudePath != "" {
-		s.emitLLMProviderEvent("attempt", "Claude Code", "正在调用本地 Claude Code，允许它读取当前项目进行分析")
-		resp, err := s.chatClaudeCodeCLI(ctx, messages)
-		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "Claude Code", "已返回响应")
-			return resp, nil
-		}
-		s.emitLLMProviderEvent("error", "Claude Code", formatLLMAttemptError("Claude Code", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("Claude Code CLI", resp, err))
-	} else {
-		s.emitLLMProviderEvent("skip", "Claude Code", "未发现本地命令")
-		attempts = append(attempts, "Claude Code CLI 未发现")
-	}
-
-	if codexPath := findLocalCLI("codex", filepath.Join(homeDir(), ".local", "bin", "codex")); codexPath != "" {
-		s.emitLLMProviderEvent("attempt", "Codex", "正在调用本地 Codex，允许它读取当前项目进行分析")
-		resp, err := s.chatCodexCLI(ctx, messages)
-		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "Codex", "已返回响应")
-			return resp, nil
-		}
-		s.emitLLMProviderEvent("error", "Codex", formatLLMAttemptError("Codex", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("Codex CLI", resp, err))
-	} else {
-		s.emitLLMProviderEvent("skip", "Codex", "未发现本地命令")
-		attempts = append(attempts, "Codex CLI 未发现")
-	}
-
-	// Qwen Code（阿里通义千问 CLI，基于 Gemini CLI；支持 -p 非交互模式 + --yolo 自动放行）
-	if bin := findLocalCLI("qwen", filepath.Join(homeDir(), ".local", "bin", "qwen")); bin != "" {
-		s.emitLLMProviderEvent("attempt", "Qwen Code", "正在调用本地 Qwen Code")
-		resp, err := s.chatGenericLocalCLI(ctx, "Qwen Code", bin, 120*time.Second,
-			[]string{"-p", chatMessagesToCLIPrompt(messages), "--yolo"})
-		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "Qwen Code", "已返回响应")
-			return resp, nil
-		}
-		s.emitLLMProviderEvent("error", "Qwen Code", formatLLMAttemptError("Qwen Code", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("Qwen Code CLI", resp, err))
-	} else {
-		s.emitLLMProviderEvent("skip", "Qwen Code", "未发现本地命令")
-		attempts = append(attempts, "Qwen Code CLI 未发现")
-	}
-
-	// DeepSeek（本地 DeepSeek CLI / harness；非交互 -p 模式）
-	if bin := findLocalCLI("deepseek"); bin != "" {
-		s.emitLLMProviderEvent("attempt", "DeepSeek", "正在调用本地 DeepSeek CLI")
-		resp, err := s.chatGenericLocalCLI(ctx, "DeepSeek", bin, 120*time.Second,
-			[]string{"-p", chatMessagesToCLIPrompt(messages)})
-		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "DeepSeek", "已返回响应")
-			return resp, nil
-		}
-		s.emitLLMProviderEvent("error", "DeepSeek", formatLLMAttemptError("DeepSeek", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("DeepSeek CLI", resp, err))
-	} else {
-		s.emitLLMProviderEvent("skip", "DeepSeek", "未发现本地命令")
-		attempts = append(attempts, "DeepSeek CLI 未发现")
-	}
-
 	return "", fmt.Errorf("%s", strings.Join(attempts, "；"))
 }
 
@@ -1856,18 +1913,32 @@ func (s *Service) chatCodexCLI(parent context.Context, messages []ChatMessage) (
 	return strings.TrimSpace(string(content)), nil
 }
 
+// cliLimits 本地 CLI 调用的「自适应时限」——不再定死一个总超时：
+//   - FirstOutput：启动后最多等多久必须吐出第一个字节（首包超时）
+//   - Idle：已收到输出后允许的最长静默（停滞超时）
+//
+// 只要 CLI 还在持续输出就一直等，因此长任务（模型慢思考、agent 连跑多个工具）
+// 不会被固定超时误杀；反过来无输出或卡死的 CLI 会很快被判定失败并让位给下一档。
+type cliLimits struct {
+	FirstOutput time.Duration
+	Idle        time.Duration
+}
+
+var defaultCLILimits = cliLimits{FirstOutput: 60 * time.Second, Idle: 90 * time.Second}
+
 // chatGenericLocalCLI runs an arbitrary local coding CLI in non-interactive
-// single-shot mode: it feeds the conversation as a prompt, captures the final
-// stdout, and bounds the run with a timeout so a misbehaving CLI cannot hang
-// Auto forever. Discovery and attempt/success/error events are the caller's
+// single-shot mode: it feeds the conversation as a prompt and captures the final
+// stdout. Progress-based timeouts (first byte + idle) avoid cutting off slow but
+// healthy runs. Discovery and attempt/success/error events are the caller's
 // responsibility. Used for providers that don't yet have a bespoke stream
-// parser (Qwen Code, DeepSeek, WorkBuddy, zcode, ...).
-func (s *Service) chatGenericLocalCLI(ctx context.Context, provider, bin string, timeout time.Duration, args []string) (string, error) {
-	if timeout <= 0 {
-		timeout = 90 * time.Second
+// parser (zcode, Qwen Code, DeepSeek, ...).
+func (s *Service) chatGenericLocalCLI(ctx context.Context, provider, bin string, limits cliLimits, args []string) (string, error) {
+	if limits.FirstOutput <= 0 {
+		limits.FirstOutput = defaultCLILimits.FirstOutput
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	if limits.Idle <= 0 {
+		limits.Idle = defaultCLILimits.Idle
+	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureCommandCancellation(cmd)
@@ -1875,19 +1946,91 @@ func (s *Service) chatGenericLocalCLI(ctx context.Context, provider, bin string,
 
 	// stdout 才是答案；stderr 只作为报错诊断（如 zcode 每次都会往 stderr
 	// 打一条 provider 刷新告警，混入答案会污染 LLM 输出）。
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("%s CLI 超时", provider)
-		}
-		if detail := strings.TrimSpace(stderr.String()); detail != "" {
-			return "", fmt.Errorf("%s CLI 执行失败: %w: %s", provider, err, truncateString(detail, 300))
-		}
-		return "", fmt.Errorf("%s CLI 执行失败: %w", provider, err)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("创建 %s 输出管道失败: %w", provider, err)
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("启动 %s 失败: %w", provider, err)
+	}
+
+	var (
+		mu      sync.Mutex
+		out     bytes.Buffer
+		lastAct = time.Now()
+		gotAny  bool
+		readEnd = make(chan struct{}, 1)
+	)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := stdoutPipe.Read(buf)
+			if n > 0 {
+				mu.Lock()
+				out.Write(buf[:n])
+				lastAct = time.Now()
+				gotAny = true
+				mu.Unlock()
+			}
+			if readErr != nil {
+				readEnd <- struct{}{}
+				return
+			}
+		}
+	}()
+
+	kill := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case waitErr := <-waitDone:
+			<-readEnd
+			mu.Lock()
+			text := out.String()
+			mu.Unlock()
+			if waitErr != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					return "", fmt.Errorf("%s CLI 超时", provider)
+				}
+				if detail := strings.TrimSpace(stderr.String()); detail != "" {
+					return "", fmt.Errorf("%s CLI 执行失败: %w: %s", provider, waitErr, truncateString(detail, 300))
+				}
+				return "", fmt.Errorf("%s CLI 执行失败: %w", provider, waitErr)
+			}
+			return strings.TrimSpace(text), nil
+		case <-ticker.C:
+			mu.Lock()
+			last := lastAct
+			any := gotAny
+			mu.Unlock()
+			if !any && time.Since(last) > limits.FirstOutput {
+				kill()
+				return "", fmt.Errorf("%s CLI 首包超时（%s 内没有任何输出）", provider, limits.FirstOutput)
+			}
+			if any && time.Since(last) > limits.Idle {
+				kill()
+				return "", fmt.Errorf("%s CLI 输出停滞超时（%s 无新输出）", provider, limits.Idle)
+			}
+		case <-ctx.Done():
+			kill()
+			if ctx.Err() == context.DeadlineExceeded {
+				return "", fmt.Errorf("%s CLI 超时", provider)
+			}
+			return "", fmt.Errorf("%s CLI 已停止", provider)
+		}
+	}
 }
 
 // ── zcode 可执行镜像 ────────────────────────────────────────────────
