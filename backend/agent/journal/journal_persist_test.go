@@ -8,6 +8,40 @@ import (
 	"testing"
 )
 
+// TestAppendRollsBackOnWriteFailure is a 反证 that a failed disk write does NOT
+// advance in-memory state: after the failure, HeadSeq and Len are unchanged and a
+// subsequent successful Append reuses the same seq (the committed fix must roll
+// back l.seq). This guards the "disk is the source of truth" invariant.
+func TestAppendRollsBackOnWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	l, err := OpenLog(filepath.Join(dir, "rollback.log"))
+	if err != nil {
+		t.Fatalf("OpenLog: %v", err)
+	}
+	if _, err := l.Append("ok", nil); err != nil {
+		t.Fatalf("first Append: %v", err)
+	}
+	beforeSeq := l.HeadSeq()
+	beforeLen := l.Len()
+	if beforeSeq != 1 || beforeLen != 1 {
+		t.Fatalf("setup: want HeadSeq=1 Len=1, got seq=%d len=%d", beforeSeq, beforeLen)
+	}
+
+	// Force the backing fd into a closed (unwritable) state without niling it.
+	if err := l.file.Close(); err != nil {
+		t.Fatalf("close underlying fd: %v", err)
+	}
+	if _, err := l.Append("fail", nil); err == nil {
+		t.Fatal("expected Append to fail after fd closed, got nil")
+	}
+	if l.HeadSeq() != beforeSeq {
+		t.Fatalf("HeadSeq advanced on failed Append: got %d want %d", l.HeadSeq(), beforeSeq)
+	}
+	if l.Len() != beforeLen {
+		t.Fatalf("Len grew on failed Append: got %d want %d", l.Len(), beforeLen)
+	}
+}
+
 // testState is a minimal State used by the persistence tests. It folds "turn" /
 // "step" events and round-trips via PureJSON/LoadJSON, returning the same pointer
 // (satisfying the same-pointer invariant).

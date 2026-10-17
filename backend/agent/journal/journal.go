@@ -261,6 +261,7 @@ func (l *Log) Append(kind string, payload interface{}) (Event, error) {
 		Time:    time.Now().UnixMilli(),
 	}
 	if err := l.writeRecord(record{Type: recEvent, Event: &e}); err != nil {
+		l.seq-- // roll back: keep in-memory counters consistent with disk (nothing persisted)
 		return Event{}, err
 	}
 	l.events = append(l.events, e)
@@ -534,10 +535,11 @@ func (p *Projector) RecoverTo(seq int64) error {
 		}
 		seq = anch.Seq
 	}
+	anchors := p.log.Anchors()
 	var target *Anchor
-	for i := range p.log.anchors {
-		if p.log.anchors[i].Seq == seq {
-			target = &p.log.anchors[i]
+	for i := range anchors {
+		if anchors[i].Seq == seq {
+			target = &anchors[i]
 			break
 		}
 	}
