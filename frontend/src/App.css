@@ -7658,3 +7658,94 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ── 项目记忆工具条（会话持久化 / 锚点 / 审计 / 回退 / 红线 / 召回） ── */
+.sess-bar {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary, transparent);
+  padding: 4px 8px;
+  flex-shrink: 0;
+}
+.sess-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.sess-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sess-btn:hover { background: var(--hover, rgba(127,127,127,.14)); color: var(--text); }
+.sess-btn.active { background: var(--hover, rgba(127,127,127,.18)); color: var(--text); border-color: var(--border); }
+.sess-meta { font-size: 10px; color: var(--text-muted); margin-left: auto; white-space: nowrap; }
+.sess-spin { animation: spin 1s linear infinite; color: var(--text-muted); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.sess-err { font-size: 11px; color: var(--danger, #e05252); padding: 3px 2px; }
+.sess-panel {
+  margin-top: 4px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+  background: var(--bg-tertiary, rgba(127,127,127,.05));
+}
+.sess-panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; color: var(--text-secondary); margin-bottom: 4px;
+}
+.sess-item {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; padding: 2px 0; color: var(--text);
+}
+.sess-seq { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-muted); font-size: 10px; }
+.sess-title { font-weight: 600; }
+.sess-preview { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+.sess-dim { font-size: 10px; color: var(--text-muted); white-space: nowrap; }
+.sess-empty { font-size: 11px; color: var(--text-muted); padding: 4px 2px; }
+.sess-mini {
+  font-size: 10px; padding: 2px 6px; border-radius: 4px;
+  border: 1px solid var(--border); background: transparent; color: var(--text-secondary); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 3px; white-space: nowrap;
+}
+.sess-mini:hover { background: var(--hover, rgba(127,127,127,.14)); color: var(--text); }
+.sess-mini:disabled { opacity: .45; cursor: default; }
+.sess-mini.danger { color: var(--danger, #e05252); border-color: var(--danger, #e05252); }
+.sess-dot { color: var(--accent, #4c8dff); }
+.sess-audit { max-height: 180px; overflow: auto; }
+.sess-audit-row { border-bottom: 1px dashed var(--border); }
+.sess-kind {
+  font-size: 10px; padding: 0 4px; border-radius: 3px;
+  background: var(--hover, rgba(127,127,127,.16)); color: var(--text-secondary);
+}
+.sess-role { font-size: 10px; color: var(--accent, #4c8dff); }
+.sess-red.sev-hard .sess-preview { color: var(--danger, #e05252); }
+.sess-red.sev-soft .sess-preview { color: #d9a441; }
+.sess-add { display: flex; gap: 4px; margin-bottom: 4px; }
+.sess-add input {
+  flex: 1; font-size: 11px; padding: 3px 6px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.sess-score {
+  font-size: 10px; font-weight: 600; color: var(--accent, #4c8dff);
+  min-width: 30px; text-align: right;
+}
+.sess-hit { border-bottom: 1px dashed var(--border); }
+.sess-warn { font-size: 10px; color: #d9a441; padding: 2px 0; }
+.sess-pre {
+  font-size: 10px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  max-height: 160px; overflow: auto; margin: 4px 0 0;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px;
+  color: var(--text-secondary);
+}

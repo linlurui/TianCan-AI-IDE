@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/ctxsvc"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
 	"github.com/linlurui/tiancan-ai-ide/backend/ai"
 	"github.com/linlurui/tiancan-ai-ide/backend/config"
@@ -34,6 +35,7 @@ func main() {
 	aiService := ai.NewService()
 	winManager := window.NewManager()
 	pwService := playwright.NewService()
+	ctxService := ctxsvc.NewService()
 
 	app := application.New(application.Options{
 		Name:        "TianCan AI IDE",
@@ -61,6 +63,8 @@ func main() {
 			application.NewService(agent.NewRollbackBindings(project.GetProjectRoot())),
 			// Task service - exposes task tracking and apply/reject APIs to frontend
 			application.NewService(agent.NewTaskBindings()),
+			// Context service - 项目级会话持久化 + 语义召回 + 提示词装配（P0/P1/P2）
+			application.NewService(ctxService),
 		},
 		Assets: application.AssetOptions{
 			Handler: buildAssetHandler(),

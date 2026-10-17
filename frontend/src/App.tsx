@@ -36,6 +36,7 @@ import type { ModelSource } from "./components/AIPanel";
 import PermissionConfirmModal, { type PermissionRequest } from "./components/PermissionConfirmModal";
 import { applyExtensionContributes } from "./extensions/contributes";
 import { RunSetup } from "./bindings/project";
+import { SessionAppend, SessionMessages, type MsgView } from "./bindings/ctxsvc";
 import { Project, ProjectType } from "./types";
 import { RevealSignal } from "./components/FileTree";
 import TerminalPanel from "./components/TerminalPanel";
@@ -268,6 +269,89 @@ export default function App() {
     });
     return () => { off(); offReasoning(); };
   }, [pushAIActivity]);
+
+  // ── 项目级会话持久化（P0）：消息不再只活在前端内存 ──────────────────────
+  // 每条落定的 user/assistant 消息都会追加到后端 journal；重启后从后端恢复；
+  // 回退后也以后端为准重新加载。去重靠内容键，避免流式期间重复写入。
+  const persistedRef = React.useRef<Set<string>>(new Set());
+  // 后端水位线：后端已有的前 N 条消息不必再写入。只靠"内容键"去重不够稳 ——
+  // 前端 localStorage 与后端各存一份，两份内容可能有细微差异（流式拼接 vs 落库），
+  // 于是同一条消息会被判成两条，每次重启都翻倍。水位线 + 内容键双保险。
+  const baselineRef = React.useRef(0);
+  // 恢复闸门：后端历史还没取回来之前不能写入，否则会把前端已有的整段历史
+  // 当成"新消息"再写一遍（持久化 effect 是同步的，必然抢在 await 之前跑完）。
+  const restoredRef = React.useRef(false);
+  const msgKey = (m: { role: string; content: string }) =>
+    `${m.role}|${m.content.length}|${m.content.slice(0, 120)}`;
+
+  const reloadSessionMessages = React.useCallback(async (root: string, force: boolean) => {
+    if (!root) return;
+    try {
+      const rows: MsgView[] = await SessionMessages(root, "main", 0);
+      if (!rows?.length) return;
+      const restored: Message[] = rows.map((m) => ({ role: m.role as Message["role"], content: m.content }));
+      restored.forEach((m) => {
+        if (m.role === "user" || m.role === "assistant") persistedRef.current.add(msgKey(m));
+      });
+      // 回退后后端消息变少，水位线必须跟着降，否则新消息会被误判为"已写入"。
+      if (force) baselineRef.current = rows.length;
+      else if (rows.length > baselineRef.current) baselineRef.current = rows.length;
+      setMessages((prev) => (force || prev.length === 0 ? restored : prev));
+    } catch {
+      // 会话尚不存在（首次打开项目）：忽略，首次发消息时会创建
+    }
+  }, []);
+
+  // 切换/打开项目时从后端恢复历史
+  React.useEffect(() => {
+    const root = project.activeProject?.rootPath ?? "";
+    if (!root) return;
+    let alive = true;
+    restoredRef.current = false;
+    void (async () => {
+      try {
+        const rows: MsgView[] = await SessionMessages(root, "main", 0);
+        if (!alive) return;
+        if (!rows?.length) { restoredRef.current = true; return; }
+        const restored: Message[] = rows.map((m) => ({ role: m.role as Message["role"], content: m.content }));
+        restored.forEach((m) => {
+          if (m.role === "user" || m.role === "assistant") persistedRef.current.add(msgKey(m));
+        });
+        // 后端已有这些消息，抬高水位线，避免重启时被重复写入后端。
+        if (rows.length > baselineRef.current) baselineRef.current = rows.length;
+        setMessages((prev) => (prev.length ? prev : restored));
+      } catch {
+        // 会话尚不存在或后端不可用：忽略，首次发消息时会创建
+      } finally {
+        if (alive) restoredRef.current = true;
+      }
+    })();
+    return () => { alive = false; };
+  }, [project.activeProject?.rootPath]);
+
+  // 落定的消息写入后端（覆盖 auto / local / api / web 全部链路）
+  React.useEffect(() => {
+    const root = project.activeProject?.rootPath ?? "";
+    if (!root) return;
+    if (!restoredRef.current) return; // 等后端历史取回来，避免整段重复写入
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.streaming) continue;
+      if (m.role !== "user" && m.role !== "assistant") continue;
+      if (!m.content.trim()) continue;
+      const k = msgKey(m);
+      if (i < baselineRef.current) {
+        // 后端已经存在这一段（上次运行留下的），只登记不重写。
+        persistedRef.current.add(k);
+        continue;
+      }
+      if (persistedRef.current.has(k)) continue;
+      persistedRef.current.add(k);
+      void SessionAppend(root, "main", m.role, m.content).catch(() => {
+        persistedRef.current.delete(k); // 失败则允许下次重试
+      });
+    }
+  }, [messages, project.activeProject?.rootPath]);
 
   useEffect(() => {
     const off = Events.On("ai:model-stream", (evt: any) => {
@@ -1045,7 +1129,12 @@ export default function App() {
             ) : null}
           />
         ) : (
-          <AIPanel messages={messages} contextToAppend={aiContextSignal} onSend={async (text, source: ModelSource) => {
+          <AIPanel
+            messages={messages}
+            contextToAppend={aiContextSignal}
+            projectRoot={project.activeProject?.rootPath ?? ""}
+            onRollback={(seq) => { void reloadSessionMessages(project.activeProject?.rootPath ?? "", true); }}
+            onSend={async (text, source: ModelSource) => {
             if (text === "__clear__") {
               // Cleanup any active stream listener
               if (streamRef.current) { Events.Off("agent:stream"); streamRef.current = null; }

@@ -10,6 +10,7 @@ import {
 } from "@bindings/ai";
 import type { APIProviderConfig, WebProviderInfo } from "@bindings/ai";
 import SubAgentProgressPanel from "./SubAgentProgress";
+import SessionMemoryBar from "./SessionMemoryBar";
 import { describeTool, type ActivityItem, type ActivityKind } from "../aiActivity";
 export type { ActivityItem, ActivityKind } from "../aiActivity";
 
@@ -133,6 +134,10 @@ interface AIPanelProps {
   fullWidth?: boolean;
   contextToAppend?: { id: number; text: string } | null;
   activityItems?: ActivityItem[];
+  /** 项目根路径：有值时聊天框显示「项目记忆」工具条（锚点/审计/回退/红线/召回/提示词） */
+  projectRoot?: string;
+  /** 回退成功后通知上层刷新消息列表 */
+  onRollback?: (seq: number) => void;
 }
 
 function ActivityIcon({ kind }: { kind: ActivityKind }) {
@@ -229,7 +234,7 @@ function AIActivityTimeline({ items, isLoading }: { items: ActivityItem[]; isLoa
   );
 }
 
-export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth, contextToAppend, activityItems = [] }: AIPanelProps) {
+export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth, contextToAppend, activityItems = [], projectRoot, onRollback }: AIPanelProps) {
   const [input, setInput] = React.useState("");
   const [source, setSource] = useState<ModelSource>(() => (localStorage.getItem("ai_source") as ModelSource) || "auto");
   const [routeInfo, setRouteInfo] = useState<{ tier: string; reason: string } | null>(null);
@@ -850,6 +855,15 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
           </div>
         </div>
       )}
+
+      {projectRoot ? (
+        <SessionMemoryBar
+          projectRoot={projectRoot}
+          sessionID="main"
+          input={input}
+          onRollback={(seq) => onRollback?.(seq)}
+        />
+      ) : null}
 
       <div className="ai-messages">
         {installLogs.length > 0 && (
