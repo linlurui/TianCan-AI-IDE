@@ -1251,6 +1251,25 @@ func (s *Service) ChatLocalCLI(messages []ChatMessage) (string, error) {
 func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (string, error) {
 	var attempts []string
 
+	// zcode：ZCode.app（智谱 Z.ai）自带 CLI，非交互 -p 模式，登录态与 ZCode app 共享。
+	// 实测可用，故排在本地 CLI 档最前，优先命中。
+	if bin := ensureZCodeCLI(); bin != "" {
+		s.emitLLMProviderEvent("attempt", "zcode", "正在调用本地 ZCode (zcode CLI)")
+		// -p 单次非交互；--mode yolo 自动放行（--prompt 默认即 yolo，显式指定更稳）；
+		// --no-color 避免 ANSI 转义混入答案；--cwd 限定工作目录。
+		resp, err := s.chatGenericLocalCLI(ctx, "zcode", bin, 90*time.Second,
+			[]string{"-p", chatMessagesToCLIPrompt(messages), "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()})
+		if err == nil && strings.TrimSpace(resp) != "" {
+			s.emitLLMProviderEvent("success", "zcode", "已返回响应")
+			return resp, nil
+		}
+		s.emitLLMProviderEvent("error", "zcode", formatLLMAttemptError("zcode", resp, err))
+		attempts = append(attempts, formatLLMAttemptError("zcode CLI", resp, err))
+	} else {
+		s.emitLLMProviderEvent("skip", "zcode", "未发现 ZCode.app 或 PATH 上的 zcode")
+		attempts = append(attempts, "zcode CLI 未发现")
+	}
+
 	// WorkBuddy：本机安装的 WorkBuddy.app 内自带 CodeBuddy CLI（bin 名 codebuddy/cbc）。
 	// 放在本地 CLI 档最前，确保优先被尝试、不被 claude/codex 的超时吃掉预算。
 	if bin := findLocalCLI("codebuddy",
@@ -1336,22 +1355,6 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 	} else {
 		s.emitLLMProviderEvent("skip", "DeepSeek", "未发现本地命令")
 		attempts = append(attempts, "DeepSeek CLI 未发现")
-	}
-
-	// zcode（本地 zcode CLI；非交互 -p 模式）
-	if bin := findLocalCLI("zcode"); bin != "" {
-		s.emitLLMProviderEvent("attempt", "zcode", "正在调用本地 zcode")
-		resp, err := s.chatGenericLocalCLI(ctx, "zcode", bin, 90*time.Second,
-			[]string{"-p", chatMessagesToCLIPrompt(messages)})
-		if err == nil && strings.TrimSpace(resp) != "" {
-			s.emitLLMProviderEvent("success", "zcode", "已返回响应")
-			return resp, nil
-		}
-		s.emitLLMProviderEvent("error", "zcode", formatLLMAttemptError("zcode", resp, err))
-		attempts = append(attempts, formatLLMAttemptError("zcode CLI", resp, err))
-	} else {
-		s.emitLLMProviderEvent("skip", "zcode", "未发现本地命令")
-		attempts = append(attempts, "zcode CLI 未发现")
 	}
 
 	return "", fmt.Errorf("%s", strings.Join(attempts, "；"))
@@ -1868,16 +1871,79 @@ func (s *Service) chatGenericLocalCLI(ctx context.Context, provider, bin string,
 	configureCommandCancellation(cmd)
 	cmd.Dir = s.cliWorkDir()
 
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// stdout 才是答案；stderr 只作为报错诊断（如 zcode 每次都会往 stderr
+	// 打一条 provider 刷新告警，混入答案会污染 LLM 输出）。
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return "", fmt.Errorf("%s CLI 超时", provider)
 		}
+		if detail := strings.TrimSpace(stderr.String()); detail != "" {
+			return "", fmt.Errorf("%s CLI 执行失败: %w: %s", provider, err, truncateString(detail, 300))
+		}
 		return "", fmt.Errorf("%s CLI 执行失败: %w", provider, err)
 	}
-	return strings.TrimSpace(buf.String()), nil
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// ── zcode 可执行镜像 ────────────────────────────────────────────────
+// ZCode.app 包内的 zcode.cjs 会依据自身路径「向上 5 级」定位
+// config/provider/zcode-builtin.json，而它在包内只比 Resources 深 1 级，
+// 直接调用必然报「无法定位 CLI ZCode Built-in Provider Config」。
+// 这里在用户目录重建符合其期望深度的目录结构。刻意不去修改 app 包本身：
+// 改动 /Applications/*.app 内容会破坏 macOS 代码签名，导致 app 无法启动。
+
+const zcodeAppResources = "/Applications/ZCode.app/Contents/Resources"
+
+// ensureZCodeCLI 准备好可被调用的 zcode 入口，返回可执行路径；不可用时返回 ""。
+func ensureZCodeCLI() string {
+	srcCLI := filepath.Join(zcodeAppResources, "glm", "zcode.cjs")
+	srcCfg := filepath.Join(zcodeAppResources, "config", "provider", "zcode-builtin.json")
+	if !fileExists(srcCLI) || !fileExists(srcCfg) {
+		// 未安装 ZCode.app 时，回退到 PATH 上独立安装的 zcode。
+		return findLocalCLI("zcode")
+	}
+	root := filepath.Join(homeDir(), ".tiancan-ai-ide", "zcode-shim")
+	dstCLI := filepath.Join(root, "a", "b", "c", "d", "e", "zcode.cjs")
+	dstCfg := filepath.Join(root, "config", "provider", "zcode-builtin.json")
+	if err := copyFileIfNewer(srcCfg, dstCfg); err != nil {
+		return findLocalCLI("zcode")
+	}
+	if err := copyFileIfNewer(srcCLI, dstCLI); err != nil {
+		return findLocalCLI("zcode")
+	}
+	return dstCLI
+}
+
+// copyFileIfNewer 仅当目标缺失或源文件更新时复制，使镜像随 ZCode 升级自动刷新。
+func copyFileIfNewer(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if dstInfo, err := os.Stat(dst); err == nil && !dstInfo.IsDir() &&
+		!srcInfo.ModTime().After(dstInfo.ModTime()) && srcInfo.Size() == dstInfo.Size() {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func codexExecApprovalArgs() []string {
