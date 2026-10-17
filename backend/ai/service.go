@@ -1311,11 +1311,17 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 		attempts = append(attempts, "DeepSeek CLI 未发现")
 	}
 
-	// WorkBuddy（codebuddy CLI；非交互 -p 模式 + --yolo 自动放行）
-	if bin := findLocalCLI("codebuddy", filepath.Join(homeDir(), ".local", "bin", "codebuddy")); bin != "" {
-		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (codebuddy)")
-		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 90*time.Second,
-			[]string{"-p", chatMessagesToCLIPrompt(messages), "--yolo"})
+	// WorkBuddy：本机安装的 WorkBuddy.app 内自带 CodeBuddy CLI（bin 名 codebuddy/cbc）。
+	// 优先 PATH 上的 codebuddy，再回退到 WorkBuddy.app 包内二进制（macOS 常见安装位置）。
+	if bin := findLocalCLI("codebuddy",
+		"/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
+		filepath.Join(homeDir(), ".local", "bin", "codebuddy"),
+	); bin != "" {
+		s.emitLLMProviderEvent("attempt", "WorkBuddy", "正在调用本地 WorkBuddy (CodeBuddy CLI)")
+		// -p 非交互打印；--permission-mode bypassPermissions 自动放行避免卡交互；
+		// --no-session-persistence 不落盘；--output-format text 取纯文本答案。
+		resp, err := s.chatGenericLocalCLI(ctx, "WorkBuddy", bin, 150*time.Second,
+			[]string{"-p", "--output-format", "text", "--permission-mode", "bypassPermissions", "--no-session-persistence", chatMessagesToCLIPrompt(messages)})
 		if err == nil && strings.TrimSpace(resp) != "" {
 			s.emitLLMProviderEvent("success", "WorkBuddy", "已返回响应")
 			return resp, nil
