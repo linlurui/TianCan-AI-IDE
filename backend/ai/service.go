@@ -1339,9 +1339,19 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 			if bin == "" {
 				return "", errCLINotFound
 			}
+			// zcode 没有 --provider 参数，用哪个凭证取决于它的 providerOrder。
+			// 并发探一遍所有凭证，把最快可用的顶上去，避免卡在已挂掉的那个上
+			// （曾出现某自建中转平均 243s 才响应，直接把整档拖到首包超时）。
+			preferZCodeCredential()
+			// 先建立日志基线：zcode 跑 agent loop 的工具阶段 stdout 会静默，
+			// 但它在持续写自己的运行日志，用它判断「还在干活」而非「卡死」。
+			activity := newZCodeActivityMonitor()
 			// -p 单次非交互；--mode yolo 自动放行；--no-color 避免 ANSI 混入；--cwd 限定目录。
-			return s.chatGenericLocalCLI(c, "zcode", bin, cliLimits{FirstOutput: 90 * time.Second, Idle: 150 * time.Second},
-				[]string{"-p", prompt, "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()})
+			return s.chatGenericLocalCLI(c, "zcode", bin, cliLimits{
+				FirstOutput: 120 * time.Second,
+				Idle:        150 * time.Second,
+				Liveness:    activity.LastActive,
+			}, []string{"-p", prompt, "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()})
 		}},
 		{key: "claude", label: "Claude Code", run: func(c context.Context) (string, error) {
 			if findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude")) == "" {
@@ -1922,6 +1932,13 @@ func (s *Service) chatCodexCLI(parent context.Context, messages []ChatMessage) (
 type cliLimits struct {
 	FirstOutput time.Duration
 	Idle        time.Duration
+	// Liveness 是可选的「进程还活着」外部信号源，返回最近一次观察到该 CLI
+	// 仍在活动的时刻（零值表示未知）。
+	//
+	// 有些 CLI（如 zcode）跑 agent loop 的工具阶段时 stdout 会长时间静默，
+	// 但它们同时在写自己的运行日志。只看 stdout 会把这段正常静默误判成卡死，
+	// 因此允许提供一个外部活跃信号参与超时判定。
+	Liveness func() time.Time
 }
 
 var defaultCLILimits = cliLimits{FirstOutput: 60 * time.Second, Idle: 90 * time.Second}
@@ -2015,6 +2032,13 @@ func (s *Service) chatGenericLocalCLI(ctx context.Context, provider, bin string,
 			last := lastAct
 			any := gotAny
 			mu.Unlock()
+			// 活跃度外检：agent loop 的工具阶段 stdout 会静默，但进程本身在干活。
+			// 此时以外部活跃信号为准，避免把正常静默期误判成卡死。
+			if limits.Liveness != nil {
+				if live := limits.Liveness(); live.After(last) {
+					last = live
+				}
+			}
 			if !any && time.Since(last) > limits.FirstOutput {
 				kill()
 				return "", fmt.Errorf("%s CLI 首包超时（%s 内没有任何输出）", provider, limits.FirstOutput)
