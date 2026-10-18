@@ -1114,6 +1114,14 @@ body {
   filter: drop-shadow(0 0 20px rgba(139, 124, 247, 0.6)) drop-shadow(0 0 40px rgba(168, 85, 247, 0.4));
 }
 
+.ai-messages-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
 .ai-messages {
   flex: 1;
   overflow-y: auto;
@@ -7748,4 +7756,568 @@ body {
   max-height: 160px; overflow: auto; margin: 4px 0 0;
   background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px;
   color: var(--text-secondary);
+}
+
+/* ── 侧边锚点刻度条（Codex 风格） ─────────────────────────────
+   绝对定位在 .ai-messages-wrap 上，故不随消息内容滚动，始终可见。
+   刻度点按锚点 seq 在消息流里的相对位置摆放，与它代表的消息齐平。 */
+.anchor-rail {
+  position: absolute;
+  top: 16px;
+  bottom: 16px;
+  right: 18px;
+  width: 14px;
+  z-index: 6;
+  pointer-events: none;
+}
+
+.anchor-rail-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--border, #3c3c3c);
+  opacity: 0.55;
+}
+
+/* 刻度就是刻度：一轮对话一个点，所有点长得一模一样。
+   系统的内部存储点不参与渲染（见 AnchorTimeline 的 kind==="turn" 过滤），
+   所以这里不需要任何分型样式。 */
+.anchor-tick {
+  position: absolute;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  padding: 0;
+  border: 1px solid var(--accent, #007acc);
+  border-radius: 50%;
+  background: var(--accent, #007acc);
+  cursor: pointer;
+  pointer-events: auto;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+
+.anchor-tick:hover,
+.anchor-tick.hot {
+  transform: scale(1.5);
+}
+
+/* 已归档的工作单元：不再带入上下文，视觉上退后 */
+.anchor-tick.archived {
+  border-color: var(--text-muted, #858585);
+  background: var(--bg-tertiary, #333333);
+  opacity: 0.55;
+}
+
+.anchor-tick.archived:hover,
+.anchor-tick.archived.hot {
+  opacity: 1;
+}
+
+.anchor-tip {
+  position: absolute;
+  right: 20px;
+  top: 0;
+  min-width: 150px;
+  max-width: 230px;
+  padding: 7px 9px;
+  border: 1px solid var(--border, #3c3c3c);
+  border-radius: 6px;
+  background: var(--bg-tertiary, #333333);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  z-index: 7;
+}
+
+.anchor-tip-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary, #cccccc);
+  margin-bottom: 3px;
+}
+
+.anchor-tip-meta {
+  font-size: 10px;
+  color: var(--text-secondary, #969696);
+}
+
+.anchor-tip-dim {
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--text-muted, #858585);
+}
+
+.anchor-menu {
+  position: fixed;
+  min-width: 168px;
+  padding: 4px;
+  border: 1px solid var(--border, #3c3c3c);
+  border-radius: 7px;
+  background: var(--bg-tertiary, #333333);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.45);
+  z-index: 60;
+}
+
+.anchor-menu-head {
+  padding: 5px 7px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted, #858585);
+  border-bottom: 1px solid var(--border, #3c3c3c);
+  margin-bottom: 3px;
+}
+
+.anchor-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-primary, #cccccc);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.anchor-menu-item:hover:not(:disabled) {
+  background: var(--bg-hover, #2a2d2e);
+}
+
+.anchor-menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.anchor-menu-item.danger {
+  color: #ff7b72;
+}
+
+/* 锚点审计浮层 */
+.anchor-audit {
+  position: fixed;
+  right: 24px;
+  bottom: 120px;
+  width: 340px;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border, #3c3c3c);
+  border-radius: 8px;
+  background: var(--bg-tertiary, #333333);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+  z-index: 61;
+}
+
+.anchor-audit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary, #cccccc);
+  border-bottom: 1px solid var(--border, #3c3c3c);
+}
+
+.anchor-audit-close {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted, #858585);
+  cursor: pointer;
+  padding: 2px;
+  display: flex;
+}
+
+.anchor-audit-body {
+  overflow-y: auto;
+  padding: 6px 8px 8px;
+}
+
+.anchor-audit-empty {
+  padding: 10px;
+  font-size: 11px;
+  color: var(--text-muted, #858585);
+  text-align: center;
+}
+
+.anchor-audit-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 3px;
+  font-size: 11px;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.12);
+}
+
+.anchor-audit-seq {
+  color: var(--accent, #007acc);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.anchor-audit-kind {
+  flex-shrink: 0;
+  color: var(--text-secondary, #969696);
+}
+
+.anchor-audit-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary, #cccccc);
+}
+
+.anchor-audit-time {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-muted, #858585);
+}
+
+/* 点击刻度后短暂高亮被定位到的消息 */
+.ai-message.anchor-flash {
+  animation: anchor-flash 1.6s ease-out;
+  border-radius: 8px;
+}
+
+@keyframes anchor-flash {
+  0%,
+  22% {
+    background: rgba(76, 141, 255, 0.22);
+    box-shadow: 0 0 0 1px var(--accent, #007acc);
+  }
+  100% {
+    background: transparent;
+    box-shadow: none;
+  }
+}
+
+/* ─── 锚点审查面板（AI Changes 的审查模式）──────────────────────────────────
+   右键锚点 → 审查此锚点：列出该轮改过的文件 → 点文件看逐段 diff →
+   每段可「应用此段」还原为改前内容；被后续修改占用的段灰掉 + 删除线。 */
+.anchor-review {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  color: var(--text-primary, #ccc);
+  background: var(--bg-primary, #1e1e1e);
+}
+
+.anchor-review-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border, #333);
+}
+
+.anchor-review-back {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  background: var(--bg-secondary, #252526);
+  color: var(--text-primary, #ccc);
+  cursor: pointer;
+}
+
+.anchor-review-back:hover {
+  background: var(--bg-hover, #2a2d2e);
+}
+
+.anchor-review-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.anchor-review-seq {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent, #007acc);
+  white-space: nowrap;
+}
+
+.anchor-review-summary {
+  font-size: 12px;
+  color: var(--text-primary, #ccc);
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.anchor-review-count {
+  font-size: 11px;
+  color: var(--text-primary, #ccc);
+  opacity: 0.6;
+  white-space: nowrap;
+}
+
+.anchor-review-error,
+.anchor-review-notice {
+  margin: 8px 12px 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.anchor-review-error {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--status-error, #ef4444);
+}
+
+.anchor-review-notice {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--status-success, #22c55e);
+}
+
+.anchor-review-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.anchor-review-files {
+  width: 42%;
+  min-width: 180px;
+  overflow-y: auto;
+  border-right: 1px solid var(--border, #333);
+  padding: 6px;
+}
+
+.anchor-review-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary, #ccc);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.anchor-review-file:hover {
+  background: var(--bg-hover, #2a2d2e);
+}
+
+.anchor-review-file.active {
+  background: var(--bg-tertiary, #333);
+}
+
+.anchor-review-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.anchor-review-status.s-A { background: rgba(34, 197, 94, 0.18); color: var(--status-success, #22c55e); }
+.anchor-review-status.s-M { background: rgba(59, 130, 246, 0.18); color: var(--accent, #3b82f6); }
+.anchor-review-status.s-D { background: rgba(239, 68, 68, 0.18); color: var(--status-error, #ef4444); }
+
+.anchor-review-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+}
+
+.anchor-review-diffcount {
+  flex-shrink: 0;
+  font-size: 10px;
+  opacity: 0.7;
+  font-family: var(--font-mono, monospace);
+}
+
+.anchor-review-detail {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+
+.anchor-review-hint,
+.anchor-review-empty {
+  padding: 16px 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: 0.65;
+}
+
+.anchor-review-empty span {
+  opacity: 0.75;
+}
+
+.anchor-review-file-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.anchor-review-file-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.anchor-review-detail-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+}
+
+/* 一个片段 = 一段改前→改后 */
+.anchor-hunk {
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.anchor-hunk-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  background: var(--bg-secondary, #252526);
+  border-bottom: 1px solid var(--border, #333);
+  font-size: 11px;
+}
+
+.anchor-hunk-no {
+  font-weight: 600;
+}
+
+.anchor-hunk-range {
+  flex: 1;
+  opacity: 0.65;
+  font-family: var(--font-mono, monospace);
+}
+
+.anchor-hunk-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+
+.anchor-hunk-badge.applied {
+  background: rgba(34, 197, 94, 0.18);
+  color: var(--status-success, #22c55e);
+}
+
+.anchor-hunk-badge.blocked {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--status-error, #ef4444);
+}
+
+.anchor-hunk-apply {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  background: var(--bg-tertiary, #333);
+  color: var(--text-primary, #ccc);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.anchor-hunk-apply:hover:not(:disabled) {
+  background: var(--bg-hover, #2a2d2e);
+  border-color: var(--accent, #007acc);
+}
+
+.anchor-hunk-apply:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.anchor-hunk-lines {
+  margin: 0;
+  padding: 4px 0;
+  font-size: 11px;
+  line-height: 1.55;
+  font-family: var(--font-mono, monospace);
+  overflow-x: auto;
+}
+
+.anchor-hunk-lines.before {
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.anchor-hunk-lines.after {
+  background: rgba(34, 197, 94, 0.08);
+  border-top: 1px dashed var(--border, #333);
+}
+
+.anchor-hunk-line {
+  display: flex;
+  gap: 8px;
+  padding: 0 8px;
+  white-space: pre;
+}
+
+.anchor-hunk-line.del { color: #f87171; }
+.anchor-hunk-line.add { color: #4ade80; }
+
+.anchor-hunk-ln {
+  flex-shrink: 0;
+  width: 34px;
+  text-align: right;
+  opacity: 0.45;
+  user-select: none;
+}
+
+.anchor-hunk-text {
+  flex: 1;
+}
+
+/* 被后续修改占用的片段：整体灰掉，内容加删除线，一眼就知道不能用了 */
+.anchor-hunk.superseded {
+  opacity: 0.45;
+}
+
+.anchor-hunk.superseded .anchor-hunk-lines,
+.anchor-hunk.superseded .anchor-hunk-head {
+  text-decoration: line-through;
+  text-decoration-color: rgba(239, 68, 68, 0.8);
+}
+
+.anchor-hunk.applied .anchor-hunk-head {
+  border-left: 2px solid var(--status-success, #22c55e);
 }

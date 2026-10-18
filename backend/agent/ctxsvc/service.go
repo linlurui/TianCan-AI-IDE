@@ -17,6 +17,7 @@ import (
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/conversation"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/prompt"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/recall"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/turncap"
 )
 
 // saveEvery is how often the vector index is flushed to disk (per appends).
@@ -27,6 +28,7 @@ type Service struct {
 	mu        sync.Mutex
 	store     *conversation.Store
 	indices   map[string]*recall.Index
+	caps      map[string]*turncap.Recorder // 每会话的文件改动记录器（审查/版本管理）
 	embed     recall.Embedder
 	cfg       recall.RemoteConfig
 	saveCount map[string]int
@@ -38,6 +40,7 @@ func NewService() *Service {
 	return &Service{
 		store:     conversation.DefaultStore(),
 		indices:   map[string]*recall.Index{},
+		caps:      map[string]*turncap.Recorder{},
 		embed:     recall.NewHashingEmbedder(),
 		saveCount: map[string]int{},
 	}
@@ -113,7 +116,43 @@ func (s *Service) pair(projectRoot, sessionID string) (*conversation.Session, *r
 	}
 	s.indices[key] = idx
 	s.wire(sess, idx, key)
+	s.attachCapture(key, sess, projectRoot, sessionID)
 	return sess, idx, nil
+}
+
+// attachCapture gives the session its per-turn file-change recorder. The
+// recorder is what turns "AI 改了哪些文件" from a guess into recorded versions.
+func (s *Service) attachCapture(key string, sess *conversation.Session, projectRoot, sessionID string) {
+	if _, ok := s.caps[key]; ok {
+		return
+	}
+	rec := turncap.NewRecorder(projectRoot, sess.DB(), conversation.ProjectHash(projectRoot), sessionID)
+	sess.SetCapture(rec)
+	s.caps[key] = rec
+}
+
+// recorder returns the capture recorder of a session, attaching it on demand
+// (a session opened before this build has none yet).
+func (s *Service) recorder(projectRoot, sessionID string) (*turncap.Recorder, error) {
+	sess, _, err := s.pair(projectRoot, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	key := conversation.ProjectHash(projectRoot) + "/" + sessionID
+	if sessionID == "" {
+		key = conversation.ProjectHash(projectRoot) + "/" + conversation.MainSessionID
+	}
+	s.mu.Lock()
+	rec, ok := s.caps[key]
+	s.mu.Unlock()
+	if ok {
+		return rec, nil
+	}
+	s.attachCapture(key, sess, projectRoot, sessionID)
+	s.mu.Lock()
+	rec = s.caps[key]
+	s.mu.Unlock()
+	return rec, nil
 }
 
 func (s *Service) wire(sess *conversation.Session, idx *recall.Index, key string) {
@@ -356,7 +395,125 @@ func (s *Service) SessionRollback(projectRoot, sessionID string, target int64, n
 	}
 	// 向量索引必须同步截断，否则会召回已经被撤销的内容。
 	idx.TruncateAfter(target)
+	// 被撤销轮次的文件版本记录一并作废，否则审查面板还能看到不存在的轮次。
+	if rec, err := s.recorder(projectRoot, sessionID); err == nil && rec != nil {
+		rec.TruncateAfter(target)
+	}
 	return idx.Save()
+}
+
+// --- 审查（每轮文件改动与版本） ----------------------------------------------
+// 右键锚点 → 审查：右侧 AI Changes 面板列出这一轮改过的文件，点文件看逐段
+// diff，「应用此段」把选中片段还原回工作区。见 docs/anchor-design.md。
+
+// AnchorFileView is one changed file of one turn, as the review panel lists it.
+type AnchorFileView struct {
+	Path      string `json:"path"`
+	Status    string `json:"status"` // A 新增 | M 修改 | D 删除
+	Added     int    `json:"added"`
+	Removed   int    `json:"removed"`
+	UpdatedAt int64  `json:"updatedAt"`
+}
+
+// AnchorHunkView is one changed region plus whether it can still be applied.
+type AnchorHunkView struct {
+	Index       int      `json:"index"`
+	BeforeStart int      `json:"beforeStart"`
+	BeforeEnd   int      `json:"beforeEnd"`
+	AfterStart  int      `json:"afterStart"`
+	AfterEnd    int      `json:"afterEnd"`
+	Before      []string `json:"before"`
+	After       []string `json:"after"`
+	Superseded  bool     `json:"superseded"` // 被后续修改占用：灰掉 + 删除线
+	Reason      string   `json:"reason"`
+	Applied     bool     `json:"applied"`
+}
+
+// AnchorFileDetail is the full review payload of one file in one turn.
+type AnchorFileDetail struct {
+	Path          string           `json:"path"`
+	Status        string           `json:"status"`
+	Added         int              `json:"added"`
+	Removed       int              `json:"removed"`
+	BeforeContent string           `json:"beforeContent"`
+	AfterContent  string           `json:"afterContent"`
+	Hunks         []AnchorHunkView `json:"hunks"`
+}
+
+// SessionAnchorFiles lists the files one turn changed (capturing it first — the
+// turn may still be open, in which case the list shows the current state).
+func (s *Service) SessionAnchorFiles(projectRoot, sessionID string, seq int64) ([]AnchorFileView, error) {
+	rec, err := s.recorder(projectRoot, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	files, err := rec.Files(seq)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AnchorFileView, 0, len(files))
+	for _, f := range files {
+		out = append(out, AnchorFileView{Path: f.Path, Status: f.Status, Added: f.Added, Removed: f.Removed, UpdatedAt: f.UpdatedAt})
+	}
+	return out, nil
+}
+
+// SessionAnchorFileDetail returns one file's two versions and every changed
+// region with its apply state.
+func (s *Service) SessionAnchorFileDetail(projectRoot, sessionID string, seq int64, path string) (*AnchorFileDetail, error) {
+	rec, err := s.recorder(projectRoot, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	d, err := rec.Detail(seq, path)
+	if err != nil {
+		return nil, err
+	}
+	out := &AnchorFileDetail{
+		Path: d.Path, Status: d.Status, Added: d.Added, Removed: d.Removed,
+		BeforeContent: d.BeforeContent, AfterContent: d.AfterContent,
+		Hunks: make([]AnchorHunkView, 0, len(d.Hunks)),
+	}
+	for _, h := range d.Hunks {
+		out.Hunks = append(out.Hunks, AnchorHunkView{
+			Index: h.Index, BeforeStart: h.BeforeStart, BeforeEnd: h.BeforeEnd,
+			AfterStart: h.AfterStart, AfterEnd: h.AfterEnd,
+			Before: h.Before, After: h.After,
+			Superseded: h.Superseded, Reason: h.Reason, Applied: h.Applied,
+		})
+	}
+	return out, nil
+}
+
+// SessionApplyAnchorHunk restores one changed region of one turn into the
+// working copy. Refused (with a reason) when a later turn already edited the
+// same lines — the UI greys those out, this is the server-side guard.
+func (s *Service) SessionApplyAnchorHunk(projectRoot, sessionID string, seq int64, path string, hunk int) error {
+	rec, err := s.recorder(projectRoot, sessionID)
+	if err != nil {
+		return err
+	}
+	return rec.ApplyHunk(seq, path, hunk)
+}
+
+// SessionArchiveAnchor flips a work unit between active and archived. Archived
+// turns stay searchable but stop feeding their full text into prompts.
+func (s *Service) SessionArchiveAnchor(projectRoot, sessionID string, seq int64, archived bool) error {
+	sess, _, err := s.pair(projectRoot, sessionID)
+	if err != nil {
+		return err
+	}
+	return sess.ArchiveAnchor(seq, archived)
+}
+
+// SessionSearchAnchors finds prior work units by content ("像之前那个做法一样").
+// Hits map back to the anchor whose message range covers the match.
+func (s *Service) SessionSearchAnchors(projectRoot, sessionID, query string, limit int) ([]conversation.AnchorHitView, error) {
+	sess, _, err := s.pair(projectRoot, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return sess.SearchAnchors(query, limit), nil
 }
 
 // SessionStats reports diagnostics (index size, embedding mode).

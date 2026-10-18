@@ -101,12 +101,38 @@ type Session struct {
 	memID string // hash + "/" + id, the global key in the events/messages tables
 	dir   string // per-session directory (for recall index sidecars)
 
-	mu         sync.Mutex
-	state      *SessionState
-	pending    int // events since the last tail snapshot
-	onAppend   func(seq int64, role Role, content string)
-	autoSegTok int
+	mu          sync.Mutex
+	state       *SessionState
+	pending     int // events since the last tail snapshot
+	onAppend    func(seq int64, role Role, content string)
+	autoSegTok  int
+	summarizer  func(string) string // optional small-model one-line distiller
+	cap         TurnCapture        // optional per-turn file-change recorder
 }
+
+// TurnCapture records what files the AI changed during a turn. Implemented by
+// turncap.Recorder; declared here as an interface so the conversation package
+// stays independent of git/snapshot machinery.
+type TurnCapture interface {
+	// Begin marks the start of the turn identified by the user message seq.
+	Begin(seq int64)
+	// Capture persists the turn's file changes (idempotent).
+	Capture(seq int64) error
+	// CaptureOpen flushes every still-open turn (shutdown).
+	CaptureOpen()
+}
+
+// SetCapture installs the per-turn file-change recorder. Must be called before
+// messages are appended.
+func (s *Session) SetCapture(c TurnCapture) {
+	s.mu.Lock()
+	s.cap = c
+	s.mu.Unlock()
+}
+
+// DB exposes the shared memory database (used by the turn recorder, which
+// stores file versions there).
+func (s *Session) DB() *memdb.DB { return s.db }
 
 // Open returns the project's main session, creating it on first use.
 func (s *Store) Open(projectRoot string) (*Session, error) {
@@ -184,6 +210,8 @@ func (s *Store) openLocked(projectRoot, hash, id, title string) (*Session, error
 	if title != "" && st.Title != title {
 		_, _ = sess.appendLocked(KindTitle, TitlePayload{Title: title})
 	}
+	// 打开会话时补出历史轮次：老会话在此之前没有任何锚点，刻度尺会一直空着。
+	sess.backfillTurnAnchors()
 	return sess, nil
 }
 
@@ -193,7 +221,7 @@ func (s *Store) Close() error {
 	defer s.mu.Unlock()
 	var firstErr error
 	for k, sess := range s.open {
-		if err := sess.close(); err != nil && firstErr == nil {
+		if err := sess.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		delete(s.open, k)
@@ -284,6 +312,30 @@ func (s *Session) persistMessage(kind string, seq int64, raw json.RawMessage, no
 	_ = s.db.UpsertMessage(s.memID, seq, string(p.Role), p.Content, p.SegmentID, now)
 }
 
+// SetSummarizer installs a small-model hook that distills a user turn into one
+// line for anchor tooltips and archived-context digests. It is called on the
+// append path with the turn's text; a nil or failing hook falls back to the
+// local heuristic distiller. Must be called before the session is used.
+func (s *Session) SetSummarizer(fn func(string) string) {
+	s.mu.Lock()
+	s.summarizer = fn
+	s.mu.Unlock()
+}
+
+// distillSummary is the offline fallback: first meaningful line, markdown and
+// quote prefixes stripped, hard-capped so tooltips stay one line.
+func distillSummary(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		t := strings.TrimSpace(line)
+		t = strings.TrimLeft(t, "#>*-• ")
+		if t == "" {
+			continue
+		}
+		return truncateRunes(t, 40)
+	}
+	return "（空）"
+}
+
 // AppendMessage records a chat message. It returns the log seq, which is the stable
 // handle used by recall, audit and rollback.
 func (s *Session) AppendMessage(role Role, content string) (int64, error) {
@@ -298,6 +350,13 @@ func (s *Session) AppendMessage(role Role, content string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if role == RoleUser {
+		for _, sq := range s.closeOpenTurns(e.Seq) {
+			s.captureTurn(sq)
+		}
+		s.dropTurnAnchor(e.Seq, content)
+		s.beginTurn(e.Seq)
+	}
 	if fn := s.hook(); fn != nil {
 		fn(e.Seq, role, content)
 	}
@@ -310,6 +369,143 @@ func (s *Session) AppendMessage(role Role, content string) (int64, error) {
 		}
 	}
 	return e.Seq, nil
+}
+
+// closeOpenTurns caps every still-open turn anchor at the seq just before this
+// new user message and returns the seqs it closed (so their file changes can be
+// captured: the turn is over, the worktree now holds its final state).
+func (s *Session) closeOpenTurns(before int64) []int64 {
+	if s.db == nil || before <= 1 {
+		return nil
+	}
+	rows, err := s.db.ListAnchors(s.hash, s.id)
+	if err != nil {
+		return nil
+	}
+	var closed []int64
+	for _, a := range rows {
+		if a.Kind == "turn" && a.TurnEndSeq == 0 && a.MsgSeq > 0 && a.MsgSeq < before {
+			closed = append(closed, a.Seq)
+		}
+	}
+	if len(closed) == 0 {
+		return nil
+	}
+	_ = s.db.Exec(`UPDATE anchors SET turn_end_seq=? WHERE hash=? AND id=? AND kind='turn' AND turn_end_seq=0 AND msg_seq<?`,
+		before-1, s.hash, s.id, before)
+	return closed
+}
+
+// beginTurn tells the recorder a new turn started at this user message.
+func (s *Session) beginTurn(seq int64) {
+	s.mu.Lock()
+	c := s.cap
+	s.mu.Unlock()
+	if c != nil {
+		c.Begin(seq)
+	}
+}
+
+// captureTurn flushes one turn's file changes off the append path (git calls
+// are fast but not free).
+func (s *Session) captureTurn(seq int64) {
+	s.mu.Lock()
+	c := s.cap
+	s.mu.Unlock()
+	if c == nil {
+		return
+	}
+	go func() { _ = c.Capture(seq) }()
+}
+
+// captureTurnNow is the synchronous variant for user-triggered actions
+// (archive, shutdown) where the caller expects the versions to be there.
+func (s *Session) captureTurnNow(seq int64) {
+	s.mu.Lock()
+	c := s.cap
+	s.mu.Unlock()
+	if c != nil {
+		_ = c.Capture(seq)
+	}
+}
+
+// dropTurnAnchor creates this turn's anchor. The summary starts as a local
+// heuristic distill so the UI is never empty; if a small-model summarizer is
+// installed it refines the line asynchronously off the append path.
+func (s *Session) dropTurnAnchor(msgSeq int64, content string) {
+	if s.db == nil {
+		return
+	}
+	s.mu.Lock()
+	fn := s.summarizer
+	s.mu.Unlock()
+	summary := distillSummary(content)
+	_ = s.db.RecordAnchor(s.hash, s.id, memdb.AnchorRow{
+		Seq:        msgSeq,
+		Time:       time.Now().UnixMilli(),
+		Title:      summary,
+		Kind:       "turn",
+		Summary:    summary,
+		Status:     "active",
+		MsgSeq:     msgSeq,
+		TurnEndSeq: 0, // closed by the next user turn
+	})
+	if fn == nil {
+		return
+	}
+	go func() {
+		if v := strings.TrimSpace(fn(content)); v != "" {
+			_ = s.db.RefineAnchorSummary(s.hash, s.id, msgSeq, truncateRunes(v, 60))
+		}
+	}()
+}
+
+// backfillTurnAnchors rebuilds the timeline for a session that already had
+// messages before automatic turn anchors existed. Without it the rail stays
+// empty until the next user message, which reads as "the feature is broken"
+// for every session the user already has. Existing rows are never touched, so
+// it is safe to run on every open.
+func (s *Session) backfillTurnAnchors() {
+	if s.db == nil {
+		return
+	}
+	// 只有真正的轮次行才算"已经有了"：自动折叠点常常正好落在最后一条用户消息上
+	// （退出保存时就是这样），那个点是匿名的，应该让位给带摘要的轮次行。
+	existing := map[int64]bool{}
+	if rows, err := s.db.ListAnchors(s.hash, s.id); err == nil {
+		for _, a := range rows {
+			if a.Kind == "turn" {
+				existing[a.Seq] = true
+			}
+		}
+	}
+	var turns []Msg
+	for _, m := range s.state.Messages {
+		if m.Role == RoleUser && !existing[m.Seq] {
+			turns = append(turns, m)
+		}
+	}
+	for i, m := range turns {
+		end := int64(0)
+		if i+1 < len(turns) {
+			end = turns[i+1].Seq - 1
+		}
+		t := m.Time
+		if t == 0 {
+			t = s.state.UpdatedAt
+		}
+		sum := distillSummary(m.Content)
+		_ = s.db.RecordAnchor(s.hash, s.id, memdb.AnchorRow{
+			Seq:        m.Seq,
+			Time:       t,
+			Title:      sum,
+			Kind:       "turn",
+			Summary:    sum,
+			Status:     "active",
+			MsgSeq:     m.Seq,
+			TurnEndSeq: end,
+		})
+	}
 }
 
 // SetAutoSegmentTokens overrides the auto-segmentation budget (0 disables it).
@@ -403,6 +599,11 @@ type AnchorInfo struct {
 	Title     string `json:"title"`
 	Messages  int    `json:"messages"`
 	Tokens    int    `json:"tokens"`
+	Kind      string `json:"kind"`              // turn | fold | manual
+	Summary   string `json:"summary"`           // one-line digest of the work unit
+	Status    string `json:"status"`            // active | archived
+	MsgSeq    int64  `json:"msgSeq"`            // first message of the turn
+	TurnEndSeq int64 `json:"turnEndSeq"`        // last message of the turn (0 = open)
 }
 
 // DropAnchor persists the current folded state as a tail snapshot and returns its
@@ -413,34 +614,140 @@ func (s *Session) DropAnchor() (AnchorInfo, error) {
 	s.pending = 0
 	s.saveTail()
 	st := s.State()
-	return AnchorInfo{
-		Seq:      st.HeadSeq,
-		Time:     st.UpdatedAt,
-		Title:    st.Title,
-		Messages: len(st.Messages),
-		Tokens:   st.TotalTokens,
-	}, nil
+	return s.recordAnchor(st, 0, true), nil
 }
 
-// Anchors lists the persisted tail snapshots (at most one, the current fold).
+// recordAnchor persists the given fold state as a resumable point in history.
+// manual=true is an explicit "mark here" and may overwrite the row sitting on
+// that seq; manual=false is the background fold, which must never erase a user
+// turn that landed on the same event. Callers must hold the lock.
+func (s *Session) recordAnchor(st *SessionState, coverFrom int64, manual bool) AnchorInfo {
+	info := AnchorInfo{
+		Seq:        st.HeadSeq,
+		CoverFrom:  coverFrom,
+		Time:       st.UpdatedAt,
+		Title:      st.Title,
+		Messages:   len(st.Messages),
+		Tokens:     st.TotalTokens,
+		Kind:       "fold",
+		Status:     "active",
+	}
+	if s.db != nil {
+		row := memdb.AnchorRow{
+			Seq:       info.Seq,
+			CoverFrom: info.CoverFrom,
+			Time:      info.Time,
+			Title:     info.Title,
+			Messages:  info.Messages,
+			Tokens:    info.Tokens,
+			Kind:      info.Kind,
+			Status:    info.Status,
+		}
+		if manual {
+			_ = s.db.RecordAnchor(s.hash, s.id, row)
+		} else {
+			_ = s.db.RecordFoldAnchor(s.hash, s.id, row)
+		}
+	}
+	return info
+}
+
+// Anchors lists every persisted fold snapshot, oldest first.
+//
+// sessions.tail_json only ever holds the newest fold and is silently overwritten,
+// so it cannot support jumping back to an earlier point. The anchors table keeps
+// the full history; without it the UI timeline would only ever show one tick.
 func (s *Session) Anchors() []AnchorInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tj, ts, ok, err := s.db.GetTail(s.hash, s.id)
-	if err != nil || !ok || tj == "" {
+	if s.db == nil {
 		return nil
 	}
-	st := NewSessionState(s.id, s.projectRoot(), "", 0)
-	if e := st.LoadJSON([]byte(tj)); e != nil {
+	rows, err := s.db.ListAnchors(s.hash, s.id)
+	if err != nil {
 		return nil
 	}
-	return []AnchorInfo{{
-		Seq:      ts,
-		Time:     st.UpdatedAt,
-		Title:    st.Title,
-		Messages: len(st.Messages),
-		Tokens:   st.TotalTokens,
-	}}
+	out := make([]AnchorInfo, 0, len(rows))
+	for _, a := range rows {
+		out = append(out, AnchorInfo{
+			Seq:        a.Seq,
+			CoverFrom:  a.CoverFrom,
+			Time:       a.Time,
+			Title:      a.Title,
+			Messages:   a.Messages,
+			Tokens:     a.Tokens,
+			Kind:       a.Kind,
+			Summary:    a.Summary,
+			Status:     a.Status,
+			MsgSeq:     a.MsgSeq,
+			TurnEndSeq: a.TurnEndSeq,
+		})
+	}
+	return out
+}
+
+// ArchiveAnchor flips a work unit between active and archived. Archived turns
+// stay searchable but their full text no longer feeds the prompt (阶段三接线).
+func (s *Session) ArchiveAnchor(seq int64, archived bool) error {
+	if s.db == nil {
+		return fmt.Errorf("conversation: store unavailable")
+	}
+	status := "active"
+	if archived {
+		status = "archived"
+	}
+	if err := s.db.SetAnchorStatus(s.hash, s.id, seq, status); err != nil {
+		return err
+	}
+	// 归档前把这一轮的文件改动补齐：审查面板要能立刻看到这一轮的版本。
+	s.captureTurnNow(seq)
+	return nil
+}
+
+// AnchorHitView is a search hit mapped back to its work unit.
+type AnchorHitView struct {
+	Anchor  AnchorInfo `json:"anchor"`
+	HitSeq  int64      `json:"hitSeq"`
+	Score   float32    `json:"score"`
+	Snippet string     `json:"snippet"`
+}
+
+// SearchAnchors finds work units by content: FTS over the turn's messages,
+// bucketed back to anchors. This is the "像之前那个做法一样" entry point.
+func (s *Session) SearchAnchors(query string, limit int) []AnchorHitView {
+	if s.db == nil || strings.TrimSpace(query) == "" {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 8
+	}
+	hits, err := s.db.SearchAnchors(s.hash, s.id, query, limit)
+	if err != nil {
+		return nil
+	}
+	bySeq := make(map[int64]AnchorInfo, len(hits))
+	for _, a := range s.Anchors() {
+		bySeq[a.Seq] = a
+	}
+	out := make([]AnchorHitView, 0, len(hits))
+	for _, h := range hits {
+		view := AnchorHitView{HitSeq: h.HitSeq, Score: h.Score, Snippet: h.Snippet}
+		if a, ok := bySeq[h.Anchor.Seq]; ok {
+			view.Anchor = a
+		} else {
+			view.Anchor = toInfo(h.Anchor)
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
+func toInfo(a memdb.AnchorRow) AnchorInfo {
+	return AnchorInfo{
+		Seq: a.Seq, CoverFrom: a.CoverFrom, Time: a.Time, Title: a.Title,
+		Messages: a.Messages, Tokens: a.Tokens, Kind: a.Kind,
+		Summary: a.Summary, Status: a.Status, MsgSeq: a.MsgSeq, TurnEndSeq: a.TurnEndSeq,
+	}
 }
 
 // AuditEntry is one line of the audit trail: the raw event, rendered for humans.
@@ -496,6 +803,9 @@ func (s *Session) Rollback(target int64, note string) error {
 	}
 	s.pending = 0
 	s.saveTail()
+	// Points newer than the rollback target describe a branch that no longer
+	// exists; leaving them would let the UI offer a "jump back" that cannot work.
+	_ = s.db.DeleteAnchorsAfter(s.hash, s.id, target)
 	return nil
 }
 
@@ -527,9 +837,11 @@ func (s *Session) Info() SessionInfo {
 			open++
 		}
 	}
+	// Every kind of work unit counts: the tail column only ever holds the newest
+	// fold, so it would always report one no matter how many points exist.
 	anchors := 0
-	if _, _, ok, _ := s.db.GetTail(s.hash, s.id); ok {
-		anchors = 1
+	if s.db != nil {
+		anchors = s.db.CountAnchors(s.hash, s.id)
 	}
 	return SessionInfo{
 		ID:          s.id,
@@ -584,10 +896,10 @@ func (s *Store) ListSessions(projectRoot string) ([]SessionInfo, error) {
 				Segments:    len(st.Segments),
 				OpenReqs:    open,
 				Redlines:    len(st.Redlines),
-				HeadSeq:     st.HeadSeq,
-				Anchors:     1,
-			})
-			seen[r.ID] = true
+			HeadSeq:     st.HeadSeq,
+			Anchors:     s.db.CountAnchors(hash, r.ID),
+		})
+		seen[r.ID] = true
 		}
 	}
 	s.mu.Lock()
@@ -623,7 +935,7 @@ func (s *Store) DeleteSession(projectRoot, id string) error {
 	key := hash + "/" + id
 	s.mu.Lock()
 	if cur, ok := s.open[key]; ok {
-		_ = cur.close()
+		_ = cur.Close()
 		delete(s.open, key)
 	}
 	s.mu.Unlock()
@@ -633,15 +945,22 @@ func (s *Store) DeleteSession(projectRoot, id string) error {
 	return os.RemoveAll(filepath.Join(s.baseDir, hash, id))
 }
 
+// close flushes the tail. Callers must hold s.mu — Session.Close takes it, and
+// taking it twice on the same mutex would hang the caller forever.
 func (s *Session) close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.saveTail()
 	return nil
 }
 
 // Close releases this session's state (the shared DB is owned by the store).
 func (s *Session) Close() error {
+	// 退出前把还开着的轮次的文件改动落库：用户可能看完审查就直接关应用。
+	s.mu.Lock()
+	c := s.cap
+	s.mu.Unlock()
+	if c != nil {
+		c.CaptureOpen()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.close()
@@ -657,6 +976,10 @@ func (s *Session) saveTail() {
 		return
 	}
 	_ = s.db.SetTail(s.hash, s.id, string(tj), s.state.HeadSeq)
+	// The automatic fold is also a resumable point: without this line every
+	// AnchorEvery-boundary would overwrite the previous one and the history of
+	// restorable points would keep collapsing to the newest fold.
+	s.recordAnchor(s.state, 0, false)
 }
 
 // MarshalState exposes the projection as raw JSON (used by bindings / tests).

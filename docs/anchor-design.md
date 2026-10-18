@@ -1,0 +1,119 @@
+# 锚点系统设计方案
+
+> 状态：v1（地基已落地，diff 关联与 prompt 压缩为下一阶段）
+> 核心思想：**锚点 = 「一轮工作」的一等公民**，不是聊天记录上的装饰刻度。
+
+## 1. 锚点是什么
+
+一个锚点对应**用户的一次发言及其引发的全部后续**：AI 的回复、改动的文件、
+用户提出的重点与红线、最终是否被确认。它是后续三件事的索引单元：
+
+| 能力 | 依赖锚点的什么 |
+|---|---|
+| 快速定位上下文 | msg_seq..turn_end_seq 消息区间 |
+| 审计（看这次改了什么） | 关联的文件快照 / diff（阶段二） |
+| 上下文压缩（归档） | status=archived ⇒ 该轮只带摘要不带入全文 |
+| 引用检索（"像之前那样做"） | summary + 该轮消息的 FTS/向量检索 |
+
+## 2. 打点规则（自动，零手打）
+
+- **turn 锚点**：每当用户消息 `AppendMessage(user)` 落盘时自动创建。summary 初值 =
+  本地启发式提炼（首行、去 markdown 修饰、截 40 字），异步由**小模型**重写更好的一句。
+- **fold 锚点**：每 64 次事件自动折叠时记录（沿用现有 AnchorEvery 机制），作为纯存储检查点。
+- **manual 锚点**：UI 手动打点保留，但不再是主要入口。
+
+## 3. 数据模型（memdb）
+
+```sql
+-- v1 迁移：在 anchors 表上加列（逐列 ALTER，兼容已存在的库）
+kind       TEXT DEFAULT 'fold'    -- turn | fold | manual
+summary    TEXT DEFAULT ''        -- 小模型提炼的一句话
+status     TEXT DEFAULT 'active'  -- active | archived（归档后不进 prompt 全文）
+msg_seq      INTEGER DEFAULT 0    -- 本轮用户消息 seq
+turn_end_seq  INTEGER DEFAULT 0   -- 本轮最后一条消息 seq（下一条 user 前）
+```
+
+后续（阶段二）：`anchor_files(anchor_seq, path, blob_before, blob_after, checkpoint_id)`
+记录该轮改动文件的前后内容引用，审计 diff 面板直接读它。
+
+## 4. 检索（"像之前那个做法一样"）
+
+`SessionSearchAnchors(query, limit)`：
+1. memdb 两阶段检索（FTS5 bigram 召回 → 向量重排）在该会话 messages 上找 top-N 命中；
+2. 命中消息 seq 按区间映射回锚点（`msg_seq <= hit.seq <= turn_end_seq`）；
+3. 返回锚点 + 命中片段，去重按相关度排序。
+
+同一检索同时服务两个场景：用户口述引用；agent 装配 prompt 时自动召回相关历史锚点。
+
+## 5. 归档与上下文压缩
+
+- 触发：a) 小模型从用户回复中检测确认语义（"可以/同意/确认/就这样/lgtm"）；
+  b) 用户点「同意」按钮（阶段二的审计-确认流）。
+- 效果：`status=archived` 的锚点，其消息区间在 prompt 装配时**只保留 summary**，
+  红线永远保留全文（红线不压缩是既有原则）。
+- 可逆：右键可取消归档，恢复全文带入。
+
+## 6. 审查：每轮文件改动与版本管理（阶段二）
+
+用户对"审计"的定义：不是对话流水，而是**这一轮 AI 改过哪些文件、每个文件的
+改前/改后版本，以及能否把某一段单独还原回去**。入口是右键锚点 →
+「审查此锚点」，右侧 AI Changes 面板切换成审查模式。
+
+### 6.1 数据模型（memdb）
+
+- `anchor_files(hash, id, seq, path, status, before_sha, after_sha, added, removed)`：
+  一轮（turn 锚点 seq）改动过的文件。内容本身在 `blobs`（内容寻址）里，
+  status ∈ A/M/D。
+- `anchor_turn_bases(hash, id, seq, tree, git, snap_sha)`：轮次开工时的基点。
+  git 项目 `tree` = `git stash create` 的提交（不碰工作区）；`snap_sha` 指向
+  开工时文件清单 blob（未跟踪文件或非 git 项目的全部文本文件，path → blob sha）。
+- `anchor_applies`：「应用此段」流水。
+
+### 6.2 捕获时机（改前内容必须在改动发生前拿到）
+
+| 时机 | 动作 |
+| --- | --- |
+| 用户发言（轮次开始） | `Begin(seq)`：git 项目记基点树 + 把未跟踪文件存 blob；非 git 项目把全部文本文件存 blob（内容寻址，跨轮去重，第二轮的边际成本只有变化的文件） |
+| 下一轮用户发言 / 归档 / 退出 / 审查时 | `Capture(seq)`：与基点比对，落 `anchor_files`（幂等，可重复抓） |
+| 回退到某锚点 | `TruncateAfter(seq)`：撤掉之后轮次的文件记录与基点 |
+
+两条捕获路线，都在 `backend/agent/turncap`：
+
+- **git**：轮末再 `git stash create` 得终点树，`git diff --name-status` 得
+  A/M/D；改前/改后分别 `git cat-file blob tree:path`。未跟踪文件靠开工时的
+  blob 清单补（新文件 before 为空本就正确；删掉的未跟踪文件 before 从清单取）。
+- **快照**：非 git 项目轮末重走目录比对哈希，改前从开工时的 blob 取。
+
+**为什么不做硬链接快照**：`os.WriteFile`、`sed -i` 和许多编辑器是就地截断写，
+硬链接指向同一个 inode，"改前版本"会被静默改成改后内容——版本历史上最致命的
+错误。所以开工时直接存 blob 副本。
+
+### 6.3 片段（hunk）与应用
+
+- 行级 LCS（先剥公共前后缀，中间段超 4M 单元格不拆只报一个粗 hunk）把
+  before/after 切成有序 hunk，每个带双侧行号区间 `[start, end)`。
+- **应用此段 = 局部还原**：把该 hunk 的 before 行替换回工作区的对应区域。
+  坐标换算：hunk 的区间在"本轮 after"坐标系；沿版本链（同一文件后续轮次，
+  `before_sha` 必须等于上一段的 `after_sha`，否则判"版本链断裂"）逐轮平移：
+  后续 hunk 完全在目标之前 → 目标区间整体平移；完全不重叠 → 不动；
+  **有任何交叠 → 拒绝应用**（后续修改已占用同一片段）。
+- 落定前与工作区现状核对：目标区域必须还是"本轮改完的样子"，否则判
+  "文件已被其他修改，片段定位失败"（防用户手动编辑）。
+- 双重保险：UI 把被占用的片段灰掉 + 删除线 + 禁用按钮；服务端
+  `ApplyHunk` 同样走一遍校验，拒绝时返回原因并记入 `anchor_applies`。
+
+### 6.4 界面
+
+- 右键菜单：「定位到此处 / 审查此锚点（改过的文件）/ 归档 / 回退到这里」。
+- 审查模式：文件列表（状态徽章 + 加减行数）→ 点文件看逐段 diff
+  （红=改前、绿=改后）→ 每段一个「应用此段」按钮；已应用显示徽章；
+  不可应用的段整段灰化 + 删除线 + 原因。
+
+## 7. 阶段划分
+
+- **阶段一（已完成）**：数据模型 + 自动打点 + 启发式摘要 + 归档状态 + 检索 API +
+  删除旧工具条 + 刻度尺 tooltip 接入 summary + 落盘去重修成稳定 uid。
+- **阶段二（本次）**：每轮文件改动捕获（turncap）+ anchor_files/blobs 版本存储 +
+  审查面板（文件清单 → 逐段 diff → 应用此段）+ 越界保护（灰掉/删除线/服务端拒绝）。
+- **阶段三（待办）**：小模型摘要异步接入；确认语义自动归档；prompt 装配按
+  归档压缩（归档轮次只带 summary）；agent 自动引用检索。

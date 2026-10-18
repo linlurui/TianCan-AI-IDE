@@ -10,7 +10,9 @@ import {
 } from "@bindings/ai";
 import type { APIProviderConfig, WebProviderInfo } from "@bindings/ai";
 import SubAgentProgressPanel from "./SubAgentProgress";
-import SessionMemoryBar from "./SessionMemoryBar";
+import AnchorTimeline from "./AnchorTimeline";
+import { useUIStore } from "../store/uiStore";
+import type { AnchorInfo } from "../bindings/ctxsvc";
 import { describeTool, type ActivityItem, type ActivityKind } from "../aiActivity";
 export type { ActivityItem, ActivityKind } from "../aiActivity";
 
@@ -117,6 +119,15 @@ export interface Message {
   content: string;
   name?: string; // tool name for tool_call/tool_result
   streaming?: boolean;
+  /** 后端会话里的事件序号，用于把锚点/审计条目精确定位到某条消息；尚未落盘的消息没有 */
+  seq?: number;
+  /**
+   * 前端侧的稳定标识：首次考虑落盘时惰性分配，此后无论这条消息被 spread 复制
+   * 多少次（流式拼接、写回 seq）都跟着走。落盘去重必须用它 —— 用对象身份会被
+   * 复制打断（写入后写不回 seq → 下次又写 → 无限循环），用内容又会把用户重复
+   * 输入的两句话当成一条。
+   */
+  uid?: string;
 }
 
 export type ModelSource = "auto" | "local" | "api" | "web";
@@ -235,7 +246,17 @@ function AIActivityTimeline({ items, isLoading }: { items: ActivityItem[]; isLoa
 }
 
 export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth, contextToAppend, activityItems = [], projectRoot, onRollback }: AIPanelProps) {
+  const ui = useUIStore();
   const [input, setInput] = React.useState("");
+  // 侧边刻度按「已有 seq 的消息」算相对位置，与 DOM 里带 data-seq 的元素保持一致。
+  const messageSeqs = React.useMemo(
+    () =>
+      messages
+        .filter((m) => !["thinking", "tool_call", "tool_result"].includes(m.role))
+        .map((m) => m.seq)
+        .filter((s): s is number => typeof s === "number" && s >= 0),
+    [messages],
+  );
   const [source, setSource] = useState<ModelSource>(() => (localStorage.getItem("ai_source") as ModelSource) || "auto");
   const [routeInfo, setRouteInfo] = useState<{ tier: string; reason: string } | null>(null);
   const [localModels, setLocalModels] = useState<LMModel[]>(LOCAL_MODELS_FALLBACK);
@@ -856,15 +877,8 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
         </div>
       )}
 
-      {projectRoot ? (
-        <SessionMemoryBar
-          projectRoot={projectRoot}
-          sessionID="main"
-          input={input}
-          onRollback={(seq) => onRollback?.(seq)}
-        />
-      ) : null}
-
+      {/* wrap 提供定位上下文：刻度条absolute挂在它上面，故不随消息内容滚动，始终可见 */}
+      <div className="ai-messages-wrap">
       <div className="ai-messages">
         {installLogs.length > 0 && (
           <div className="ai-install-logs">
@@ -912,7 +926,11 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
         )}
 
         {messages.filter((msg) => !["thinking", "tool_call", "tool_result"].includes(msg.role)).map((msg, idx) => (
-          <div key={idx} className={`ai-message ${msg.role}`}>
+          <div
+            key={idx}
+            className={`ai-message ${msg.role}`}
+            data-seq={msg.seq ?? undefined}
+          >
             <MessageBody msg={msg} t={t} />
           </div>
         ))}
@@ -934,6 +952,26 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
         )}
 
         <div ref={bottomRef} />
+      </div>
+
+      {/* 竖直锚点刻度：左键定位到该消息，右键弹出审计/回退 */}
+      {projectRoot ? (
+        <AnchorTimeline
+          projectRoot={projectRoot}
+          sessionID="main"
+          messageSeqs={messageSeqs}
+          // 消息一增删就重拉锚点：新的用户发言会在后端落一个轮次锚点，
+          // 不主动刷的话刻度尺要等到序号写回才动，看着像没反应。
+          refreshKey={messages.length}
+          onRollback={(seq) => onRollback?.(seq)}
+          // 审查：跳到右侧 AI Changes 面板，列出这一轮改过的文件与逐段版本
+          onReview={(a: AnchorInfo) => {
+            ui.setAnchorReview({ seq: a.seq, summary: a.summary || a.title || "本轮" });
+            ui.setToolPanelOpen(true);
+            ui.setActiveToolTab("changes");
+          }}
+        />
+      ) : null}
       </div>
 
       <AIActivityTimeline items={activityItems} isLoading={isLoading} />

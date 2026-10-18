@@ -101,6 +101,17 @@ func (d *DB) initSchema() error {
 		`CREATE TABLE IF NOT EXISTS events(session_id TEXT, seq INTEGER, kind TEXT, ts INTEGER, payload TEXT, refs INTEGER DEFAULT 0, PRIMARY KEY(session_id, seq))`,
 		`CREATE INDEX IF NOT EXISTS idx_events_sk ON events(session_id, kind, seq)`,
 
+		// 折叠快照的历史点（= UI 上的「锚点」）。sessions.tail_json 只保存最新一份且
+		// 会被反复覆盖，无法支撑「回退到历史上某个锚点」，所以这里单独留一份履历。
+		`CREATE TABLE IF NOT EXISTS anchors(hash TEXT, id TEXT, seq INTEGER, cover_from INTEGER DEFAULT 0, time INTEGER, title TEXT, messages INTEGER DEFAULT 0, tokens INTEGER DEFAULT 0, PRIMARY KEY(hash, id, seq))`,
+		`CREATE INDEX IF NOT EXISTS idx_anchors_sess ON anchors(hash, id, seq)`,
+		// 锚点扩展列（逐列迁移，兼容已存在的库）：见 docs/anchor-design.md。
+		`ALTER TABLE anchors ADD COLUMN kind TEXT DEFAULT 'fold'`,
+		`ALTER TABLE anchors ADD COLUMN summary TEXT DEFAULT ''`,
+		`ALTER TABLE anchors ADD COLUMN status TEXT DEFAULT 'active'`,
+		`ALTER TABLE anchors ADD COLUMN msg_seq INTEGER DEFAULT 0`,
+		`ALTER TABLE anchors ADD COLUMN turn_end_seq INTEGER DEFAULT 0`,
+
 		`CREATE TABLE IF NOT EXISTS messages(session_id TEXT, seq INTEGER, role TEXT, content TEXT, seg_id TEXT, ts INTEGER, tok INTEGER, PRIMARY KEY(session_id, seq))`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_seg ON messages(session_id, seg_id, seq)`,
 
@@ -124,11 +135,33 @@ func (d *DB) initSchema() error {
 
 		`CREATE TABLE IF NOT EXISTS links(from_seg TEXT, to_seg TEXT, kind TEXT, score REAL, reason TEXT, PRIMARY KEY(from_seg, to_seg, kind))`,
 		`CREATE INDEX IF NOT EXISTS idx_links_to ON links(to_seg)`,
+
+		// 每轮（turn 锚点）改动过的文件与改前/改后版本。内容走 blobs（内容寻址），
+		// 这里只存 sha 引用与行数统计。见 docs/anchor-design.md「审查」。
+		`CREATE TABLE IF NOT EXISTS anchor_files(hash TEXT, id TEXT, seq INTEGER, path TEXT, status TEXT, before_sha TEXT DEFAULT '', after_sha TEXT DEFAULT '', added INTEGER DEFAULT 0, removed INTEGER DEFAULT 0, updated_at INTEGER, PRIMARY KEY(hash, id, seq, path))`,
+		`CREATE INDEX IF NOT EXISTS idx_anchor_files_path ON anchor_files(hash, id, path, seq)`,
+
+		// 每轮开工时的 git 基点树（git stash create，不碰工作区）。轮末拿它做树差分，
+		// 得到这一轮精确的改前/改后。跨重启后补抓未合的轮次也要靠它。
+		`CREATE TABLE IF NOT EXISTS anchor_turn_bases(hash TEXT, id TEXT, seq INTEGER, tree TEXT, git INTEGER DEFAULT 0, ts INTEGER, PRIMARY KEY(hash, id, seq))`,
+		// snap_sha：轮次开工时的文件清单（哈希+路径）blob。git 项目里是未跟踪文件清单
+		// （配合同目录硬链接快照补抓新文件），非 git 项目里是全部文本文件清单。
+		`ALTER TABLE anchor_turn_bases ADD COLUMN snap_sha TEXT DEFAULT ''`,
+
+		// 「应用此段」流水：用户把某个锚点的某一段改动落回工作区的记录。
+		`CREATE TABLE IF NOT EXISTS anchor_applies(hash TEXT, id TEXT, seq INTEGER, path TEXT, hunk INTEGER, ok INTEGER, note TEXT, applied_at INTEGER)`,
 	}
 	for _, s := range stmts {
-		if _, err := d.sql.Exec(s); err != nil {
-			return fmt.Errorf("memdb: init schema (%s): %w", s[:min(48, len(s))], err)
+		_, err := d.sql.Exec(s)
+		if err == nil {
+			continue
 		}
+		// 列迁移用的 ALTER TABLE 在列已存在时会报错，这是正常路径（老库升级），
+		// 忽略之；其余错误照常失败。
+		if strings.HasPrefix(s, "ALTER TABLE") && strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			continue
+		}
+		return fmt.Errorf("memdb: init schema (%s): %w", s[:min(48, len(s))], err)
 	}
 	return nil
 }

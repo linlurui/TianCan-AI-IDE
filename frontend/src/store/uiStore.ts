@@ -33,6 +33,13 @@ export interface FileNavigationState {
   fileModifications: Array<{ taskId: string; taskName: string; taskIndex: number }>;
 }
 
+// 锚点审查：右键锚点「审查此锚点」时置位，AI Changes 面板随即展示该轮
+// 改动过的文件清单与逐段版本；返回时置回 null。
+export interface AnchorReviewState {
+  seq: number;
+  summary: string;
+}
+
 interface UIState {
   // Sidebar
   sidebarOpen: boolean;
@@ -97,6 +104,9 @@ interface UIState {
   navigateToNextFileModification: () => boolean;
   setSelectedTaskId: (taskId: string | null) => void;
   updateFileModifications: (tasks: any[]) => void;
+  // 锚点审查
+  anchorReview: AnchorReviewState | null;
+  setAnchorReview: (v: AnchorReviewState | null) => void;
 }
 
 export const useUIStore = create<UIState>((set, get) => ({
@@ -130,6 +140,7 @@ export const useUIStore = create<UIState>((set, get) => ({
     fileModifications: [],
   },
   selectedTaskId: null,
+  anchorReview: null,
 
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
   setSidebarTab: (tab) => set({ sidebarTab: tab }),
@@ -182,6 +193,7 @@ export const useUIStore = create<UIState>((set, get) => ({
 
   // AI Changes navigation actions
   setSelectedTaskId: (taskId) => set({ selectedTaskId: taskId }),
+  setAnchorReview: (v) => set({ anchorReview: v }),
 
   setAiChangesNavigation: (nav) => set({ aiChangesNavigation: nav }),
 

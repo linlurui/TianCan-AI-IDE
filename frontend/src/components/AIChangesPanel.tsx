@@ -29,12 +29,17 @@ import * as Task from '../bindings/task';
 import { GetFileOriginalContent } from '../bindings/task';
 import { useAgentProgressStore } from '../hooks/useAgentProgress';
 import { useTranslation } from '../i18n';
+import { useUIStore } from '../store/uiStore';
 import MonacoDiffViewer from './MonacoDiffViewer';
+import AnchorReview from './AnchorReview';
 // Re-export types for external use
 export type { AgentTask, TaskFile };
 
 interface AIChangesPanelProps {
   tasks: AgentTask[];
+  /** 项目根目录：审查模式要靠它拉取每轮文件改动 */
+  projectRoot?: string | null;
+  sessionID?: string;
   onApplyTask: (taskId: string) => void;
   onRejectTask: (taskId: string) => void;
   onApplyFile: (taskId: string, filePath: string) => void;
@@ -372,6 +377,8 @@ const TaskNode: React.FC<TaskNodeProps> = ({
 
 export const AIChangesPanel: React.FC<AIChangesPanelProps> = ({
   tasks,
+  projectRoot = null,
+  sessionID = "main",
   onApplyTask,
   onRejectTask,
   onApplyFile,
@@ -379,6 +386,8 @@ export const AIChangesPanel: React.FC<AIChangesPanelProps> = ({
   onRefresh,
 }) => {
   const { t } = useTranslation();
+  const anchorReview = useUIStore((s) => s.anchorReview);
+  const setAnchorReview = useUIStore((s) => s.setAnchorReview);
   const [loading, setLoading] = useState(false);
   const [localTasks, setLocalTasks] = useState<AgentTask[]>(tasks);
   const [error, setError] = useState<string | null>(null);
@@ -520,6 +529,20 @@ export const AIChangesPanel: React.FC<AIChangesPanelProps> = ({
   };
 
   const hasModifications = fileModifications.length > 0;
+
+  // 审查模式：右键锚点「审查此锚点」后，整个面板切换成该轮的文件改动清单。
+  // 注意必须放在所有 hooks 之后——早退会改变 hook 数量，React 会报错。
+  if (anchorReview && projectRoot) {
+    return (
+      <AnchorReview
+        projectRoot={projectRoot}
+        sessionID={sessionID ?? "main"}
+        seq={anchorReview.seq}
+        summary={anchorReview.summary}
+        onClose={() => setAnchorReview(null)}
+      />
+    );
+  }
 
   return (
     <div

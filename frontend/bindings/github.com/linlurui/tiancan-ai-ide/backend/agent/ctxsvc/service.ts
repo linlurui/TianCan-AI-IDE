@@ -68,6 +68,52 @@ export interface AnchorInfo {
   title: string;
   messages: number;
   tokens: number;
+  kind: string;
+  summary: string;
+  status: string;
+  msgSeq: number;
+  turnEndSeq: number;
+}
+
+export interface AnchorHitView {
+  anchor: AnchorInfo;
+  hitSeq: number;
+  score: number;
+  snippet: string;
+}
+
+// ── 审查（每轮文件改动与版本）──────────────────────────────────────────────
+
+export interface AnchorFileView {
+  path: string;
+  status: string; // A 新增 | M 修改 | D 删除
+  added: number;
+  removed: number;
+  updatedAt: number;
+}
+
+export interface AnchorHunkView {
+  index: number;
+  beforeStart: number;
+  beforeEnd: number;
+  afterStart: number;
+  afterEnd: number;
+  before: string[];
+  after: string[];
+  /** 被后续修改占用：UI 灰掉 + 删除线，禁用应用 */
+  superseded: boolean;
+  reason: string;
+  applied: boolean;
+}
+
+export interface AnchorFileDetail {
+  path: string;
+  status: string;
+  added: number;
+  removed: number;
+  beforeContent: string;
+  afterContent: string;
+  hunks: AnchorHunkView[];
 }
 
 export interface AuditEntry {
@@ -204,6 +250,31 @@ export function SessionDropAnchor(projectRoot: string, sessionID: string): $Canc
 /** SessionRollback 回退到指定 seq（审计流水保留）。 */
 export function SessionRollback(projectRoot: string, sessionID: string, target: number, note: string): $CancellablePromise<void> {
   return $wrap<void>($Call.ByName($ns + "SessionRollback", projectRoot, sessionID, target, note));
+}
+
+/** SessionArchiveAnchor 在 active / archived 之间翻转一个工作单元。归档后不再带入 prompt 全文。 */
+export function SessionArchiveAnchor(projectRoot: string, sessionID: string, seq: number, archived: boolean): $CancellablePromise<void> {
+  return $wrap<void>($Call.ByName($ns + "SessionArchiveAnchor", projectRoot, sessionID, seq, archived));
+}
+
+/** SessionSearchAnchors 按内容检索历史工作单元（"像之前那个做法一样"）。 */
+export function SessionSearchAnchors(projectRoot: string, sessionID: string, query: string, limit: number): $CancellablePromise<AnchorHitView[] | null> {
+  return $wrap<AnchorHitView[] | null>($Call.ByName($ns + "SessionSearchAnchors", projectRoot, sessionID, query, limit));
+}
+
+/** SessionAnchorFiles 列出某一轮（锚点）改动过的文件（先补抓再返回）。 */
+export function SessionAnchorFiles(projectRoot: string, sessionID: string, seq: number): $CancellablePromise<AnchorFileView[] | null> {
+  return $wrap<AnchorFileView[] | null>($Call.ByName($ns + "SessionAnchorFiles", projectRoot, sessionID, seq));
+}
+
+/** SessionAnchorFileDetail 某个文件在该轮的完整审查内容：两个版本 + 逐段 diff + 每段能否应用。 */
+export function SessionAnchorFileDetail(projectRoot: string, sessionID: string, seq: number, path: string): $CancellablePromise<AnchorFileDetail> {
+  return $wrap<AnchorFileDetail>($Call.ByName($ns + "SessionAnchorFileDetail", projectRoot, sessionID, seq, path));
+}
+
+/** SessionApplyAnchorHunk 把某一轮的某一段改动还原回工作区（局部回退）。 */
+export function SessionApplyAnchorHunk(projectRoot: string, sessionID: string, seq: number, path: string, hunk: number): $CancellablePromise<void> {
+  return $wrap<void>($Call.ByName($ns + "SessionApplyAnchorHunk", projectRoot, sessionID, seq, path, hunk));
 }
 
 /** SessionStats 会话与索引诊断信息。 */

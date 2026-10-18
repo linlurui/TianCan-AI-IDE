@@ -136,8 +136,15 @@ func TestAnchorThenReopenRecovers(t *testing.T) {
 	if info.Messages != 5 {
 		t.Fatalf("anchor should cover 5 messages, got %d", info.Messages)
 	}
-	if len(sess.Anchors()) != 1 {
-		t.Fatalf("want 1 anchor, got %d", len(sess.Anchors()))
+	// 每轮 user 消息都会自动打 turn 锚点（5 条 user + 1 个手动），但手动那个必须在。
+	manual := 0
+	for _, a := range sess.Anchors() {
+		if a.Kind == "fold" {
+			manual++
+		}
+	}
+	if manual != 1 {
+		t.Fatalf("want exactly 1 manual fold anchor, got %d", manual)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
@@ -150,6 +157,240 @@ func TestAnchorThenReopenRecovers(t *testing.T) {
 	}
 	if got := len(sess2.State().Messages); got != 5 {
 		t.Fatalf("recovery lost messages: %d", got)
+	}
+}
+
+// 侧边「刻度时间线」要能列出多个可跳转的点。tail_json 是覆盖式的，所以这里
+// 守住 anchors 履历不被每次折叠冲掉 —— 退化回单点时这个用例必须失败。
+func TestAnchorsHistoryAccumulates(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+	defer st.Close()
+	sess, _ := st.Open("/proj/anchors")
+
+	var seqs []int64
+	for round := 0; round < 3; round++ {
+		s, err := sess.AppendMessage(RoleUser, "第 "+string(rune('A'+round))+" 轮")
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, s)
+		if _, err := sess.DropAnchor(); err != nil {
+			t.Fatalf("drop anchor %d: %v", round, err)
+		}
+	}
+	got := sess.Anchors()
+	if len(got) != 3 {
+		t.Fatalf("want 3 anchors accumulated, got %d", len(got))
+	}
+	for i, a := range got {
+		if a.Seq != seqs[i] {
+			t.Fatalf("anchor %d seq = %d, want %d", i, a.Seq, seqs[i])
+		}
+		if a.Messages != i+1 {
+			t.Fatalf("anchor %d messages = %d, want %d", i, a.Messages, i+1)
+		}
+	}
+
+	// 回退到第一个锚点：比它新的锚点描述的未来已经不存在了，必须一并清掉，
+	// 否则 UI 会给出一个「跳不回去」的点。
+	if err := sess.Rollback(seqs[0], ""); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if got := sess.Anchors(); len(got) != 1 || got[0].Seq != seqs[0] {
+		t.Fatalf("after rollback want only anchor #%d, got %+v", seqs[0], got)
+	}
+}
+
+// 锚点履历必须持久化，而不是只活在内存里。
+func TestAnchorsSurviveReopen(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+	sess, _ := st.Open("/proj/anchors2")
+	want := map[int64]bool{}
+	for i := 0; i < 3; i++ {
+		s, err := sess.AppendMessage(RoleUser, "消息 "+string(rune('A'+i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sess.DropAnchor(); err != nil {
+			t.Fatal(err)
+		}
+		want[s] = true
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st2 := NewStore(dir)
+	defer st2.Close()
+	sess2, err := st2.Open("/proj/anchors2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := sess2.Anchors()
+	if len(got) != len(want) {
+		t.Fatalf("want %d anchors after reopen, got %d", len(want), len(got))
+	}
+	for _, a := range got {
+		if !want[a.Seq] {
+			t.Fatalf("unexpected anchor seq %d after reopen", a.Seq)
+		}
+	}
+}
+
+// 每轮用户发言应自动生成一个 turn 锚点（零手打），下一轮发言时闭合上一轮区间，
+// 归档可翻转、检索能按内容映射回工作单元。
+func TestTurnAnchorsAutoCreatedAndSearchable(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+	defer st.Close()
+	sess, _ := st.Open("/proj/turns")
+
+	if _, err := sess.AppendMessage(RoleUser, "把会话消息持久化到后端磁盘"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AppendMessage(RoleAssistant, "已实现：统一 SQLite 存储"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AppendMessage(RoleUser, "把部署脚本改成幂等的"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AppendMessage(RoleAssistant, "部署脚本已加锁与检查"); err != nil {
+		t.Fatal(err)
+	}
+
+	anchors := sess.Anchors()
+	var turns []AnchorInfo
+	for _, a := range anchors {
+		if a.Kind == "turn" {
+			turns = append(turns, a)
+		}
+	}
+	if len(turns) != 2 {
+		t.Fatalf("want 2 turn anchors (one per user message), got %d (all=%+v)", len(turns), anchors)
+	}
+	if turns[0].Summary == "" || !strings.Contains(turns[0].Summary, "持久化") {
+		t.Fatalf("turn 0 summary should distill the user ask, got %q", turns[0].Summary)
+	}
+	// 第一轮已被第二条用户消息闭合；第二轮仍开放（turn_end_seq=0）。
+	if turns[0].TurnEndSeq == 0 {
+		t.Fatal("turn 0 should have been closed by the next user message")
+	}
+	if turns[1].TurnEndSeq != 0 {
+		t.Fatalf("turn 1 should still be open, got end=%d", turns[1].TurnEndSeq)
+	}
+
+	// 归档第一轮：状态翻转，其余不动。
+	if err := sess.ArchiveAnchor(turns[0].Seq, true); err != nil {
+		t.Fatal(err)
+	}
+	after := sess.Anchors()
+	if after[0].Status != "archived" || after[1].Status != "active" {
+		t.Fatalf("archive flip failed: %+v", after)
+	}
+	if err := sess.ArchiveAnchor(turns[0].Seq, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.Anchors()[0].Status; got != "active" {
+		t.Fatalf("unarchive failed, got %s", got)
+	}
+
+	// 内容检索："部署"应命中第二轮而不是第一轮。
+	hits := sess.SearchAnchors("部署脚本", 5)
+	if len(hits) == 0 {
+		t.Fatal("search should find the deployment turn")
+	}
+	if hits[0].Anchor.Seq != turns[1].Seq {
+		t.Fatalf("search hit wrong anchor: got #%d want #%d", hits[0].Anchor.Seq, turns[1].Seq)
+	}
+	if hits[0].Anchor.Summary == "" {
+		t.Fatal("hit anchor should carry a summary")
+	}
+}
+
+// 折叠快照与用户轮次可能落在同一个事件上。折叠行绝不能把轮次行连同它的
+// 摘要一起覆盖掉，否则时间轴上这一轮会变成一个没有摘要的灰色点。
+func TestFoldNeverErasesATurnOnTheSameEvent(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+	defer st.Close()
+	sess, _ := st.Open("/proj/fold-vs-turn")
+	if _, err := sess.AppendMessage(RoleUser, "把回退做成跨重启可恢复的"); err != nil {
+		t.Fatal(err)
+	}
+	// 关闭会话会保存折叠快照，落点正好是上面那条用户消息的 seq。
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+	anchors := sess.Anchors()
+	var turn *AnchorInfo
+	for i := range anchors {
+		if anchors[i].Kind == "turn" {
+			turn = &anchors[i]
+		}
+	}
+	if turn == nil {
+		t.Fatalf("turn anchor was erased by the fold at the same seq: %+v", anchors)
+	}
+	if turn.MsgSeq != 1 {
+		t.Fatalf("turn should still sit on the user message, got msg_seq=%d", turn.MsgSeq)
+	}
+	if !strings.Contains(turn.Summary, "回退") {
+		t.Fatalf("turn summary lost: %q", turn.Summary)
+	}
+}
+
+// 老会话（自动打点上线前就存在的）打开时必须补出历史轮次，否则刻度尺一片空白，
+// 看起来就像功能没做。且回填不能覆盖已有行。
+func TestBackfillTurnAnchorsForExistingSession(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+	sess, _ := st.Open("/proj/backfill")
+	_, _ = sess.AppendMessage(RoleUser, "第一条：把会话落盘")
+	_, _ = sess.AppendMessage(RoleAssistant, "好")
+	_, _ = sess.AppendMessage(RoleUser, "第二条：加刻度尺")
+	// 模拟老会话：一行锚点都没有。
+	if err := sess.db.Exec(`DELETE FROM anchors WHERE hash=? AND id=?`, sess.hash, sess.id); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st2 := NewStore(dir)
+	defer st2.Close()
+	sess2, err := st2.Open("/proj/backfill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var turns []AnchorInfo
+	for _, a := range sess2.Anchors() {
+		if a.Kind == "turn" {
+			turns = append(turns, a)
+		}
+	}
+	if len(turns) != 2 {
+		t.Fatalf("want 2 backfilled turns, got %d (%+v)", len(turns), sess2.Anchors())
+	}
+	if !strings.Contains(turns[0].Summary, "落盘") || !strings.Contains(turns[1].Summary, "刻度尺") {
+		t.Fatalf("backfill summaries wrong: %q / %q", turns[0].Summary, turns[1].Summary)
+	}
+	if turns[0].TurnEndSeq == 0 {
+		t.Fatal("first turn should be closed by the next user message")
+	}
+	if turns[1].TurnEndSeq != 0 {
+		t.Fatal("last turn should stay open")
+	}
+	// 重开一次：已有行不能被重复写，数量必须稳定。
+	if err := st2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st3 := NewStore(dir)
+	defer st3.Close()
+	sess3, _ := st3.Open("/proj/backfill")
+	if got := len(sess3.Anchors()); got != 2 {
+		t.Fatalf("reopen should stay at 2 anchors, got %d", got)
 	}
 }
 
@@ -404,5 +645,54 @@ func TestListSessionsIncludesOnDiskOnly(t *testing.T) {
 	}
 	if list[0].Messages != 1 {
 		t.Fatalf("message count lost: %d", list[0].Messages)
+	}
+}
+
+// fakeCap records the hook calls without touching git or the filesystem.
+type fakeCap struct {
+	begun    []int64
+	captured []int64
+	opened   int
+}
+
+func (f *fakeCap) Begin(seq int64)              { f.begun = append(f.begun, seq) }
+func (f *fakeCap) Capture(seq int64) error      { f.captured = append(f.captured, seq); return nil }
+func (f *fakeCap) CaptureOpen()                 { f.opened++ }
+
+func TestTurnCaptureHooksFireAtTurnBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	st := NewStore(dir)
+	defer st.Close()
+	sess, _ := st.Open("/proj/capture")
+
+	cap := &fakeCap{}
+	sess.SetCapture(cap)
+
+	s1, _ := sess.AppendMessage(RoleUser, "第一轮")
+	sess.AppendMessage(RoleAssistant, "回复")
+	s2, _ := sess.AppendMessage(RoleUser, "第二轮")
+
+	// 每个用户消息各 Begin 一次；上一轮在下一条用户消息到来时闭合并 Capture。
+	if len(cap.begun) != 2 || cap.begun[0] != s1 || cap.begun[1] != s2 {
+		t.Fatalf("want Begin at both user messages, got %+v", cap.begun)
+	}
+	if len(cap.captured) != 1 || cap.captured[0] != s1 {
+		t.Fatalf("want the closed turn captured once, got %+v", cap.captured)
+	}
+
+	// 归档也补抓一次（幂等，审查面板要能立刻看到版本）。
+	if err := sess.ArchiveAnchor(s2, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(cap.captured) != 2 || cap.captured[1] != s2 {
+		t.Fatalf("archive should capture the turn, got %+v", cap.captured)
+	}
+
+	// 关会话把仍开着的轮次全部落库。
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if cap.opened != 1 {
+		t.Fatalf("Close should flush open turns once, got %d", cap.opened)
 	}
 }

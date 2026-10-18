@@ -1,3 +1,5 @@
+// Thin re-export layer: components import from here instead of reaching into
+// the generated binding tree directly (its layout is generator-owned).
 export {
   SessionOpen,
   SessionList,
@@ -16,12 +18,18 @@ export {
   SessionAnchors,
   SessionDropAnchor,
   SessionRollback,
+  SessionArchiveAnchor,
+  SessionSearchAnchors,
+  SessionAnchorFiles,
+  SessionAnchorFileDetail,
+  SessionApplyAnchorHunk,
   SessionStats,
   PromptPreview,
   EmbeddingConfig,
   Now,
 } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/ctxsvc/service";
 
+// Types live next to their Go packages in the generated tree.
 export type {
   SessionInfo,
   MsgView,
@@ -29,10 +37,13 @@ export type {
   Requirement,
   Redline,
   AnchorInfo,
+  AnchorHitView,
+  AnchorFileView,
+  AnchorHunkView,
+  AnchorFileDetail,
   AuditEntry,
   RecallHit,
   Packed,
   PackedSection,
-  EmbeddingConfigInfo,
   RemoteConfig,
 } from "../../bindings/github.com/linlurui/tiancan-ai-ide/backend/agent/ctxsvc/service";
