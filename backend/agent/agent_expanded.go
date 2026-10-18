@@ -166,12 +166,18 @@ func (a *AgentV2) RunV2(ctx context.Context, userMessage string, maxIter int, ch
 		}
 
 		// Advanced compaction check
-		if a.advCompactor.Plan(msgs) != nil {
-			result, _, err := a.advCompactor.Execute(msgs, a.advCompactor.Plan(msgs))
-			if err == nil && result != nil {
-				msgs = append(result.SummaryMessages, msgs[len(msgs)-4:]...)
+			if a.advCompactor.Plan(msgs) != nil {
+				result, _, err := a.advCompactor.Execute(msgs, a.advCompactor.Plan(msgs))
+				if err == nil && result != nil {
+					// Keep the last few messages verbatim, clamped: a summary
+					// shorter than 4 messages would panic on a negative bound.
+					keep := len(msgs) - 4
+					if keep < 0 {
+						keep = 0
+					}
+					msgs = append(result.SummaryMessages, msgs[keep:]...)
+				}
 			}
-		}
 
 		// Get AI response
 		response, err := chatFn(systemPrompt, msgs)

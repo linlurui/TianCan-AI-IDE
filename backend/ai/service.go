@@ -22,13 +22,15 @@ import (
 
 	"log"
 
+	"github.com/google/uuid"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent"
-	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
-	"github.com/linlurui/tiancan-ai-ide/backend/events"
+	agentmemory "github.com/linlurui/tiancan-ai-ide/backend/agent/memory"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
 	agenttypes "github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 	aiprovider "github.com/linlurui/tiancan-ai-ide/backend/ai/providers"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
+	"github.com/linlurui/tiancan-ai-ide/backend/events"
 	"github.com/linlurui/tiancan-ai-ide/backend/memory"
 	"github.com/linlurui/tiancan-ai-ide/backend/router"
 	"github.com/linlurui/tiancan-ai-ide/backend/sandbox"
@@ -75,7 +77,8 @@ type Service struct {
 	providerRegistry *aiprovider.Registry
 	activeProvider   string // ID of active provider
 	// Agent mode
-	lastAgents map[string]*agent.Agent // rootPath → last agent of that project
+	lastConversations map[string][]agent.Message // rootPath → last finished transcript
+	autoMemSys        *agentmemory.MemorySystem  // Auto Memory store, created on first use
 }
 
 // SetSink 注入 G3 ProgressSink（PC 端/测试用）；传 nil 恢复 App 桥接。
@@ -3239,6 +3242,7 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 			result.Done = true
 			result.Messages = messages
 			s.emitProgress(i+1, "local", "", nil, resp, true, "")
+			s.finishChatTurn(rootPath, "local", messages)
 			return result
 		}
 
@@ -3259,6 +3263,7 @@ func (s *Service) AgentRun(userMessage string, rootPath string, maxIterations in
 	result.Messages = messages
 	result.Error = fmt.Sprintf("达到最大迭代次数 %d", maxIterations)
 	s.emitProgress(maxIterations, "local", "", nil, "", true, result.Error)
+	s.finishChatTurn(rootPath, "local", messages)
 	return result
 }
 
@@ -3323,6 +3328,7 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 			result.Done = true
 			result.Messages = messages
 			s.emitProgress(i+1, "api", "", nil, resp, true, "")
+			s.finishChatTurn(rootPath, "api", messages)
 			return result
 		}
 
@@ -3340,6 +3346,7 @@ func (s *Service) AgentRunAPI(userMessage string, rootPath string, maxIterations
 	result.Messages = messages
 	result.Error = fmt.Sprintf("达到最大迭代次数 %d", maxIterations)
 	s.emitProgress(maxIterations, "api", "", nil, "", true, result.Error)
+	s.finishChatTurn(rootPath, "api", messages)
 	return result
 }
 
@@ -3489,6 +3496,10 @@ func (s *Service) SmartAgentRunV2(userMessage string, rootPath string, maxIterat
 	// 统一走标准 V2 工具循环，确保所有 provider 都能持续收到工具执行结果。
 	// Parallel/Ralph V2 目前只完成了单轮工具执行，不适合作为 Auto 默认路径。
 	result := agentV2.RunV2(ctx, userMessageWithMemory, maxIterations, agentChatFn)
+
+	// Memory pass. Mode "" → whatever provider Service.Chat is configured for:
+	// the notes rewrite only needs a working LLM, not the routing V2 picked.
+	s.finishAgentTurn(rootPath, "", result.Messages)
 
 	// 转换结果
 	return AgentRunResultV2{
@@ -4131,6 +4142,7 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 			if !hasTool {
 				// Done — final response already streamed
 				s.emitProgress(i+1, "local", "", nil, resp, true, "")
+				s.finishChatTurn(rootPath, "local", messages)
 				ch <- AgentStreamEvent{Type: "done", Content: resp}
 				return
 			}
@@ -4204,6 +4216,9 @@ func (s *Service) AgentStream(userMessage string, rootPath string, maxIterations
 			})
 		}
 
+		// Hit the iteration cap — the turn is over even if the model never
+		// closed it, so memory still gets its pass over what was produced.
+		s.finishChatTurn(rootPath, "local", messages)
 		ch <- AgentStreamEvent{Type: "error", Content: fmt.Sprintf("达到最大迭代次数 %d", maxIterations)}
 		s.emitProgress(maxIterations, "local", "", nil, "", true, fmt.Sprintf("达到最大迭代次数 %d", maxIterations))
 	}()
@@ -4521,10 +4536,6 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 	// Build chat function based on mode
 	chatFn := s.buildChatFn(mode, rootPath, userMessage)
 
-	// Remember the agent so later actions (memory extraction on demand) can
-	// reuse this conversation instead of rebuilding it.
-	s.rememberAgent(rootPath, a)
-
 	// Wire agent loop progress to frontend via Wails events
 	a.SetProgressCallback(func(iteration int, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string) {
 		if s.hasEmitter() {
@@ -4541,7 +4552,12 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 		}
 	})
 
-	return a.Run(context.Background(), userMessageWithMemory, maxIterations, chatFn)
+	result := a.Run(context.Background(), userMessageWithMemory, maxIterations, chatFn)
+	// The loop already ran the memory pipeline (see Agent.flushMemory); the
+	// transcript only has to stay reachable for the manual "organize memory"
+	// trigger, same as every other chat entry point does.
+	s.rememberConversation(rootPath, identifyMessages(result.Messages))
+	return result
 }
 
 // buildChatFn wires the agent's model call to the selected backend ("local",
@@ -4580,44 +4596,146 @@ func (s *Service) buildChatFn(mode, rootPath, userMessage string) agent.ChatFunc
 	}
 }
 
-// maxRememberedAgents caps how many project agents are kept alive for later
-// actions. Small enough to be irrelevant as memory pressure, large enough to
-// cover switching between a few projects in one session.
-const maxRememberedAgents = 8
+// maxRememberedConversations caps how many project transcripts are kept for
+// later actions (e.g. the "organize memory" button). Small enough to be
+// irrelevant as memory pressure, large enough to cover switching between a few
+// projects in one session.
+const maxRememberedConversations = 8
 
-// rememberAgent keeps the last agent of a project reachable after its Run
-// returns (needed by ExtractSessionMemoryNow).
-func (s *Service) rememberAgent(rootPath string, a *agent.Agent) {
-	if a == nil {
-		return
-	}
+// autoMemory returns the shared Auto Memory store, created on first use.
+//
+// The UI's chat loops (AgentRun*, AgentStream, SmartAgentRunV2) build their own
+// transcripts and never share an *agent.Agent, so the store has to live here
+// too — otherwise every advanced-agent-only hook silently no-ops in production.
+// One instance per Service keeps a single writer for the persisted cursor in
+// ~/.tiancan/memory.
+func (s *Service) autoMemory() *agentmemory.MemorySystem {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lastAgents == nil {
-		s.lastAgents = map[string]*agent.Agent{}
+	if s.autoMemSys == nil {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			home = os.TempDir()
+		}
+		s.autoMemSys = agentmemory.NewMemorySystem(home)
 	}
-	if len(s.lastAgents) >= maxRememberedAgents {
+	return s.autoMemSys
+}
+
+// rememberConversation keeps the last finished transcript of a project so later
+// actions (the manual "organize memory" trigger) can use it.
+func (s *Service) rememberConversation(rootPath string, msgs []agent.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastConversations == nil {
+		s.lastConversations = map[string][]agent.Message{}
+	}
+	if len(s.lastConversations) >= maxRememberedConversations {
 		// Simple bound: start over rather than guessing which project is coldest.
-		s.lastAgents = map[string]*agent.Agent{}
+		s.lastConversations = map[string][]agent.Message{}
 	}
-	s.lastAgents[rootPath] = a
+	s.lastConversations[rootPath] = msgs
+}
+
+// lastConversation returns a copy of the last finished transcript.
+func (s *Service) lastConversation(rootPath string) []agent.Message {
+	s.mu.Lock()
+	msgs := s.lastConversations[rootPath]
+	s.mu.Unlock()
+	if len(msgs) == 0 {
+		return nil
+	}
+	out := make([]agent.Message, len(msgs))
+	copy(out, msgs)
+	return out
+}
+
+// finishChatTurn closes out a finished turn of one of the Service's own chat
+// loops: remember the transcript, then run the Auto Memory pipeline over it.
+//
+// Every loop in this file must land here. They talk to the model directly with
+// their own []ChatMessage history, so wiring memory only into agent.Agent.Run
+// leaves the whole UI memoryless.
+func (s *Service) finishChatTurn(rootPath, mode string, msgs []ChatMessage) {
+	s.finishAgentTurn(rootPath, mode, chatMessagesToAgentMessages(msgs))
+}
+
+// finishAgentTurn is finishChatTurn for transcripts already in agent.Message
+// shape (the V2 router produces those).
+func (s *Service) finishAgentTurn(rootPath, mode string, msgs []agent.Message) {
+	msgs = identifyMessages(msgs)
+	if len(msgs) == 0 {
+		return
+	}
+	s.rememberConversation(rootPath, msgs)
+	s.runMemoryPipeline(rootPath, mode, msgs)
+}
+
+// runMemoryPipeline runs the end-of-turn Auto Memory steps for a transcript:
+// the cheap keyword pass synchronously, and (when the token/tool thresholds
+// fire) the heavier SESSION_MEMORY.md extraction in the background.
+func (s *Service) runMemoryPipeline(rootPath, mode string, msgs []agent.Message) {
+	ms := s.autoMemory()
+	if ms == nil || !ms.IsEnabled() {
+		return
+	}
+	agentmemory.RunFlush(ms, msgs, s.buildChatFn(mode, rootPath, ""), s.emitMemoryError)
+}
+
+// chatMessagesToAgentMessages converts a raw chat transcript into the shape the
+// memory pipeline consumes. The system prompt is dropped: it describes the tools
+// of this one loop, not a user intent worth remembering.
+func chatMessagesToAgentMessages(msgs []ChatMessage) []agent.Message {
+	out := make([]agent.Message, 0, len(msgs))
+	for _, m := range msgs {
+		switch agent.MessageRole(m.Role) {
+		case agent.RoleUser:
+			out = append(out, agent.Message{Role: agent.RoleUser, Content: m.Content})
+		case agent.RoleAssistant:
+			out = append(out, agent.Message{Role: agent.RoleAssistant, Content: m.Content})
+		}
+	}
+	return out
+}
+
+// identifyMessages guarantees every message carries a UUID and a timestamp.
+// The memory cursor is keyed off UUIDs: without them each pass rescans the
+// whole transcript and re-appends every old "remember X" line.
+func identifyMessages(msgs []agent.Message) []agent.Message {
+	if len(msgs) == 0 {
+		return nil
+	}
+	out := make([]agent.Message, len(msgs))
+	copy(out, msgs)
+	for i := range out {
+		if out[i].UUID == "" {
+			out[i].UUID = uuid.NewString()
+		}
+		if out[i].Timestamp.IsZero() {
+			out[i].Timestamp = time.Now()
+		}
+	}
+	return out
+}
+
+// emitMemoryError reports a background extraction failure. Never fatal: a lost
+// note must not break a chat turn.
+func (s *Service) emitMemoryError(err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("ai: session memory extraction failed: %v", err)
 }
 
 // ExtractSessionMemoryNow forces a session-memory extraction over the current
 // conversation of a project, ignoring thresholds — the user-facing "organize
 // my notes now" action. It also flushes "remember X" lines that are waiting.
 func (s *Service) ExtractSessionMemoryNow(rootPath, mode string) error {
-	s.mu.Lock()
-	a := s.lastAgents[rootPath]
-	s.mu.Unlock()
-	if a == nil {
+	messages := s.lastConversation(rootPath)
+	if len(messages) == 0 {
 		return errors.New("这个项目还没有会话记录")
 	}
-	messages := a.GetMessages()
-	if len(messages) == 0 {
-		return errors.New("当前会话还没有内容可整理")
-	}
-	ms := a.MemorySystem()
+	ms := s.autoMemory()
 	if ms == nil || !ms.IsEnabled() {
 		return errors.New("记忆系统已关闭（TIANCAN_DISABLE_AUTO_MEMORY）")
 	}
@@ -5066,6 +5184,7 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 			result.Done = true
 			result.Messages = messages
 			s.emitProgress(i+1, "web", "", nil, finalAnswer, true, "")
+			s.finishChatTurn(rootPath, "web", messages)
 			return result
 		}
 
@@ -5132,5 +5251,6 @@ func (s *Service) AgentRunWeb(userMessage string, rootPath string, maxIterations
 	result.Messages = messages
 	result.Error = fmt.Sprintf("达到最大迭代次数 %d", maxIterations)
 	s.emitProgress(maxIterations, "web", "", nil, "", true, result.Error)
+	s.finishChatTurn(rootPath, "web", messages)
 	return result
 }

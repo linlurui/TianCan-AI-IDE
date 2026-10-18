@@ -196,26 +196,9 @@ func (a *Agent) SetProgressCallback(cb ProgressCallback) {
 	a.progressCB = cb
 }
 
-// MemorySystem exposes the recorder so callers can drive memory actions
-// (extraction, resets) without going through the agent loop.
-func (a *Agent) MemorySystem() *memory.MemorySystem {
-	return a.memorySys
-}
-
 // GetRollbackManager returns the rollback manager for file versioning.
 func (a *Agent) GetRollbackManager() *ralph.RollbackManager {
 	return a.rollbackMgr
-}
-
-// GetMessages returns a copy of the conversation history. Exported so callers
-// (the UI's "organize memory now" action) can drive a memory extraction over
-// the current conversation without re-entering the agent loop.
-func (a *Agent) GetMessages() []Message {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	out := make([]Message, len(a.messages))
-	copy(out, a.messages)
-	return out
 }
 
 // Registry returns the tool registry so callers can inject shared dependencies.
@@ -725,27 +708,27 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 				}
 			}
 			if isClar {
-			// The user's answer is fed back as a user message and the
-			// loop re-runs with it in context (do/while re-prompt).
-			messages = append(messages, Message{
-				Role:      RoleUser,
-				Content:   answer,
-				Timestamp: time.Now(),
-				UUID:      uuid.NewString(),
-			})
+				// The user's answer is fed back as a user message and the
+				// loop re-runs with it in context (do/while re-prompt).
+				messages = append(messages, Message{
+					Role:      RoleUser,
+					Content:   answer,
+					Timestamp: time.Now(),
+					UUID:      uuid.NewString(),
+				})
 				totalTokens += len(answer) / 4
 				continue
 			}
 
-		// No more tool calls - done
-		a.mu.Lock()
-		a.messages = messages
-		cb := a.progressCB
-		a.mu.Unlock()
+			// No more tool calls - done
+			a.mu.Lock()
+			a.messages = messages
+			cb := a.progressCB
+			a.mu.Unlock()
 
-		// Memory pipeline: keyword scan first (cheap, synchronous, must not
-		// be skipped), then the threshold-gated session-memory extraction.
-		a.flushMemory(messages, chatFn)
+			// Memory pipeline: keyword scan first (cheap, synchronous, must not
+			// be skipped), then the threshold-gated session-memory extraction.
+			a.flushMemory(messages, chatFn)
 
 			if cb != nil {
 				cb(iteration, "", nil, response, true, "")
@@ -801,23 +784,12 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 //
 // A snapshot of the messages is taken so the background call cannot race with
 // the caller reusing the slice.
+//
+// This is a thin wrapper around memory.RunFlush, which is the single
+// implementation shared with the Service's own chat loops — those never enter
+// the agent loop, so a pipeline living only here would leave them memoryless.
 func (a *Agent) flushMemory(messages []Message, chatFn ChatFunc) {
-	if a.memorySys == nil || !a.memorySys.IsEnabled() {
-		return
-	}
-	_ = a.memorySys.ExtractMemories(messages)
-	if chatFn == nil || !a.memorySys.ShouldExtractMemory(messages) {
-		return
-	}
-	msgs := make([]Message, len(messages))
-	copy(msgs, messages)
-	// ShouldExtractMemory already moved the cursor; the extraction below uses
-	// the state machine so a later turn waits instead of stacking rewrites.
-	go func() {
-		if err := a.memorySys.ExtractSessionMemory(msgs, chatFn); err != nil {
-			a.emitMemoryError(err)
-		}
-	}()
+	memory.RunFlush(a.memorySys, messages, chatFn, a.emitMemoryError)
 }
 
 // runCompact compacts the conversation, carrying session memory into the

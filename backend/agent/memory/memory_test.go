@@ -3,12 +3,17 @@ package memory
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 )
+
+// tagPattern pulls the tags the update prompt tells the model to use
+// ("wrapped in a single <a>...</b> block").
+var tagPattern = regexp.MustCompile(`wrapped in a single <([a-z_]+)>\.\.\.</([a-z_]+)> block`)
 
 // newTestMem points the memory dir at a temp dir so nothing touches the real
 // ~/.tiancan/memory while tests run.
@@ -248,6 +253,101 @@ func TestDailyLogLayout(t *testing.T) {
 }
 
 // TestDisabledMemoryIsSilent: with the kill switch on, nothing must touch disk.
+// TestUpdatePromptTagsMatchParser: the prompt tells the model which tags to
+// wrap the notes in, and the parser only accepts one exact pair. They drifted
+// once (prompt said </updated_>, parser looked for </updated_notes>), which
+// made EVERY extraction report "empty notes" and — after 3 failures — tripped
+// the kill switch permanently. Guard the round trip itself.
+func TestUpdatePromptTagsMatchParser(t *testing.T) {
+	m := newTestMem(t)
+	prompt := m.BuildSessionMemoryUpdatePrompt("")
+
+	tags := tagPattern.FindStringSubmatch(prompt)
+	if tags == nil {
+		t.Fatalf("prompt no longer declares the wrapper tags:\n%s", prompt)
+	}
+	open, close := tags[1], tags[2]
+	if open != "updated_notes" || close != "updated_notes" {
+		t.Fatalf("prompt asks for <%s>...</%s>, parser handles <updated_notes>...</updated_notes>", open, close)
+	}
+
+	if err := m.SetupSessionMemoryFile(); err != nil {
+		t.Fatal(err)
+	}
+	reply := "思考过程……\n<" + open + ">\n" + loadTemplate(t, m) + "\n- 做完了\n</" + close + ">\n收尾"
+	if err := m.writeSessionMemoryFromOutput(reply); err != nil {
+		t.Fatalf("a reply following the prompt must be accepted: %v", err)
+	}
+	if got := readFile(t, m.GetSessionMemoryPath()); !strings.Contains(got, "做完了") {
+		t.Fatalf("notes were not written:\n%s", got)
+	}
+}
+
+// TestFailedExtractionReleasesWait: WaitForExtraction must not keep waiting on
+// a run that already ended in failure.
+func TestFailedExtractionReleasesWait(t *testing.T) {
+	m := newTestMem(t)
+	if err := m.SetupSessionMemoryFile(); err != nil {
+		t.Fatal(err)
+	}
+	broken := func(string, []types.Message) (string, error) {
+		return "抱歉，我无法完成。", nil
+	}
+	if err := m.ExtractSessionMemory([]types.Message{msg("u1", hi)}, broken); err == nil {
+		t.Fatal("expected the extraction to fail")
+	}
+	if m.consecutiveFailures != 1 {
+		t.Fatalf("failure not recorded: %d", m.consecutiveFailures)
+	}
+	done := make(chan struct{})
+	go func() { m.WaitForExtraction(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForExtraction hangs after a failed extraction")
+	}
+}
+
+// TestRunFlushIsSharedPipeline: one implementation, both stages — the keyword
+// pass lands synchronously, the heavy extraction runs in the background only
+// once the token threshold fires.
+func TestRunFlushIsSharedPipeline(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TIANCAN_MEMORY_DIR", dir)
+	// Keep the fixture small but still over both thresholds: real defaults are
+	// 10k tokens to initialize and 5k further tokens per update.
+	t.Setenv("TIANCAN_MEMORY_MIN_TOKENS_INIT", "20")
+	t.Setenv("TIANCAN_MEMORY_MIN_TOKENS_UPDATE", "10")
+	m := NewMemorySystem(dir)
+
+	msgs := []types.Message{
+		msg("u1", "请记住我用 tab 缩进"),
+		msg("u2", strings.Repeat("上下文 ", 60)),
+	}
+	chatFn := func(string, []types.Message) (string, error) {
+		return "<updated_notes>\n" + DefaultSessionMemoryTemplate + "\n## Worklog\n\n- 做了 X\n</updated_notes>", nil
+	}
+	RunFlush(m, msgs, chatFn, func(err error) { t.Errorf("unexpected error: %v", err) })
+
+	log := readFile(t, m.GetDailyLogPath(time.Now()))
+	if !strings.Contains(log, "tab 缩进") {
+		t.Fatalf("keyword pass must have run synchronously before return:\n%s", log)
+	}
+
+	// Stage 2 is async — wait for the notes file to appear.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(m.GetSessionMemoryPath()); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	notes := readFile(t, m.GetSessionMemoryPath())
+	if !strings.Contains(notes, "做了 X") {
+		t.Fatalf("session memory was not extracted:\n%s", notes)
+	}
+}
+
 func TestDisabledMemoryIsSilent(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TIANCAN_MEMORY_DIR", dir)

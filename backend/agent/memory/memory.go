@@ -173,12 +173,12 @@ func (m *MemorySystem) saveStateLocked() {
 		return
 	}
 	// Best effort: a lost cursor costs one redundant extraction, not correctness.
-	// The dir may not exist yet (EnsureDirExists runs once per agent), and a
-	// failed write here would silently degrade into "trigger every turn".
-	if err := os.MkdirAll(m.autoMemDir, 0755); err != nil {
+	// The dir may not exist yet (EnsureDirExists only runs on some paths), and a
+	// failed write here would silently degrade into "trigger every turn" —
+	// writeFileAtomic creates it, and never leaves a half-written JSON behind.
+	if err := writeFileAtomic(m.stateFilePath(), data, 0644); err != nil {
 		return
 	}
-	_ = os.WriteFile(m.stateFilePath(), data, 0644)
 }
 
 // IsEnabled returns whether auto memory is enabled.
@@ -367,8 +367,8 @@ func (m *MemorySystem) ShouldExtractMemory(messages []types.Message) bool {
 		(hasMetTokenThreshold && !hasToolCallsInLastTurn)
 
 	if shouldExtract {
-		if len(messages) > 0 {
-			m.lastSummarizedMsgUUID = messages[len(messages)-1].UUID
+		if uuid := lastKnownUUID(messages); uuid != "" {
+			m.lastSummarizedMsgUUID = uuid
 		}
 		m.tokensAtLastExtraction = currentTokenCount
 		m.saveStateLocked() // caller holds the lock; see saveStateLocked
@@ -406,6 +406,9 @@ func (m *MemorySystem) MarkExtractionFailed() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.consecutiveFailures++
+	// The run is over — leaving the timestamp set would make every later
+	// WaitForExtraction burn its full stale timeout for nothing.
+	m.extractionStartedAt = 0
 	m.saveStateLocked()
 }
 
@@ -489,7 +492,7 @@ The file ` + notesPath + ` has already been read for you. Here are its current c
 ` + currentNotes + `
 </current_notes_content>
 
-Your ONLY task is to output the COMPLETE updated notes file, wrapped in a single <updated_notes>...</updated_> block. Update every section that needs changes. Do not output anything outside that block, and do not use any tools.
+Your ONLY task is to output the COMPLETE updated notes file, wrapped in a single <updated_notes>...</updated_notes> block. Update every section that needs changes. Do not output anything outside that block, and do not use any tools.
 
 CRITICAL RULES FOR EDITING:
 - The file must maintain its exact structure with all sections, headers, and italic descriptions intact
@@ -540,7 +543,41 @@ func (m *MemorySystem) writeSessionMemoryFromOutput(output string) error {
 	if err := m.checkNotesStructure(content); err != nil {
 		return err
 	}
-	return os.WriteFile(m.GetSessionMemoryPath(), []byte(content), 0644)
+	// Write atomically: the extraction runs in the background, and a kill
+	// (app quit / process restart) mid-write must not leave a truncated
+	// SESSION_MEMORY.md behind — that file survives compaction, so corrupting
+	// it costs the user the whole session context.
+	return writeFileAtomic(m.GetSessionMemoryPath(), []byte(content), 0644)
+}
+
+// writeFileAtomic replaces path via a temp file + rename in the same dir.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // extractNotesBlock pulls the notes body out of a model reply.
@@ -728,6 +765,17 @@ func (m *MemorySystem) ExtractMemories(messages []types.Message) error {
 		}
 	}
 
+	// Belt and braces: even with the cursor above, a transcript whose cursor
+	// message is gone (compaction replaced it with a summary) rescans from the
+	// start. Re-appending the same "remember X" line to today's log every turn
+	// is exactly the failure that looked like "memory is broken", so skip
+	// anything already recorded today.
+	logPath := m.GetDailyLogPath(time.Now())
+	logged := ""
+	if data, err := os.ReadFile(logPath); err == nil {
+		logged = string(data)
+	}
+
 	var lastUUID string
 	for _, msg := range messages[start:] {
 		if msg.UUID != "" {
@@ -741,9 +789,13 @@ func (m *MemorySystem) ExtractMemories(messages []types.Message) error {
 			strings.Contains(content, "记住") ||
 			strings.Contains(content, "don't forget") ||
 			strings.Contains(content, "别忘了") {
+			if strings.Contains(logged, msg.Content) {
+				continue
+			}
 			if err := m.AppendToDailyLog(msg.Content); err != nil {
 				return err
 			}
+			logged += msg.Content
 		}
 	}
 
@@ -808,6 +860,36 @@ func (m *MemorySystem) ExtractSessionMemory(messages []types.Message, chatFn typ
 	return nil
 }
 
+// RunFlush is the canonical end-of-turn Auto Memory pipeline — every code path
+// that finishes a user turn must land here (the agent loop, the Service's own
+// chat loops, the V2 router), so behaviour cannot drift between them.
+//
+// Stage 1 (keyword pass, ExtractMemories) is synchronous and must run BEFORE
+// the stage-2 threshold check: firing the threshold advances the same cursor,
+// and anything behind it would then be skipped forever.
+//
+// Stage 2 (ExtractSessionMemory) is asynchronous: it costs one extra LLM round
+// trip and must never delay the user's next message. The messages are copied
+// because the caller keeps owning the slice.
+func RunFlush(ms *MemorySystem, messages []types.Message, chatFn types.ChatFunc, onError func(error)) {
+	if ms == nil || !ms.IsEnabled() {
+		return
+	}
+	if err := ms.ExtractMemories(messages); err != nil && onError != nil {
+		onError(err)
+	}
+	if chatFn == nil || !ms.ShouldExtractMemory(messages) {
+		return
+	}
+	snapshot := make([]types.Message, len(messages))
+	copy(snapshot, messages)
+	go func() {
+		if err := ms.ExtractSessionMemory(snapshot, chatFn); err != nil && onError != nil {
+			onError(err)
+		}
+	}()
+}
+
 // ManuallyExtractSessionMemory forces a session memory extraction regardless of thresholds.
 // Mirrors Claude Code's manuallyExtractSessionMemory().
 func (m *MemorySystem) ManuallyExtractSessionMemory(messages []types.Message, chatFn types.ChatFunc) error {
@@ -848,14 +930,27 @@ func (m *MemorySystem) ManuallyExtractSessionMemory(messages []types.Message, ch
 
 	// Update tracking
 	m.mu.Lock()
-	if len(messages) > 0 {
-		m.lastSummarizedMsgUUID = messages[len(messages)-1].UUID
+	// Prefer the newest identified message: some transcripts (e.g. the Service's
+	// own chat loops) still carry empty UUIDs, and storing "" would reset the
+	// cursor and make the next incremental scan re-process history.
+	if uuid := lastKnownUUID(messages); uuid != "" {
+		m.lastSummarizedMsgUUID = uuid
 	}
 	m.tokensAtLastExtraction = EstimateTokens(messages)
 	m.saveStateLocked()
 	m.mu.Unlock()
 
 	return nil
+}
+
+// lastKnownUUID returns the UUID of the last message that has one.
+func lastKnownUUID(messages []types.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].UUID != "" {
+			return messages[i].UUID
+		}
+	}
+	return ""
 }
 
 // --- Session memory compaction integration ---

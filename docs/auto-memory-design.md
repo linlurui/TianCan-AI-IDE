@@ -21,7 +21,7 @@ memory/
 
 ## 2. 记忆流水线（回合结束时）
 
-`Agent.flushMemory(messages, chatFn)` 是唯一入口，两个阶段必须按此顺序：
+唯一实现是 `memory.RunFlush(ms, messages, chatFn, onError)`，两个阶段必须按此顺序：
 
 1. **`ExtractMemories`（轻量，同步，绝不跳过）**
    只扫 User 消息里的显式记忆请求（remember / 记住 / don't forget / 别忘了），
@@ -34,8 +34,27 @@ memory/
    命中后 **goroutine** 里 fork 一次对话让模型重写 SESSION_MEMORY.md。
    异步是因为它要几秒，不能堵住用户的下一句。
 
-顺序不可交换：阶段 2 一旦move cursor，阶段 1 的增量窗口就会被“后来的”
+顺序不可交换：阶段 2 一旦 move cursor，阶段 1 的增量窗口就会被“后来的”
 游标吃掉一部分。
+
+## 2.1 谁调用 RunFlush（重要）
+
+UI 真正走的对话循环**全都不经过 `agent.Agent.Run`**：
+
+| 入口 | Shape | 出口 |
+| --- | --- | --- |
+| `AgentRun` / `AgentRunAPI` / `AgentRunWeb` | 自建 `[]ChatMessage` | `Service.finishChatTurn` |
+| `AgentStream`（local 流式） | 自建 `[]ChatMessage` | `Service.finishChatTurn` |
+| `SmartAgentRunV2`（auto） | `AgentV2` 的 `[]agent.Message` | `Service.finishAgentTurn` |
+| `AgentRunAdvanced`（smoke/内部） | `agent.Agent.Run` | `Agent.flushMemory` |
+
+所以流水线必须挂在 **Service 层**：只写在 agent 循环里的话，UI 的每一条路径都
+是“看起来上线了、实际从不触发”（踩过一轮）。两个出口最终都归结到一处实现
+（`memory.RunFlush`），避免行为分叉。
+
+`finishChatTurn` 顺带把这份 transcript 记下来（`lastConversations`），手动入口
+和“compact 后重扫描”都要用；转出来的消息会补 UUID，否则游标永远是空字符串，
+每回合都全量重扫（= 重复追加同一句"记住 X"）。
 
 ## 3. 为什么要有状态持久化
 
@@ -56,9 +75,14 @@ lastSummarizedMsgUUID / consecutiveFailures`，构造时恢复。
 但接入点的 `chatFn` 是纯聊天函数（无工具），而 `ExtractSessionMemory` 又把返回值
 丢弃（`_, err = chatFn(...)`）——接上了也是空转。
 
-现在改为：prompt 要求输出单个 `<updated_notes>` 块 → `writeSessionMemoryFromOutput`
-提取并写盘，写前 `checkNotesStructure` 校验模板骨架（章节标题）是否完整，
-不完整就拒绝写入（保留旧文件）。避免模型一次抖手把笔记结构毁掉。
+现在改为：prompt 要求输出单个 `<updated_notes>...</updated_notes>` 块 →
+`writeSessionMemoryFromOutput` 提取并写盘（**原子写**：临时文件 + rename，后台
+提取被中断不会留下半截笔记），写前 `checkNotesStructure` 校验模板骨架（章节标题）
+是否完整，不完整就拒绝写入（保留旧文件）。避免模型一次抖手把笔记结构毁掉。
+
+⚠️ prompt 里的结束标签必须和解析器一致：曾经写成 `</updated_>`，解析器只认
+`</updated_notes>`，于是每次提取都判成"空输出"→ 计数 3 次后 kill switch
+永久生效（且状态在磁盘上），整套机制彻底哑火。
 
 ## 5. compact 整合
 
@@ -76,8 +100,9 @@ false，用它当 ok 判断会恰好在最该注入时跳过注入（踩过）�
 
 `Service.ExtractSessionMemoryNow(rootPath, mode)` + 前端输入框「整理记忆」按钮。
 它忽略阈值，强制跑一次 `ManuallyExtractSessionMemory`（内部先
-`WaitForExtraction` 防并发重写）。Service 侧缓存每个项目最后一个 agent
-（`lastAgents`，上限 8）以拿到当前会话消息。
+`WaitForExtraction` 防并发重写）。Service 侧缓存每个项目最后一份 transcript
+（`lastConversations`，上限 8）以拿到当前会话消息 —— 之前按 `*agent.Agent` 缓存，
+而 UI 根本不经过 `AgentRunAdvanced`，按钮永远报"这个项目还没有会话记录"。
 
 ## 7. 已知取舍 / 待办
 
