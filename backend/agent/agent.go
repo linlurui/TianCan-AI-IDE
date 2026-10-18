@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/approval"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/clarify"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/compact"
@@ -25,6 +26,7 @@ import (
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/safety"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/toolguard"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/tools"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/skills"
 	webparser "github.com/linlurui/tiancan-ai-ide/backend/webai/parser"
@@ -194,9 +196,26 @@ func (a *Agent) SetProgressCallback(cb ProgressCallback) {
 	a.progressCB = cb
 }
 
+// MemorySystem exposes the recorder so callers can drive memory actions
+// (extraction, resets) without going through the agent loop.
+func (a *Agent) MemorySystem() *memory.MemorySystem {
+	return a.memorySys
+}
+
 // GetRollbackManager returns the rollback manager for file versioning.
 func (a *Agent) GetRollbackManager() *ralph.RollbackManager {
 	return a.rollbackMgr
+}
+
+// GetMessages returns a copy of the conversation history. Exported so callers
+// (the UI's "organize memory now" action) can drive a memory extraction over
+// the current conversation without re-entering the agent loop.
+func (a *Agent) GetMessages() []Message {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]Message, len(a.messages))
+	copy(out, a.messages)
+	return out
 }
 
 // Registry returns the tool registry so callers can inject shared dependencies.
@@ -600,6 +619,7 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 		Role:      RoleUser,
 		Content:   userMessage,
 		Timestamp: time.Now(),
+		UUID:      uuid.NewString(),
 	})
 	messages := make([]Message, len(a.messages))
 	copy(messages, a.messages)
@@ -652,11 +672,11 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 
 		// Check auto-compact
 		if a.compactSvc.ShouldAutoCompact(messages) {
-			result, err := a.compactSvc.CompactConversation(messages, func(prompt string) (string, error) {
+			result, err := a.runCompact(messages, func(prompt string) (string, error) {
 				return chatFn(systemPrompt, []Message{{Role: RoleUser, Content: prompt}})
 			})
 			if err == nil && result != nil {
-				messages = append(result.SummaryMessages, messages[len(messages)-4:]...)
+				messages = append(result.SummaryMessages, a.tailMessages(messages)...)
 			}
 		}
 
@@ -678,6 +698,7 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 			Role:      RoleAssistant,
 			Content:   response,
 			Timestamp: time.Now(),
+			UUID:      uuid.NewString(),
 		}
 		messages = append(messages, assistantMsg)
 		totalTokens += len(response) / 4
@@ -704,25 +725,27 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 				}
 			}
 			if isClar {
-				// The user's answer is fed back as a user message and the
-				// loop re-runs with it in context (do/while re-prompt).
-				messages = append(messages, Message{
-					Role:      RoleUser,
-					Content:   answer,
-					Timestamp: time.Now(),
-				})
+			// The user's answer is fed back as a user message and the
+			// loop re-runs with it in context (do/while re-prompt).
+			messages = append(messages, Message{
+				Role:      RoleUser,
+				Content:   answer,
+				Timestamp: time.Now(),
+				UUID:      uuid.NewString(),
+			})
 				totalTokens += len(answer) / 4
 				continue
 			}
 
-			// No more tool calls - done
-			a.mu.Lock()
-			a.messages = messages
-			cb := a.progressCB
-			a.mu.Unlock()
+		// No more tool calls - done
+		a.mu.Lock()
+		a.messages = messages
+		cb := a.progressCB
+		a.mu.Unlock()
 
-			// Extract memories
-			a.memorySys.ExtractMemories(messages)
+		// Memory pipeline: keyword scan first (cheap, synchronous, must not
+		// be skipped), then the threshold-gated session-memory extraction.
+		a.flushMemory(messages, chatFn)
 
 			if cb != nil {
 				cb(iteration, "", nil, response, true, "")
@@ -747,6 +770,7 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 				Content:  o.Content,
 				ToolName: tc.Name,
 				Success:  o.Success,
+				UUID:     uuid.NewString(),
 			})
 			a.emitStep(tc, ToolResult{Content: o.Content, Success: o.Success})
 			if o.Executed {
@@ -762,6 +786,95 @@ func (a *Agent) Run(ctx context.Context, userMessage string, maxIterations int, 
 		// whenIdle do/while: with the inbox drained we loop back and re-prompt the
 		// model, unless it just produced a final answer (handled in the branch above).
 	}
+}
+
+// flushMemory runs the end-of-turn memory pipeline in two stages:
+//
+//  1. ExtractMemories: the cheap keyword scan ("remember X" → daily log).
+//     Synchronous and cheap, so it is never skipped — and it deliberately runs
+//     BEFORE the threshold check below: once the threshold fires, the shadow
+//     extraction advances its cursor, and anything behind it would be missed.
+//  2. ExtractSessionMemory: the full session-memory extraction (a forked chat
+//     call that rewrites SESSION_MEMORY.md). Threshold-gated by
+//     ShouldExtractMemory and run in the background because it costs seconds,
+//     which must not delay the user's next message.
+//
+// A snapshot of the messages is taken so the background call cannot race with
+// the caller reusing the slice.
+func (a *Agent) flushMemory(messages []Message, chatFn ChatFunc) {
+	if a.memorySys == nil || !a.memorySys.IsEnabled() {
+		return
+	}
+	_ = a.memorySys.ExtractMemories(messages)
+	if chatFn == nil || !a.memorySys.ShouldExtractMemory(messages) {
+		return
+	}
+	msgs := make([]Message, len(messages))
+	copy(msgs, messages)
+	// ShouldExtractMemory already moved the cursor; the extraction below uses
+	// the state machine so a later turn waits instead of stacking rewrites.
+	go func() {
+		if err := a.memorySys.ExtractSessionMemory(msgs, chatFn); err != nil {
+			a.emitMemoryError(err)
+		}
+	}()
+}
+
+// runCompact compacts the conversation, carrying session memory into the
+// post-compact context so a "what are we doing" note survives compaction.
+func (a *Agent) runCompact(messages []Message, compactChatFn compact.ChatFunc) (*types.CompactionResult, error) {
+	mem, ok := a.sessionMemoryForCompact()
+	if !ok {
+		return a.compactSvc.CompactConversation(messages, compactChatFn)
+	}
+	return a.compactSvc.CompactConversationWithSessionMemory(messages, compactChatFn, mem)
+}
+
+// sessionMemoryForCompact returns the session memory to carry through
+// compaction. The second result is false when there is nothing worth injecting.
+// The returned content is already truncated (GetSessionMemoryForCompact does
+// that) so a runaway notes file cannot eat the post-compact token budget.
+func (a *Agent) sessionMemoryForCompact() (string, bool) {
+	if a.memorySys == nil || !a.memorySys.IsEnabled() {
+		return "", false
+	}
+	// A background extraction may still be rewriting SESSION_MEMORY.md; wait so
+	// the summary is built from the newest notes (and so the compaction does
+	// not read a half-written file).
+	a.memorySys.WaitForExtraction()
+	// SessionMemoryForCompact (not GetSessionMemoryForCompact): the latter's
+	// second result means "was truncated", so its false would wrongly skip the
+	// injection exactly when notes are healthy.
+	return a.memorySys.SessionMemoryForCompact()
+}
+
+// tailMessages returns the last few messages kept verbatim after compaction.
+// It clamps instead of trusting len >= 4 (a short history would otherwise
+// panic with a negative slice bound).
+func (a *Agent) tailMessages(messages []Message) []Message {
+	keep := len(messages) - 4
+	if keep < 0 {
+		keep = 0
+	}
+	return messages[keep:]
+}
+func chatFuncFromStream(stream StreamChatFunc) ChatFunc {
+	if stream == nil {
+		return nil
+	}
+	return func(systemPrompt string, messages []Message) (string, error) {
+		return stream(systemPrompt, messages, func(string) {})
+	}
+}
+
+// emitMemoryError surfaces a memory-extraction failure. Failures here are
+// non-fatal by design (a lost note must never break a chat turn), but they are
+// worth seeing in the log.
+func (a *Agent) emitMemoryError(err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "agent: session memory extraction failed: %v\n", err)
 }
 
 // RunStream executes the agent loop with streaming events sent to the returned channel.
@@ -833,11 +946,11 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 			// Auto-compact check
 			if a.compactSvc.ShouldAutoCompact(messages) {
 				ch <- StreamEvent{Type: "compact", Content: "Compacting conversation..."}
-				result, err := a.compactSvc.CompactConversation(messages, func(prompt string) (string, error) {
+				result, err := a.runCompact(messages, func(prompt string) (string, error) {
 					return streamChatFn(systemPrompt, []Message{{Role: RoleUser, Content: prompt}}, nil)
 				})
 				if err == nil && result != nil {
-					messages = append(result.SummaryMessages, messages[len(messages)-4:]...)
+					messages = append(result.SummaryMessages, a.tailMessages(messages)...)
 				}
 			}
 
@@ -897,7 +1010,9 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 				a.mu.Lock()
 				a.messages = messages
 				a.mu.Unlock()
-				a.memorySys.ExtractMemories(messages)
+				// Same two-stage pipeline as Run; the streaming backend is
+				// adapted to the one-shot ChatFunc the extraction needs.
+				a.flushMemory(messages, chatFuncFromStream(streamChatFn))
 				ch <- StreamEvent{Type: "done", Content: resp}
 				return
 			}
@@ -910,7 +1025,7 @@ func (a *Agent) RunStream(ctx context.Context, userMessage string, maxIterations
 				argsJSON, _ := json.Marshal(tc.Args)
 				ch <- StreamEvent{Type: "tool_call", Name: tc.Name, Content: string(argsJSON)}
 				ch <- StreamEvent{Type: "tool_result", Name: tc.Name, Content: o.Content, Success: o.Success}
-				messages = append(messages, Message{Role: RoleTool, Content: o.Content, ToolName: tc.Name, Success: o.Success})
+				messages = append(messages, Message{Role: RoleTool, Content: o.Content, ToolName: tc.Name, Success: o.Success, UUID: uuid.NewString()})
 				a.emitStep(tc, ToolResult{Content: o.Content, Success: o.Success})
 				if o.Executed {
 					totalTokens += len(o.Content) / 4
@@ -958,13 +1073,33 @@ func (a *Agent) runWithRalph(ctx context.Context, task string, agentDef AgentDef
 
 	result, err := rl.Run(ctx, task, agentDef, a.rootPath)
 	if err != nil {
+		res := result
+		if res == nil {
+			res = &types.RalphLoopResult{}
+		}
+		// Even on failure: sync bytes-trail messages and run the same memory
+		// pipeline as Run. Ralph takes the non-trivial multi-file tasks, which
+		// are exactly the ones worth remembering.
+		a.mu.Lock()
+		a.messages = res.Messages
+		a.mu.Unlock()
+		a.flushMemory(res.Messages, chatFn)
 		return AgentRunResult{
 			Done:       true,
 			Error:      fmt.Sprintf("Ralph Loop error: %v", err),
-			Messages:   result.Messages,
+			Messages:   res.Messages,
 			DurationMs: time.Since(start).Milliseconds(),
 		}
 	}
+	if result == nil {
+		result = &types.RalphLoopResult{}
+	}
+
+	// memory pipeline (see above)
+	a.mu.Lock()
+	a.messages = result.Messages
+	a.mu.Unlock()
+	a.flushMemory(result.Messages, chatFn)
 
 	return AgentRunResult{
 		Done:        true,

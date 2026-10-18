@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -74,6 +75,7 @@ type Service struct {
 	providerRegistry *aiprovider.Registry
 	activeProvider   string // ID of active provider
 	// Agent mode
+	lastAgents map[string]*agent.Agent // rootPath → last agent of that project
 }
 
 // SetSink 注入 G3 ProgressSink（PC 端/测试用）；传 nil 恢复 App 桥接。
@@ -4517,38 +4519,11 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 	userMessageWithMemory := s.withProjectMemory(rootPath, userMessage, userMessage)
 
 	// Build chat function based on mode
-	var chatFn agent.ChatFunc
-	switch mode {
-	case "local":
-		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
-			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
-			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
-			return s.Chat(chatMsgs)
-		}
-	case "api":
-		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
-			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
-			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
-			return s.ChatAPI(chatMsgs)
-		}
-	case "web":
-		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
-			// For web mode, concatenate all messages into a single prompt
-			var sb strings.Builder
-			sb.WriteString(s.withProjectMemory(rootPath, userMessage, systemPrompt))
-			sb.WriteString("\n")
-			for _, m := range msgs {
-				sb.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
-			}
-			return s.ChatWeb(sb.String())
-		}
-	default:
-		chatFn = func(systemPrompt string, msgs []agent.Message) (string, error) {
-			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
-			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
-			return s.Chat(chatMsgs)
-		}
-	}
+	chatFn := s.buildChatFn(mode, rootPath, userMessage)
+
+	// Remember the agent so later actions (memory extraction on demand) can
+	// reuse this conversation instead of rebuilding it.
+	s.rememberAgent(rootPath, a)
 
 	// Wire agent loop progress to frontend via Wails events
 	a.SetProgressCallback(func(iteration int, toolName string, toolArgs map[string]interface{}, output string, isDone bool, err string) {
@@ -4567,6 +4542,91 @@ func (s *Service) AgentRunAdvanced(userMessage string, rootPath string, maxItera
 	})
 
 	return a.Run(context.Background(), userMessageWithMemory, maxIterations, chatFn)
+}
+
+// buildChatFn wires the agent's model call to the selected backend ("local",
+// "api", "web"). Shared by the agent loop and the manual memory extraction.
+func (s *Service) buildChatFn(mode, rootPath, userMessage string) agent.ChatFunc {
+	switch mode {
+	case "local":
+		return func(systemPrompt string, msgs []agent.Message) (string, error) {
+			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
+			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
+			return s.Chat(chatMsgs)
+		}
+	case "api":
+		return func(systemPrompt string, msgs []agent.Message) (string, error) {
+			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
+			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
+			return s.ChatAPI(chatMsgs)
+		}
+	case "web":
+		return func(systemPrompt string, msgs []agent.Message) (string, error) {
+			// Web mode has no message roles: concatenate everything into one prompt.
+			var sb strings.Builder
+			sb.WriteString(s.withProjectMemory(rootPath, userMessage, systemPrompt))
+			sb.WriteString("\n")
+			for _, m := range msgs {
+				sb.WriteString(fmt.Sprintf("[%s]: %s\n", m.Role, m.Content))
+			}
+			return s.ChatWeb(sb.String())
+		}
+	default:
+		return func(systemPrompt string, msgs []agent.Message) (string, error) {
+			systemPrompt = s.withProjectMemory(rootPath, userMessage, systemPrompt)
+			chatMsgs := agentMsgsToChatMsgs(systemPrompt, msgs)
+			return s.Chat(chatMsgs)
+		}
+	}
+}
+
+// maxRememberedAgents caps how many project agents are kept alive for later
+// actions. Small enough to be irrelevant as memory pressure, large enough to
+// cover switching between a few projects in one session.
+const maxRememberedAgents = 8
+
+// rememberAgent keeps the last agent of a project reachable after its Run
+// returns (needed by ExtractSessionMemoryNow).
+func (s *Service) rememberAgent(rootPath string, a *agent.Agent) {
+	if a == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastAgents == nil {
+		s.lastAgents = map[string]*agent.Agent{}
+	}
+	if len(s.lastAgents) >= maxRememberedAgents {
+		// Simple bound: start over rather than guessing which project is coldest.
+		s.lastAgents = map[string]*agent.Agent{}
+	}
+	s.lastAgents[rootPath] = a
+}
+
+// ExtractSessionMemoryNow forces a session-memory extraction over the current
+// conversation of a project, ignoring thresholds — the user-facing "organize
+// my notes now" action. It also flushes "remember X" lines that are waiting.
+func (s *Service) ExtractSessionMemoryNow(rootPath, mode string) error {
+	s.mu.Lock()
+	a := s.lastAgents[rootPath]
+	s.mu.Unlock()
+	if a == nil {
+		return errors.New("这个项目还没有会话记录")
+	}
+	messages := a.GetMessages()
+	if len(messages) == 0 {
+		return errors.New("当前会话还没有内容可整理")
+	}
+	ms := a.MemorySystem()
+	if ms == nil || !ms.IsEnabled() {
+		return errors.New("记忆系统已关闭（TIANCAN_DISABLE_AUTO_MEMORY）")
+	}
+	// Cheap keyword pass first, so an explicit "remember this" is never lost
+	// when the heavy extraction below fails.
+	if err := ms.ExtractMemories(messages); err != nil {
+		return err
+	}
+	return ms.ManuallyExtractSessionMemory(messages, s.buildChatFn(mode, rootPath, ""))
 }
 
 // ConnectMCPServer connects to an MCP server via the agent subsystem.

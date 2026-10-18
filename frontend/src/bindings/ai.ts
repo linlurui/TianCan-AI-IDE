@@ -6,6 +6,7 @@ export {
   ChatAPI,
   ChatStream,
   ChatWeb,
+  ExtractSessionMemoryNow,
   GetAPIProvider,
   GetAPIURL,
   GetHardwareProfile,

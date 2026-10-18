@@ -29,7 +29,7 @@ import {
 } from "./bindings/extension";
 import { StartAndGetPort } from "./bindings/terminal";
 import { StartAndGetPort as StartLspPort } from "./bindings/lsp";
-import { AgentRun, AgentRunAPI, AgentRunWeb, StartAgentStream, StopAgentRequest, RespondPermission, SmartAgentRun, SmartAgentRunV2 } from "./bindings/ai";
+import { AgentRun, AgentRunAPI, AgentRunWeb, ExtractSessionMemoryNow, StartAgentStream, StopAgentRequest, RespondPermission, SmartAgentRun, SmartAgentRunV2 } from "./bindings/ai";
 import { RemoteReadFile, DockerReadFile } from "./bindings/remote";
 import { Events } from "@wailsio/runtime";
 import type { ModelSource } from "./components/AIPanel";
@@ -1188,6 +1188,23 @@ export default function App() {
             contextToAppend={aiContextSignal}
             projectRoot={project.activeProject?.rootPath ?? ""}
             onRollback={() => { void reloadSessionMessages(project.activeProject?.rootPath ?? "", true); }}
+            // 整理记忆：按需把当前对话提炼进 SESSION_MEMORY.md（自动提取之外的手动通道）。
+            // mode 用最后一次对话的模型来源，保证提炼走的是同一个后端。
+            onOrganizeMemory={async () => {
+              const rootPath = project.activeProject?.rootPath ?? "";
+              if (!rootPath) {
+                pushAIActivity("error", "整理记忆失败", "没有打开的项目");
+                return;
+              }
+              const mode = aiRunSourceRef.current ?? "local";
+              pushAIActivity("tool", "整理记忆中", "提炼当前对话到 SESSION_MEMORY.md");
+              try {
+                await ExtractSessionMemoryNow(rootPath, mode);
+                pushAIActivity("success", "已整理记忆", "SESSION_MEMORY.md 已更新");
+              } catch (err: any) {
+                pushAIActivity("error", "整理记忆失败", err?.message ?? String(err));
+              }
+            }}
             onSend={async (text, source: ModelSource) => {
             if (text === "__clear__") {
               // Cleanup any active stream listener

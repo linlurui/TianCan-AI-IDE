@@ -2,6 +2,7 @@ package memory
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/config"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/types"
+	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
 const (
@@ -21,6 +22,11 @@ const (
 	DailyLogDir       = "logs"
 	TeamMemDirName    = "team"
 	SessionMemFile    = "SESSION_MEMORY.md"
+
+	// ExtractionStateFile holds the persisted extraction cursor inside the
+	// memory dir. The agent is rebuilt per user message, so without it the
+	// token/tool-call thresholds would never accumulate across turns.
+	ExtractionStateFile = ".extraction-state.json"
 
 	// Token thresholds — mirror Claude Code's sessionMemoryUtils.ts defaults
 	DefaultMinTokensToInit         = 10000
@@ -94,12 +100,85 @@ func NewMemorySystem(homeDir string) *MemorySystem {
 		autoDir = filepath.Join(homeDir, config.DotDir, AutoMemDirName)
 	}
 
-	return &MemorySystem{
+	ms := &MemorySystem{
 		baseDir:    filepath.Dir(autoDir),
 		autoMemDir: autoDir,
 		enabled:    true,
 		config:     cfg,
 	}
+	// Restore the persisted cursor. A missing/failed read is fine: it just
+	// means the thresholds start fresh for this home dir.
+	_ = ms.LoadExtractionState()
+	return ms
+}
+
+// LoadExtractionState restores the extraction cursor from disk.
+//
+// It matters because the agent — and therefore this MemorySystem — is rebuilt
+// for every user message (see Service.AgentRunAdvanced): without persistence
+// the token/tool-call thresholds would restart from zero each turn and never
+// fire. Callers should treat an error here as harmless (fresh state).
+func (m *MemorySystem) LoadExtractionState() error {
+	if !m.enabled {
+		return nil
+	}
+	data, err := os.ReadFile(m.stateFilePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var s extractionState
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.initialized = s.Initialized
+	m.tokensAtLastExtraction = s.TokensAtLastExtraction
+	m.lastSummarizedMsgUUID = s.LastSummarizedMsgUUID
+	m.consecutiveFailures = s.ConsecutiveFailures
+	return nil
+}
+
+// stateFilePath is where the extraction cursor is persisted.
+func (m *MemorySystem) stateFilePath() string {
+	return filepath.Join(m.autoMemDir, ExtractionStateFile)
+}
+
+// extractionState is the persisted subset of the extraction cursor.
+type extractionState struct {
+	Initialized            bool   `json:"initialized"`
+	TokensAtLastExtraction int    `json:"tokensAtLastExtraction"`
+	LastSummarizedMsgUUID  string `json:"lastSummarizedMsgUUID"`
+	ConsecutiveFailures    int    `json:"consecutiveFailures"`
+}
+
+// saveStateLocked persists the cursor. Caller MUST hold m.mu: callers want the
+// read-modify-write of the thresholds and their persistence to be atomic, and
+// sync.Mutex is not reentrant.
+func (m *MemorySystem) saveStateLocked() {
+	if !m.enabled {
+		return
+	}
+	s := extractionState{
+		Initialized:            m.initialized,
+		TokensAtLastExtraction: m.tokensAtLastExtraction,
+		LastSummarizedMsgUUID:  m.lastSummarizedMsgUUID,
+		ConsecutiveFailures:    m.consecutiveFailures,
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return
+	}
+	// Best effort: a lost cursor costs one redundant extraction, not correctness.
+	// The dir may not exist yet (EnsureDirExists runs once per agent), and a
+	// failed write here would silently degrade into "trigger every turn".
+	if err := os.MkdirAll(m.autoMemDir, 0755); err != nil {
+		return
+	}
+	_ = os.WriteFile(m.stateFilePath(), data, 0644)
 }
 
 // IsEnabled returns whether auto memory is enabled.
@@ -260,11 +339,13 @@ func (m *MemorySystem) ShouldExtractMemory(messages []types.Message) bool {
 	defer m.mu.Unlock()
 
 	// Check initialization threshold
+	justInitialized := false
 	if !m.initialized {
 		if currentTokenCount < m.config.MinimumMessageTokensToInit {
 			return false
 		}
 		m.initialized = true
+		justInitialized = true
 	}
 
 	// Check token growth threshold since last extraction
@@ -290,9 +371,15 @@ func (m *MemorySystem) ShouldExtractMemory(messages []types.Message) bool {
 			m.lastSummarizedMsgUUID = messages[len(messages)-1].UUID
 		}
 		m.tokensAtLastExtraction = currentTokenCount
+		m.saveStateLocked() // caller holds the lock; see saveStateLocked
 		return true
 	}
 
+	// Nothing changed but the init flip — only that one is worth persisting,
+	// so a conversation does not hit the disk on every single turn.
+	if justInitialized {
+		m.saveStateLocked()
+	}
 	return false
 }
 
@@ -311,6 +398,7 @@ func (m *MemorySystem) MarkExtractionCompleted() {
 	defer m.mu.Unlock()
 	m.extractionStartedAt = 0
 	m.consecutiveFailures = 0
+	m.saveStateLocked()
 }
 
 // MarkExtractionFailed records a failed extraction.
@@ -318,6 +406,7 @@ func (m *MemorySystem) MarkExtractionFailed() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.consecutiveFailures++
+	m.saveStateLocked()
 }
 
 // WaitForExtraction waits for any in-progress extraction to complete.
@@ -400,7 +489,7 @@ The file ` + notesPath + ` has already been read for you. Here are its current c
 ` + currentNotes + `
 </current_notes_content>
 
-Your ONLY task is to use the file_edit tool to update the notes file, then stop. You can make multiple edits (update every section as needed) - make all edits in parallel. Do not call any other tools.
+Your ONLY task is to output the COMPLETE updated notes file, wrapped in a single <updated_notes>...</updated_> block. Update every section that needs changes. Do not output anything outside that block, and do not use any tools.
 
 CRITICAL RULES FOR EDITING:
 - The file must maintain its exact structure with all sections, headers, and italic descriptions intact
@@ -418,7 +507,7 @@ CRITICAL RULES FOR EDITING:
 - Focus on actionable, specific information that would help someone understand or recreate the work discussed in the conversation
 - IMPORTANT: Always update "Current State" to reflect the most recent work - this is critical for continuity after compaction
 
-Use the file_edit tool with file_path: ` + notesPath + `
+Output the updated file content for: ` + notesPath + `
 
 STRUCTURE PRESERVATION REMINDER:
 Each section has TWO parts that must be preserved exactly as they appear in the current file:
@@ -427,7 +516,7 @@ Each section has TWO parts that must be preserved exactly as they appear in the 
 
 You ONLY update the actual content that comes AFTER these two preserved lines. The italic description lines starting and ending with underscores are part of the template structure, NOT content to be edited or removed.
 
-REMEMBER: Use the file_edit tool in parallel and stop. Do not continue after the edits. Only include insights from the actual user conversation, never from these note-taking instructions. Do not delete or change section headers or italic _section descriptions_.`
+REMEMBER: Output the complete updated file inside a single <updated_notes> block and stop. Only include insights from the actual user conversation, never from these note-taking instructions. Do not delete or change section headers or italic _section descriptions_.`
 
 	// Add section size warnings (mirrors generateSectionReminders)
 	sectionSizes := analyzeSectionSizes(currentNotes)
@@ -435,6 +524,73 @@ REMEMBER: Use the file_edit tool in parallel and stop. Do not continue after the
 	prompt += generateSectionReminders(sectionSizes, totalTokens)
 
 	return prompt
+}
+
+// writeSessionMemoryFromOutput extracts the updated notes from the forked
+// agent's output and writes them to SESSION_MEMORY.md. The expected shape is
+// a <updated_notes>...</updated_notes> block; a ```markdown fence is accepted
+// as a fallback. The structural skeleton (section headers) must survive —
+// otherwise the model mangled the file and we refuse to write it (the old
+// file stays intact).
+func (m *MemorySystem) writeSessionMemoryFromOutput(output string) error {
+	content := extractNotesBlock(output)
+	if strings.TrimSpace(content) == "" {
+		return errors.New("session memory extraction produced empty notes")
+	}
+	if err := m.checkNotesStructure(content); err != nil {
+		return err
+	}
+	return os.WriteFile(m.GetSessionMemoryPath(), []byte(content), 0644)
+}
+
+// extractNotesBlock pulls the notes body out of a model reply.
+func extractNotesBlock(output string) string {
+	if i := strings.Index(output, "<updated_notes>"); i >= 0 {
+		rest := output[i+len("<updated_notes>"):]
+		if j := strings.Index(rest, "</updated_notes>"); j >= 0 {
+			return strings.TrimSpace(rest[:j])
+		}
+	}
+	// Fallback: a fenced markdown block.
+	if i := strings.Index(output, "```"); i >= 0 {
+		rest := output[i+3:]
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			rest = rest[nl+1:]
+		}
+		if j := strings.Index(rest, "```"); j >= 0 {
+			body := strings.TrimSpace(rest[:j])
+			if strings.Contains(body, "# ") {
+				return body
+			}
+		}
+	}
+	return ""
+}
+
+// checkNotesStructure verifies the template skeleton survived the rewrite:
+// every section header line of the template must still be present, in order.
+func (m *MemorySystem) checkNotesStructure(content string) error {
+	template := m.LoadSessionMemoryTemplate()
+	var headers []string
+	for _, line := range strings.Split(template, "\n") {
+		if strings.HasPrefix(line, "# ") {
+			headers = append(headers, line)
+		}
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	next := 0
+	for _, line := range lines {
+		if next < len(headers) && line == headers[next] {
+			next++
+		}
+	}
+	if next < len(headers) {
+		return fmt.Errorf("extracted notes lost section header %q, refusing to overwrite", headers[next])
+	}
+	return nil
 }
 
 // --- Section size analysis (mirrors Claude Code's prompts.ts) ---
@@ -549,13 +705,34 @@ func flushSessionSection(header string, lines []string, maxChars int) ([]string,
 
 // ExtractMemories extracts memories from conversation messages.
 // Uses token-based thresholds and forked-agent extraction pattern.
+// ExtractMemories appends explicit "remember this" requests to the daily log.
+// Only messages AFTER the last summarized one are scanned: the message list is
+// the whole conversation history, so a full scan would re-append every old
+// "remember" line on every turn end.
 func (m *MemorySystem) ExtractMemories(messages []types.Message) error {
 	if !m.enabled || len(messages) == 0 {
 		return nil
 	}
 
-	// Legacy: append to daily log for explicit "remember" requests
-	for _, msg := range messages {
+	m.mu.Lock()
+	since := m.lastSummarizedMsgUUID
+	m.mu.Unlock()
+
+	start := 0
+	if since != "" {
+		for i, msg := range messages {
+			if msg.UUID == since {
+				start = i + 1
+				break
+			}
+		}
+	}
+
+	var lastUUID string
+	for _, msg := range messages[start:] {
+		if msg.UUID != "" {
+			lastUUID = msg.UUID
+		}
 		if msg.Role != types.RoleUser {
 			continue
 		}
@@ -570,12 +747,21 @@ func (m *MemorySystem) ExtractMemories(messages []types.Message) error {
 		}
 	}
 
+	if lastUUID != "" {
+		m.mu.Lock()
+		m.lastSummarizedMsgUUID = lastUUID
+		m.saveStateLocked()
+		m.mu.Unlock()
+	}
 	return nil
 }
 
 // ExtractSessionMemory performs the full session memory extraction using a forked agent.
 // Mirrors Claude Code's extractSessionMemory().
-// The chatFn is used to run the forked subagent that updates SESSION_MEMORY.md.
+// The chatFn is used to run the forked subagent that produces the updated
+// SESSION_MEMORY.md content; the result is written to disk by us (the chat
+// backend is a plain chat function without file tools, so "edit the file
+// yourself" style prompts would silently no-op).
 func (m *MemorySystem) ExtractSessionMemory(messages []types.Message, chatFn types.ChatFunc) error {
 	if !m.enabled {
 		return nil
@@ -605,13 +791,17 @@ func (m *MemorySystem) ExtractSessionMemory(messages []types.Message, chatFn typ
 	// Mark extraction started
 	m.MarkExtractionStarted()
 
-	// Run the forked agent to update session memory
-	_, err = chatFn("", []types.Message{
+	// Run the forked agent to produce the updated notes
+	output, err := chatFn("", []types.Message{
 		{Role: types.RoleUser, Content: updatePrompt, Timestamp: time.Now()},
 	})
 	if err != nil {
 		m.MarkExtractionFailed()
 		return fmt.Errorf("session memory extraction failed: %w", err)
+	}
+	if err := m.writeSessionMemoryFromOutput(output); err != nil {
+		m.MarkExtractionFailed()
+		return err
 	}
 
 	m.MarkExtractionCompleted()
@@ -625,6 +815,10 @@ func (m *MemorySystem) ManuallyExtractSessionMemory(messages []types.Message, ch
 		return fmt.Errorf("memory system is disabled")
 	}
 
+	// Two manual triggers (or one overlapping the automatic one) must not
+	// rewrite the same file at once — wait for any in-flight extraction.
+	m.WaitForExtraction()
+
 	if err := m.SetupSessionMemoryFile(); err != nil {
 		return err
 	}
@@ -636,13 +830,18 @@ func (m *MemorySystem) ManuallyExtractSessionMemory(messages []types.Message, ch
 
 	updatePrompt := m.BuildSessionMemoryUpdatePrompt(currentNotes)
 
+	// Mark extraction started
 	m.MarkExtractionStarted()
-	_, err = chatFn("", []types.Message{
+	output, err := chatFn("", []types.Message{
 		{Role: types.RoleUser, Content: updatePrompt, Timestamp: time.Now()},
 	})
 	if err != nil {
 		m.MarkExtractionFailed()
 		return fmt.Errorf("manual session memory extraction failed: %w", err)
+	}
+	if err := m.writeSessionMemoryFromOutput(output); err != nil {
+		m.MarkExtractionFailed()
+		return err
 	}
 
 	m.MarkExtractionCompleted()
@@ -653,6 +852,7 @@ func (m *MemorySystem) ManuallyExtractSessionMemory(messages []types.Message, ch
 		m.lastSummarizedMsgUUID = messages[len(messages)-1].UUID
 	}
 	m.tokensAtLastExtraction = EstimateTokens(messages)
+	m.saveStateLocked()
 	m.mu.Unlock()
 
 	return nil
@@ -663,6 +863,12 @@ func (m *MemorySystem) ManuallyExtractSessionMemory(messages []types.Message, ch
 // GetSessionMemoryForCompact returns session memory content for compaction,
 // truncated if needed to avoid consuming the entire post-compact token budget.
 // Mirrors how Claude Code integrates session memory into compact messages.
+// GetSessionMemoryForCompact returns notes for compaction, already truncated so
+// a runaway notes file cannot eat the whole post-compact token budget.
+//
+// NOTE the second result is wasTruncated — it reports whether truncation kicked
+// in, NOT whether there is anything usable. Callers that need "is there
+// content" should use SessionMemoryForCompact instead.
 func (m *MemorySystem) GetSessionMemoryForCompact() (string, bool) {
 	if !m.enabled {
 		return "", false
@@ -673,6 +879,21 @@ func (m *MemorySystem) GetSessionMemoryForCompact() (string, bool) {
 	}
 	truncated, wasTruncated := m.TruncateSessionMemoryForCompact(content)
 	return truncated, wasTruncated
+}
+
+// SessionMemoryForCompact returns the notes to carry through compaction and
+// reports whether there is anything worth injecting (i.e. the notes have real
+// content beyond the untouched template).
+func (m *MemorySystem) SessionMemoryForCompact() (string, bool) {
+	if !m.enabled {
+		return "", false
+	}
+	content, err := m.GetSessionMemoryContent()
+	if err != nil || content == "" || m.IsSessionMemoryEmpty(content) {
+		return "", false
+	}
+	notes, _ := m.TruncateSessionMemoryForCompact(content)
+	return notes, true
 }
 
 // --- Helper functions ---

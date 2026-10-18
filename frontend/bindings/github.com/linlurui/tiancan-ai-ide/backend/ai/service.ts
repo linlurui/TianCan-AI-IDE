@@ -70,6 +70,16 @@ export function AgentRunAdvanced(userMessage: string, rootPath: string, maxItera
 }
 
 /**
+ * ExtractSessionMemoryNow forces a session-memory extraction over the current
+ * conversation of a project, ignoring thresholds — the "organize my notes now"
+ * action. (Kept in sync with the generated binding; regenerating bindings with
+ * the wails CLI reproduces an equivalent definition.)
+ */
+export function ExtractSessionMemoryNow(rootPath: string, mode: string): $CancellablePromise<void> {
+    return $Call.ByName("github.com/linlurui/tiancan-ai-ide/backend/ai.Service.ExtractSessionMemoryNow", rootPath, mode);
+}
+
+/**
  * AgentRunWeb executes the agent loop using a web AI provider.
  * Following Claude Code's context management principle: every message sent to the model
  * must contain enough context for the model to understand what it's doing.

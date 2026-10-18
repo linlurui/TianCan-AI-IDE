@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from "react";
 import { useTranslation } from "../i18n";
 import { Events } from "@wailsio/runtime";
-import { Trash2, Paperclip, SendHorizontal, Square, Cpu, Cloud, Download, Loader2, Key, Globe, Activity, Wrench, CheckCircle2, AlertCircle, ChevronDown, ChevronRight, FileCode2, Terminal, Search } from "lucide-react";
+import { Trash2, Paperclip, SendHorizontal, Square, Cpu, Cloud, Download, Loader2, Key, Globe, Activity, Wrench, CheckCircle2, AlertCircle, ChevronDown, ChevronRight, FileCode2, Terminal, Search, NotebookPen } from "lucide-react";
 import {
   ListModels, IsLMStudioInstalled, InstallLMStudio, LaunchLMStudio,
   SetModel, ListAPIProviders, SetAPIProvider, GetAPIProvider,
@@ -145,10 +145,12 @@ interface AIPanelProps {
   fullWidth?: boolean;
   contextToAppend?: { id: number; text: string } | null;
   activityItems?: ActivityItem[];
-  /** 项目根路径：有值时聊天框显示「项目记忆」工具条（锚点/审查/回退/红线/召回/提示词） */
+  /** 项目根路径：有值时聊天框显示锚点时间线与「整理记忆」按钮 */
   projectRoot?: string;
   /** 回退成功后通知上层刷新消息列表 */
   onRollback?: (seq: number) => void;
+  /** 手动整理记忆：把当前对话提炼进 SESSION_MEMORY.md（自动提取之外的按需通道） */
+  onOrganizeMemory?: () => void | Promise<void>;
 }
 
 function ActivityIcon({ kind }: { kind: ActivityKind }) {
@@ -245,7 +247,7 @@ function AIActivityTimeline({ items, isLoading }: { items: ActivityItem[]; isLoa
   );
 }
 
-export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth, contextToAppend, activityItems = [], projectRoot, onRollback }: AIPanelProps) {
+export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth, contextToAppend, activityItems = [], projectRoot, onRollback, onOrganizeMemory }: AIPanelProps) {
   const ui = useUIStore();
   const [input, setInput] = React.useState("");
   // 侧边刻度按「已有 seq 的消息」算相对位置，与 DOM 里带 data-seq 的元素保持一致。
@@ -307,6 +309,18 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
   const resizingRef = useRef(false);
   const startYRef = useRef(0);
   const startHeightRef = useRef(0);
+  const [organizing, setOrganizing] = useState(false);
+
+  // 整理记忆是一次 LLM 提炼，可能跑几秒；失败交由上层提示，按钮只管状态。
+  const runOrganizeMemory = async () => {
+    if (!onOrganizeMemory || organizing) return;
+    setOrganizing(true);
+    try {
+      await onOrganizeMemory();
+    } finally {
+      setOrganizing(false);
+    }
+  };
 
   useEffect(() => {
     onSendRef.current = onSend;
@@ -1018,6 +1032,18 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
           rows={3}
         />
         <div className="ai-input-actions">
+          {onOrganizeMemory && projectRoot ? (
+            <button
+              className="btn-ghost"
+              disabled={organizing}
+              onClick={() => void runOrganizeMemory()}
+              title="把当前对话提炼进 SESSION_MEMORY.md（整理记忆）"
+              style={{ display: "flex", alignItems: "center", gap: 5 }}
+            >
+              {organizing ? <Loader2 size={13} className="spin" /> : <NotebookPen size={13} />}
+              {organizing ? "整理中…" : "整理记忆"}
+            </button>
+          ) : null}
           <button className="btn-ghost" title={t("ai.attachContextTitle")} style={{ display: "flex", alignItems: "center", gap: 5 }}>
             <Paperclip size={13} />
             {t("ai.context")}
