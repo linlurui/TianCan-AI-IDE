@@ -40,13 +40,10 @@ type Recorder struct {
 }
 
 // NewRecorder builds the recorder for a session. git is detected once: a git
-// project captures via tree diffs, everything else via hardlink snapshots.
+// project captures via tree diffs, everything else via blob snapshots.
 func NewRecorder(root string, db *memdb.DB, hash, id string) *Recorder {
 	r := &Recorder{root: root, db: db, hash: hash, id: id}
 	r.git = r.isGitRepo()
-	if r.git {
-		r.excludeSelfFromGit()
-	}
 	return r
 }
 
@@ -72,9 +69,15 @@ func (r *Recorder) Begin(seq int64) {
 	if r.git {
 		if t, err := r.stashTree(); err == nil {
 			tree = t
+		} else {
+			// 基点树没取到（仓库锁、git 故障）：退化成全量 blob，
+			// 绝不能只记未跟踪文件——那会把 tracked 文件的改动全丢了。
+			paths = r.walkTextFiles()
 		}
-		if u, err := r.untrackedFiles(); err == nil {
-			paths = u
+		if tree != "" {
+			if u, err := r.untrackedFiles(); err == nil {
+				paths = u
+			}
 		}
 	} else {
 		paths = r.walkTextFiles()
@@ -101,6 +104,12 @@ func (r *Recorder) Begin(seq int64) {
 
 // Capture computes and persists the file changes of a turn. Idempotent: calling
 // it again (on archive, on review, on shutdown) just refreshes the rows.
+//
+// Only an OPEN turn is captured. A closed turn's record was taken the moment it
+// closed; refreshing it later would diff its base tree against whatever the
+// worktree looks like now — which includes every later turn's edits — and
+// silently rewrite history (that is how a review of turn 10 used to show
+// turn 20's changes as turn 10's "after" version).
 func (r *Recorder) Capture(seq int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -121,6 +130,13 @@ func (r *Recorder) CaptureOpen() {
 // capture must be called with the mutex held.
 func (r *Recorder) capture(seq int64) error {
 	if seq <= 0 {
+		return nil
+	}
+	open, err := r.db.IsOpenTurn(r.hash, r.id, seq)
+	if err != nil || !open {
+		// 轮次已关闭（记录定型）或查不动：不碰历史记录。
+		// 关轮时的补抓若失败，这个轮次就显示"没有记录到文件改动"——
+		// 好过拿后续轮次的状态冒充它的改后版本。
 		return nil
 	}
 	base, isGit, snapSha, err := r.db.GetTurnBase(r.hash, r.id, seq)
@@ -154,10 +170,21 @@ func (r *Recorder) captureGit(seq int64, base, snapSha string) error {
 			old = parseManifest(data)
 		}
 	}
-	cur, _ := r.untrackedFiles()
+	cur, err := r.untrackedFiles()
+	if err != nil {
+		// 列不出未跟踪文件就不能推断删除：否则一次 git 故障会把整个清单
+		// 误报成 D。树差分本身仍然可信，原样返回它的结果。
+		return r.storeChanges(seq, changes, base, end, old)
+	}
 	curSet := map[string]bool{}
 	for _, p := range cur {
 		curSet[p] = true
+	}
+	// 已跟踪文件清单：开工时未跟踪、期间被 git add 的文件仍在工作区，
+	// 不能因为"不在未跟踪列表里"就判删除。
+	tracked, err := r.trackedFiles()
+	if err != nil {
+		tracked = nil
 	}
 	seen := map[string]bool{}
 	for _, c := range changes {
@@ -168,6 +195,9 @@ func (r *Recorder) captureGit(seq int64, base, snapSha string) error {
 			continue
 		}
 		if !curSet[p] {
+			if tracked[p] {
+				continue // 已被 git add：它的变更由树差分负责
+			}
 			changes = append(changes, change{status: "D", path: p})
 			continue
 		}
@@ -220,20 +250,35 @@ func (r *Recorder) captureSnap(seq int64, snapSha string) error {
 
 // storeChanges writes one row per changed file. Old rows of the same turn are
 // replaced (a turn can be captured repeatedly while it is still open).
+//
+// Exception: a file the user already restored a hunk of keeps its recorded
+// versions. The working copy no longer matches what the AI left, so a fresh
+// capture would overwrite the versions with post-restore content and the
+// apply log's hunk indexes would silently drift onto different regions.
 func (r *Recorder) storeChanges(seq int64, changes []change, baseTree, endTree string, manifest map[string]string) error {
+	frozen := map[string]bool{}
+	if m, err := r.db.AnchorAppliedPaths(r.hash, r.id, seq); err == nil {
+		frozen = m
+	}
 	// 先删旧行并释放它们的 blob 引用，否则重复捕获会堆积垃圾。
 	if olds, err := r.db.ListAnchorFiles(r.hash, r.id, seq); err == nil {
 		for _, o := range olds {
+			if frozen[o.Path] {
+				continue // 人工干预过的行连同它的 blob 一起保留
+			}
 			_ = r.db.DropBlobRef(o.BeforeSHA)
 			_ = r.db.DropBlobRef(o.AfterSHA)
 		}
 	}
-	if err := r.db.DeleteAnchorFiles(r.hash, r.id, seq); err != nil {
+	if err := r.db.DeleteAnchorFilesUnfrozen(r.hash, r.id, seq, frozen); err != nil {
 		return err
 	}
 
 	now := nowMs()
 	for _, c := range changes {
+		if frozen[c.path] {
+			continue // 该文件已被人工还原过：保留当时的记录，不刷新
+		}
 		var before, after []byte
 		switch c.status {
 		case "A":
@@ -406,16 +451,15 @@ func (r *Recorder) isGitRepo() bool {
 
 // stashTree commits the current worktree state into an object WITHOUT touching
 // the worktree or the index, and returns its tree. With no local changes the
-// command prints nothing, and the answer is simply HEAD's tree.
+// command prints nothing and EXITS 1 — that is not a failure, the answer is
+// simply HEAD's tree. (A turn where the AI changed nothing, or changed and
+// changed back, lands here.)
 func (r *Recorder) stashTree() (string, error) {
-	out, err := gitOutput(r.root, "stash", "create")
-	if err != nil {
-		return "", err
-	}
+	out, _ := gitOutput(r.root, "stash", "create")
 	if h := strings.TrimSpace(out); h != "" {
 		return h, nil
 	}
-	out, err = gitOutput(r.root, "rev-parse", "HEAD^{tree}")
+	out, err := gitOutput(r.root, "rev-parse", "HEAD^{tree}")
 	if err != nil {
 		return "", err
 	}
@@ -443,7 +487,7 @@ func (r *Recorder) diffNameStatus(from, to string) ([]change, error) {
 			continue
 		}
 		if strings.HasPrefix(code, "R") || strings.HasPrefix(code, "C") {
-			if i+3 < len(fields) {
+			if i+2 < len(fields) {
 				changes = append(changes,
 					change{status: "D", path: fields[i+1]},
 					change{status: "A", path: fields[i+2]})
@@ -474,23 +518,19 @@ func (r *Recorder) untrackedFiles() ([]string, error) {
 	return paths, nil
 }
 
-// excludeSelfFromGit keeps our snapshot dir out of the user's git status
-// (local-only, standard practice — like .idea). Best effort.
-func (r *Recorder) excludeSelfFromGit() {
-	exclude := filepath.Join(r.root, ".git", "info", "exclude")
-	data, err := os.ReadFile(exclude)
+// trackedFiles returns the set of paths git tracks (slash paths).
+func (r *Recorder) trackedFiles() (map[string]bool, error) {
+	out, err := gitOutput(r.root, "ls-files", "-z")
 	if err != nil {
-		return
+		return nil, err
 	}
-	if strings.Contains(string(data), ".tiancan") {
-		return
+	set := map[string]bool{}
+	for _, p := range strings.Split(out, "\x00") {
+		if p = strings.TrimSpace(p); p != "" {
+			set[p] = true
+		}
 	}
-	f, err := os.OpenFile(exclude, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.WriteString("\n# TianCan AI IDE turn snapshots\n.tiancan/\n")
+	return set, nil
 }
 
 // ── helpers -----------------------------------------------------------------

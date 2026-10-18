@@ -621,3 +621,140 @@ func (d *DB) DeleteTurnBasesAfter(hash, id string, seq int64) error {
 	_, err := d.sql.Exec(`DELETE FROM anchor_turn_bases WHERE hash=? AND id=? AND seq>?`, hash, id, seq)
 	return err
 }
+
+// ── 锚点版本记录的清理辅助 ────────────────────────────────────────────────
+
+// AnchorFileRowsAfter returns every file row of turns after seq (oldest
+// first), so callers can release those blobs before deleting the rows.
+func (d *DB) AnchorFileRowsAfter(hash, id string, seq int64) ([]AnchorFileRow, error) {
+	rows, err := d.sql.Query(
+		`SELECT seq,path,status,before_sha,after_sha,added,removed,updated_at
+		 FROM anchor_files WHERE hash=? AND id=? AND seq>? ORDER BY seq ASC`, hash, id, seq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AnchorFileRow
+	for rows.Next() {
+		var f AnchorFileRow
+		if err := rows.Scan(&f.Seq, &f.Path, &f.Status, &f.BeforeSHA, &f.AfterSHA, &f.Added, &f.Removed, &f.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// TurnBaseRow is one recorded begin-of-turn base.
+type TurnBaseRow struct {
+	Seq     int64
+	Tree    string
+	Git     bool
+	SnapSHA string
+}
+
+// TurnBasesAfter returns the base records of turns after seq (oldest first),
+// so callers can release their manifest blobs before deleting the rows.
+func (d *DB) TurnBasesAfter(hash, id string, seq int64) ([]TurnBaseRow, error) {
+	rows, err := d.sql.Query(
+		`SELECT seq,tree,git,COALESCE(snap_sha,'') FROM anchor_turn_bases WHERE hash=? AND id=? AND seq>? ORDER BY seq ASC`,
+		hash, id, seq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TurnBaseRow
+	for rows.Next() {
+		var b TurnBaseRow
+		var g int
+		if err := rows.Scan(&b.Seq, &b.Tree, &g, &b.SnapSHA); err != nil {
+			return nil, err
+		}
+		b.Git = g == 1
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// AnchorAppliedPaths returns the paths of one turn that have at least one
+// successful "apply this hunk" record. Once a human restored a region of a
+// file, its recorded versions must not be silently refreshed by a later
+// capture — the apply log and the file rows would drift apart.
+func (d *DB) AnchorAppliedPaths(hash, id string, seq int64) (map[string]bool, error) {
+	rows, err := d.sql.Query(
+		`SELECT DISTINCT path FROM anchor_applies WHERE hash=? AND id=? AND seq=? AND ok=1`, hash, id, seq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out[p] = true
+	}
+	return out, rows.Err()
+}
+
+// DeleteAnchorFilesUnfrozen drops the file rows of one turn except the frozen
+// paths (a path is frozen once the user restored a hunk of it: its recorded
+// versions must survive later captures untouched).
+func (d *DB) DeleteAnchorFilesUnfrozen(hash, id string, seq int64, frozen map[string]bool) error {
+	if len(frozen) == 0 {
+		_, err := d.sql.Exec(`DELETE FROM anchor_files WHERE hash=? AND id=? AND seq=?`, hash, id, seq)
+		return err
+	}
+	rows, err := d.sql.Query(`SELECT path FROM anchor_files WHERE hash=? AND id=? AND seq=?`, hash, id, seq)
+	if err != nil {
+		return err
+	}
+	var drop []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			rows.Close()
+			return err
+		}
+		if !frozen[p] {
+			drop = append(drop, p)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, p := range drop {
+		if _, err := d.sql.Exec(`DELETE FROM anchor_files WHERE hash=? AND id=? AND seq=? AND path=?`, hash, id, seq, p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BlobsDir returns the directory that holds the content-addressed blob files.
+func (d *DB) BlobsDir() string { return d.blobsDir() }
+
+// BlobRows counts the live blob references (zero means everything was freed).
+func (d *DB) BlobRows() (int, error) {
+	var n int
+	err := d.sql.QueryRow(`SELECT COUNT(*) FROM blobs`).Scan(&n)
+	return n, err
+}
+
+// IsOpenTurn reports whether a turn anchor is still open (turn_end_seq = 0).
+// Only an open turn may be (re)captured: a closed turn's record was taken at
+// the moment it closed and must not be refreshed from the current worktree —
+// by then later turns have already moved the files on.
+func (d *DB) IsOpenTurn(hash, id string, seq int64) (bool, error) {
+	var n int
+	err := d.sql.QueryRow(
+		`SELECT COUNT(*) FROM anchors WHERE hash=? AND id=? AND seq=? AND COALESCE(kind,'fold')='turn' AND turn_end_seq=0`,
+		hash, id, seq).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}

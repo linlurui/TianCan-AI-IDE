@@ -119,7 +119,7 @@ export interface Message {
   content: string;
   name?: string; // tool name for tool_call/tool_result
   streaming?: boolean;
-  /** 后端会话里的事件序号，用于把锚点/审计条目精确定位到某条消息；尚未落盘的消息没有 */
+  /** 后端会话里的事件序号，用于把锚点/审查条目精确定位到某条消息；尚未落盘的消息没有 */
   seq?: number;
   /**
    * 前端侧的稳定标识：首次考虑落盘时惰性分配，此后无论这条消息被 spread 复制
@@ -145,7 +145,7 @@ interface AIPanelProps {
   fullWidth?: boolean;
   contextToAppend?: { id: number; text: string } | null;
   activityItems?: ActivityItem[];
-  /** 项目根路径：有值时聊天框显示「项目记忆」工具条（锚点/审计/回退/红线/召回/提示词） */
+  /** 项目根路径：有值时聊天框显示「项目记忆」工具条（锚点/审查/回退/红线/召回/提示词） */
   projectRoot?: string;
   /** 回退成功后通知上层刷新消息列表 */
   onRollback?: (seq: number) => void;
@@ -954,7 +954,7 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
         <div ref={bottomRef} />
       </div>
 
-      {/* 竖直锚点刻度：左键定位到该消息，右键弹出审计/回退 */}
+      {/* 竖直锚点刻度：左键定位到该消息，右键弹出审查/归档/回退 */}
       {projectRoot ? (
         <AnchorTimeline
           projectRoot={projectRoot}

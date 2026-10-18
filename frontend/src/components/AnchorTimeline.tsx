@@ -165,7 +165,7 @@ export default function AnchorTimeline({ projectRoot, sessionID = "main", messag
   };
 
   const doRollback = async (a: AnchorInfo) => {
-    if (!window.confirm(`确认回退到锚点 #${a.seq}？\n\n该点之后的消息将从上下文中移除，审计流水会完整保留这一操作记录。`)) return;
+    if (!window.confirm(`确认回退到锚点 #${a.seq}？\n\n该点之后的消息将从上下文中移除，本次操作会记入会话流水。`)) return;
     setBusy(true);
     try {
       await SessionRollback(projectRoot, sessionID, a.seq, `回退到锚点 #${a.seq}`);

@@ -8,11 +8,11 @@
 //   - git: at turn start a base tree is taken with `git stash create` (a commit
 //     object that does NOT touch the worktree), at turn end another one; the diff
 //     between the two trees is exactly this turn's changes, before-content
-//     included. Untracked files are covered by a hardlink snapshot of the
-//     untracked list taken at turn start.
-//   - snapshot: for projects without git, turn start takes a hardlink snapshot
-//     of every text file (same filesystem, so links cost no disk); turn end
-//     compares hashes and reads the old inode for the before-content.
+//     included. Untracked files are covered by a blob snapshot of the untracked
+//     list taken at turn start.
+//   - snapshot: for projects without git, turn start stores every text file in
+//     the content-addressed blob store; turn end compares hashes and reads the
+//     old version back from there.
 //
 // Everything lands in memdb (anchor_files + blobs), so versions survive an app
 // restart and the review panel works on any past turn. See docs/anchor-design.md.

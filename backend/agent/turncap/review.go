@@ -69,6 +69,10 @@ func (r *Recorder) Files(seq int64) ([]FileVersion, error) {
 // Detail returns one file's full review payload: both versions, every changed
 // region, and for each region whether it can still be applied.
 func (r *Recorder) Detail(seq int64, path string) (*FileDetail, error) {
+	// 先补抓再持锁：capture 自己也要拿锁，嵌套会死锁。
+	if err := r.Capture(seq); err != nil {
+		return nil, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.detail(seq, path)
@@ -110,7 +114,12 @@ func (r *Recorder) detail(seq int64, path string) (*FileDetail, error) {
 	hunks := Hunks(before, after)
 	views := make([]HunkView, 0, len(hunks))
 	for _, h := range hunks {
-		_, ok, reason := r.resolve(chain, i, h, curLines)
+		_, ok, reason := r.resolve(chain, i, h, curLines, applied)
+		if !ok && applied[h.Index] {
+			// 还原过的片段，工作区里已经是改前内容，坐标核对必然不过——
+			// 真实原因说清楚，别让用户以为是文件被谁改坏了。
+			reason = "此片段已应用过（工作区已是改前内容）"
+		}
 		views = append(views, HunkView{
 			Hunk:       h,
 			Superseded: !ok,
@@ -157,6 +166,18 @@ func (r *Recorder) ApplyHunk(seq int64, path string, hunkIndex int) error {
 	before := r.blobText(row.BeforeSHA)
 	after := r.blobText(row.AfterSHA)
 
+	applied := map[int]bool{}
+	if logs, err := r.db.ListAnchorApplies(r.hash, r.id, seq); err == nil {
+		for _, l := range logs {
+			if l.Path == path && l.OK {
+				applied[l.Hunk] = true
+			}
+		}
+	}
+	if applied[hunkIndex] {
+		return errors.New("此片段已应用过（工作区已是改前内容）")
+	}
+
 	var target *Hunk
 	hunks := Hunks(before, after)
 	if hunkIndex >= 0 && hunkIndex < len(hunks) {
@@ -172,7 +193,7 @@ func (r *Recorder) ApplyHunk(seq int64, path string, hunkIndex int) error {
 	}
 	curLines := strings.Split(*ws, "\n")
 
-	region, ok, reason := r.resolve(chain, i, *target, curLines)
+	region, ok, reason := r.resolve(chain, i, *target, curLines, applied)
 	if !ok {
 		_ = r.db.RecordAnchorApply(r.hash, r.id, seq, path, hunkIndex, false, reason)
 		return errors.New(reason)
@@ -193,8 +214,30 @@ func (r *Recorder) ApplyHunk(seq int64, path string, hunkIndex int) error {
 }
 
 // TruncateAfter drops the version records of turns after seq (conversation
-// rollback) and their snapshot directories.
+// rollback). Blob references are released so the blob store does not grow
+// without bound; the turn bases go too, otherwise a refresh capture would
+// resurrect the rolled-back turns.
 func (r *Recorder) TruncateAfter(seq int64) {
+	if rows, err := r.db.AnchorFileRowsAfter(r.hash, r.id, seq); err == nil {
+		for _, o := range rows {
+			_ = r.db.DropBlobRef(o.BeforeSHA)
+			_ = r.db.DropBlobRef(o.AfterSHA)
+		}
+	}
+	if bases, err := r.db.TurnBasesAfter(r.hash, r.id, seq); err == nil {
+		for _, b := range bases {
+			if b.SnapSHA == "" {
+				continue
+			}
+			// manifest blob 本身 + 它引用的每个内容 blob 都只被这个基点持有。
+			if data, err := r.db.GetBlob(b.SnapSHA); err == nil {
+				for _, sha := range parseManifest(data) {
+					_ = r.db.DropBlobRef(sha)
+				}
+			}
+			_ = r.db.DropBlobRef(b.SnapSHA)
+		}
+	}
 	_ = r.db.DeleteAnchorFilesAfter(r.hash, r.id, seq)
 	_ = r.db.DeleteAnchorAppliesAfter(r.hash, r.id, seq)
 	// 基点也必须删：否则 Files() 里的补抓会把刚撤掉的轮次再抓回来。
@@ -208,8 +251,32 @@ func (r *Recorder) TruncateAfter(seq int64) {
 // Every later turn's before-content equals the previous chain entry's
 // after-content (they are consecutive versions of the same file), so the
 // region can be shifted turn by turn until it lands in current-file space.
-func (r *Recorder) resolve(chain []memdb.AnchorFileRow, i int, h Hunk, cur []string) (span, bool, string) {
+//
+// Two kinds of edits shift the region: later turns of the chain, and hunks of
+// THIS turn that were already restored by the user (an applied hunk changes
+// the line count of the working copy exactly like a later edit would).
+func (r *Recorder) resolve(chain []memdb.AnchorFileRow, i int, h Hunk, cur []string, applied map[int]bool) (span, bool, string) {
 	region := span{Start: h.AfterStart, End: h.AfterEnd}
+
+	// 同一轮里已经还原过的片段：它们已经把工作区的行数改掉了，
+	// 目标片段在它们之后的部分必须跟着平移，否则会定位到错误的行。
+	hunks := Hunks(r.blobText(chain[i].BeforeSHA), r.blobText(chain[i].AfterSHA))
+	for _, hb := range hunks {
+		if hb.Index == h.Index || !applied[hb.Index] {
+			continue
+		}
+		switch {
+		case hb.AfterEnd <= region.Start:
+			d := -hb.Delta() // 还原 = 行数变化取反
+			region.Start += d
+			region.End += d
+		case hb.AfterStart >= region.End:
+			// 完全在目标片段之后：不动。
+		default:
+			return span{}, false, "同一轮内片段相互重叠，无法定位"
+		}
+	}
+
 	prevAfter := chain[i].AfterSHA
 	for k := i + 1; k < len(chain); k++ {
 		b := chain[k]

@@ -60,6 +60,37 @@ func read(t *testing.T, dir, name string) string {
 	return string(b)
 }
 
+
+// openTurn records the turn anchor row that conversation.Session would have
+// created for this user message — the recorder only captures OPEN turns.
+func openTurn(t *testing.T, db *memdb.DB, seq int64) {
+	t.Helper()
+	if err := db.RecordAnchor("h1", "main", memdb.AnchorRow{
+		Seq: seq, Time: seq, Title: "turn", Kind: "turn",
+		Summary: "turn", Status: "active", MsgSeq: seq, TurnEndSeq: 0,
+	}); err != nil {
+		t.Fatalf("record anchor: %v", err)
+	}
+}
+
+// closeTurns mimics conversation.closeOpenTurns: every still-open turn is
+// capped (closed) — in production its capture already ran synchronously by now.
+func closeTurns(t *testing.T, db *memdb.DB) {
+	t.Helper()
+	if err := db.Exec(`UPDATE anchors SET turn_end_seq=(SELECT COALESCE(MAX(seq),0) FROM anchors) WHERE hash=? AND id=? AND kind='turn' AND turn_end_seq=0`, "h1", "main"); err != nil {
+		t.Fatalf("close turns: %v", err)
+	}
+}
+
+// beginTurn = conversation's "new user message" from the recorder's view:
+// previous turns get closed, then this turn's anchor opens.
+func beginTurn(t *testing.T, db *memdb.DB, rec *Recorder, seq int64) {
+	t.Helper()
+	closeTurns(t, db)
+	openTurn(t, db, seq)
+	rec.Begin(seq)
+}
+
 // ── diff ---------------------------------------------------------------------
 
 func TestHunksBasic(t *testing.T) {
@@ -96,7 +127,7 @@ func TestCaptureGitTurnAndApply(t *testing.T) {
 	db := openDB(t)
 	rec := NewRecorder(dir, db, "h1", "main")
 
-	rec.Begin(10)
+	beginTurn(t, db, rec, 10)
 	write(t, dir, "a.go", "package main\n\nfunc A() int { return 2 }\n")
 	write(t, dir, "new.go", "package main\n\nfunc N() {}\n")
 	if err := rec.Capture(10); err != nil {
@@ -146,13 +177,13 @@ func TestSupersedeSameRegion(t *testing.T) {
 	rec := NewRecorder(dir, db, "h1", "main")
 
 	// 第一轮改 return 1 → 2
-	rec.Begin(10)
+	beginTurn(t, db, rec, 10)
 	write(t, dir, "a.go", "package main\n\nfunc A() int { return 2 }\n")
 	if err := rec.Capture(10); err != nil {
 		t.Fatal(err)
 	}
 	// 第二轮改同一行 return 2 → 3
-	rec.Begin(20)
+	beginTurn(t, db, rec, 20)
 	write(t, dir, "a.go", "package main\n\nfunc A() int { return 3 }\n")
 	if err := rec.Capture(20); err != nil {
 		t.Fatal(err)
@@ -164,6 +195,11 @@ func TestSupersedeSameRegion(t *testing.T) {
 	}
 	if d1.Hunks[0].Reason == "" {
 		t.Fatal("superseded hunk must explain why")
+	}
+	// 原因必须是"同一片段被后续修改占用"——"版本链断裂"意味着中间某轮
+	// 的记录被污染过（曾经的真实 bug：审查老轮次会用当前工作区刷新它的记录）。
+	if !strings.Contains(d1.Hunks[0].Reason, "后续修改已占用") {
+		t.Fatalf("reason should be region-occupied, got %q", d1.Hunks[0].Reason)
 	}
 	// 服务端同样要挡住
 	if err := rec.ApplyHunk(10, "a.go", 0); err == nil {
@@ -199,13 +235,13 @@ func TestLaterEditElsewhereStillApplies(t *testing.T) {
 	rec := NewRecorder(dir, db, "h1", "main")
 
 	// 第一轮改 A
-	rec.Begin(10)
+	beginTurn(t, db, rec, 10)
 	write(t, dir, "a.go", strings.Replace(base, "return 1", "return 2", 1))
 	if err := rec.Capture(10); err != nil {
 		t.Fatal(err)
 	}
 	// 第二轮在文件末尾加一个新函数（与 A 不相干）
-	rec.Begin(20)
+	beginTurn(t, db, rec, 20)
 	write(t, dir, "a.go", strings.Replace(base, "return 1", "return 2", 1)+"\nfunc C() int { return 30 }\n")
 	if err := rec.Capture(20); err != nil {
 		t.Fatal(err)
@@ -235,7 +271,7 @@ func TestCaptureSnapWithoutGit(t *testing.T) {
 	}
 
 	write(t, dir, "a.txt", "one\ntwo\nthree\n")
-	rec.Begin(10)
+	beginTurn(t, db, rec, 10)
 	write(t, dir, "a.txt", "one\nTWO\nthree\n")
 	write(t, dir, "b.txt", "brand new\n")
 	if err := rec.Capture(10); err != nil {
@@ -270,7 +306,7 @@ func TestTruncateAfterDropsVersions(t *testing.T) {
 	dir := initGitRepo(t)
 	db := openDB(t)
 	rec := NewRecorder(dir, db, "h1", "main")
-	rec.Begin(10)
+	beginTurn(t, db, rec, 10)
 	write(t, dir, "a.go", "package main\n\nfunc A() int { return 9 }\n")
 	if err := rec.Capture(10); err != nil {
 		t.Fatal(err)
@@ -296,5 +332,201 @@ func TestCaptureWithoutBaseIsNoop(t *testing.T) {
 	files, err := rec.Files(99)
 	if err != nil || len(files) != 0 {
 		t.Fatalf("want no files, got %+v (%v)", files, err)
+	}
+}
+
+// ── 复查修复的回归测试 ────────────────────────────────────────────────────
+
+// TestApplyTwoHunksSameTurn: 一轮改了两处，先还原前面的段，行数变了，
+// 后面的段必须还能定位并还原（坐标要跟着平移，不能报"文件已被其他修改"）。
+func TestApplyTwoHunksSameTurn(t *testing.T) {
+	dir := initGitRepo(t)
+	base := "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(base), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-qm", "ten lines")
+
+	db := openDB(t)
+	rec := NewRecorder(dir, db, "h1", "main")
+
+	beginTurn(t, db, rec, 10)
+	// 两处互不相干的改动：第 2 行删掉一行，第 9 行替换
+	changed := "l1\nl3\nl4\nl5\nl6\nl7\nl8\nNINE\nl10\n"
+	write(t, dir, "a.go", changed)
+	if err := rec.Capture(10); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := rec.Detail(10, "a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Hunks) != 2 {
+		t.Fatalf("want 2 hunks, got %d (%+v)", len(d.Hunks), d.Hunks)
+	}
+
+	// 先应用靠前的片段（它删掉一行 → 后面所有行上移一格）
+	if err := rec.ApplyHunk(10, "a.go", 0); err != nil {
+		t.Fatalf("apply hunk 0: %v", err)
+	}
+	// 再应用靠后的片段：必须仍然定位得到
+	if err := rec.ApplyHunk(10, "a.go", 1); err != nil {
+		t.Fatalf("apply hunk 1 after hunk 0 shifted lines: %v", err)
+	}
+	if got := read(t, dir, "a.go"); got != base {
+		t.Fatalf("both hunks applied should restore the original:\n%s", got)
+	}
+
+	// 重复应用同一段要挡住，并且说清楚是"已应用过"
+	if err := rec.ApplyHunk(10, "a.go", 0); err == nil {
+		t.Fatal("re-applying the same hunk must fail")
+	} else if !strings.Contains(err.Error(), "已应用过") {
+		t.Fatalf("reason should mention already-applied, got %q", err)
+	}
+}
+
+// TestApplyFreezesVersionRecord: 还原过一段之后，轮子还开着时的再次捕获
+// 不许把"用户还原后"的状态写成新的改后版本——那会换掉 diff 内容，
+// 并让应用流水里的片段编号漂到别的段上。
+func TestApplyFreezesVersionRecord(t *testing.T) {
+	dir := initGitRepo(t)
+	db := openDB(t)
+	rec := NewRecorder(dir, db, "h1", "main")
+
+	beginTurn(t, db, rec, 10)
+	write(t, dir, "a.go", "package main\n\nfunc A() int { return 2 }\n")
+	if err := rec.Capture(10); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.ApplyHunk(10, "a.go", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟用户继续操作：加一个无关文件后轮子仍未关闭，前端刷新列表 → 重新捕获。
+	write(t, dir, "other.go", "package main\n")
+	if err := rec.Capture(10); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := rec.Detail(10, "a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.AfterContent != "package main\n\nfunc A() int { return 2 }\n" {
+		t.Fatalf("recorded after-content must stay what the AI wrote, got:\n%s", d.AfterContent)
+	}
+	if len(d.Hunks) != 1 || !d.Hunks[0].Applied {
+		t.Fatalf("hunk 0 must still be the applied one, got %+v", d.Hunks)
+	}
+	if d.Hunks[0].Superseded && !strings.Contains(d.Hunks[0].Reason, "已应用过") {
+		t.Fatalf("applied hunk should explain itself, got %q", d.Hunks[0].Reason)
+	}
+}
+
+// TestTruncateReleasesBlobs: 回退要释放 blob 引用，否则 blobs 目录只增不减。
+func TestTruncateReleasesBlobs(t *testing.T) {
+	dir := initGitRepo(t)
+	db := openDB(t)
+	rec := NewRecorder(dir, db, "h1", "main")
+
+	beginTurn(t, db, rec, 10)
+	write(t, dir, "a.go", "package main\n\nfunc A() int { return 9 }\n")
+	if err := rec.Capture(10); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := rec.Files(10)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %+v", files)
+	}
+	blobsBefore := countBlobFiles(t, db)
+
+	rec.TruncateAfter(5)
+
+	if got := countBlobFiles(t, db); got != 0 {
+		t.Fatalf("rollback should release every blob, %d files left (before: %d)", got, blobsBefore)
+	}
+	if n, _ := db.BlobRows(); n != 0 {
+		t.Fatalf("blob rows should be gone, got %d", n)
+	}
+}
+
+// TestGitAddedFileNotReportedDeleted: 开工时未跟踪、期间被 git add 的文件
+// 仍在工作区，不能因为"不在未跟踪列表里"就被记成删除。
+func TestGitAddedFileNotReportedDeleted(t *testing.T) {
+	dir := initGitRepo(t)
+	db := openDB(t)
+	rec := NewRecorder(dir, db, "h1", "main")
+
+	write(t, dir, "fresh.go", "package main\n\nfunc F() {}\n")
+	beginTurn(t, db, rec, 10)
+	git(t, dir, "add", "fresh.go") // 期间被 add：进了树，但没改内容
+	if err := rec.Capture(10); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := rec.Files(10)
+	for _, f := range files {
+		if f.Path == "fresh.go" && f.Status == "D" {
+			t.Fatalf("a git-added file must not be reported deleted: %+v", files)
+		}
+	}
+}
+
+// TestSnapshotTurnBaseFallback: git 项目取基点树失败时（这里用坏仓库模拟），
+// 必须退化成全量 blob，而不是只记未跟踪文件把 tracked 改动丢掉。
+func TestSnapshotTurnBaseFallback(t *testing.T) {
+	dir := t.TempDir()
+	db := openDB(t)
+	rec := NewRecorder(dir, db, "h1", "main")
+	// 伪装成 git 项目但 git 命令必失败（目录不是仓库）
+	rec.git = true
+
+	write(t, dir, "a.txt", "one\ntwo\n")
+	beginTurn(t, db, rec, 10)
+	write(t, dir, "a.txt", "one\nTWO\n")
+	if err := rec.Capture(10); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := rec.Files(10)
+	if len(files) != 1 || files[0].Path != "a.txt" || files[0].Status != "M" {
+		t.Fatalf("fallback must still capture tracked-style changes, got %+v", files)
+	}
+	d, _ := rec.Detail(10, "a.txt")
+	if d.BeforeContent != "one\ntwo\n" {
+		t.Fatalf("wrong before content: %q", d.BeforeContent)
+	}
+}
+
+// TestClosedTurnIsNotRefreshed: 轮次关闭后，审查它不许用当前工作区重新差分——
+// 那时文件已经是后续轮次的样子，刷新会把别人的改动写进这一轮的"改后版本"。
+func TestClosedTurnIsNotRefreshed(t *testing.T) {
+	dir := initGitRepo(t)
+	db := openDB(t)
+	rec := NewRecorder(dir, db, "h1", "main")
+
+	beginTurn(t, db, rec, 10)
+	write(t, dir, "a.go", "package main\n\nfunc A() int { return 2 }\n")
+	if err := rec.Capture(10); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟关轮：conversation 在下一轮用户发言时把 turn_end_seq 置上。
+	if err := db.Exec(`UPDATE anchors SET turn_end_seq=? WHERE hash=? AND id=? AND seq=?`, 99, "h1", "main", 10); err != nil {
+		t.Fatal(err)
+	}
+
+	// 之后工作区又被改（后续轮次的编辑）
+	write(t, dir, "a.go", "package main\n\nfunc A() int { return 3 }\n\nfunc Later() {}\n")
+
+	d, err := rec.Detail(10, "a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.AfterContent != "package main\n\nfunc A() int { return 2 }\n" {
+		t.Fatalf("closed turn's after-version must stay frozen at close time, got:\n%s", d.AfterContent)
+	}
+	if strings.Contains(d.AfterContent, "Later") {
+		t.Fatal("later edits must never leak into an old turn's record")
 	}
 }

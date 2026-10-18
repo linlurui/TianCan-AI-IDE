@@ -351,9 +351,7 @@ func (s *Session) AppendMessage(role Role, content string) (int64, error) {
 		return 0, err
 	}
 	if role == RoleUser {
-		for _, sq := range s.closeOpenTurns(e.Seq) {
-			s.captureTurn(sq)
-		}
+		s.closeOpenTurns(e.Seq)
 		s.dropTurnAnchor(e.Seq, content)
 		s.beginTurn(e.Seq)
 	}
@@ -372,8 +370,13 @@ func (s *Session) AppendMessage(role Role, content string) (int64, error) {
 }
 
 // closeOpenTurns caps every still-open turn anchor at the seq just before this
-// new user message and returns the seqs it closed (so their file changes can be
-// captured: the turn is over, the worktree now holds its final state).
+// new user message and returns the seqs it closed.
+//
+// The file capture runs synchronously HERE, before the rows are closed: at this
+// moment the worktree still holds exactly the state that turn left behind. An
+// async capture would race with the next turn's edits (the agent may already be
+// writing files), and a capture after closing would be skipped by the
+// open-turn guard and leave the turn with no versions at all.
 func (s *Session) closeOpenTurns(before int64) []int64 {
 	if s.db == nil || before <= 1 {
 		return nil
@@ -391,6 +394,9 @@ func (s *Session) closeOpenTurns(before int64) []int64 {
 	if len(closed) == 0 {
 		return nil
 	}
+	for _, sq := range closed {
+		s.captureTurnNow(sq) // 先抓：轮子还开着，工作区是它的最终态
+	}
 	_ = s.db.Exec(`UPDATE anchors SET turn_end_seq=? WHERE hash=? AND id=? AND kind='turn' AND turn_end_seq=0 AND msg_seq<?`,
 		before-1, s.hash, s.id, before)
 	return closed
@@ -406,20 +412,10 @@ func (s *Session) beginTurn(seq int64) {
 	}
 }
 
-// captureTurn flushes one turn's file changes off the append path (git calls
-// are fast but not free).
-func (s *Session) captureTurn(seq int64) {
-	s.mu.Lock()
-	c := s.cap
-	s.mu.Unlock()
-	if c == nil {
-		return
-	}
-	go func() { _ = c.Capture(seq) }()
-}
-
-// captureTurnNow is the synchronous variant for user-triggered actions
-// (archive, shutdown) where the caller expects the versions to be there.
+// captureTurnNow captures one turn's file changes synchronously. Used at turn
+// close, archive and shutdown — every point where the caller expects the
+// versions to be there right away, and where the worktree still holds the state
+// that turn left behind.
 func (s *Session) captureTurnNow(seq int64) {
 	s.mu.Lock()
 	c := s.cap
