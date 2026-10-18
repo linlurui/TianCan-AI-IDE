@@ -3,10 +3,9 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 
+	"github.com/linlurui/tiancan-ai-ide/backend/browser"
 	"github.com/linlurui/tiancan-ai-ide/backend/envconfig"
 )
 
@@ -38,20 +37,9 @@ func (s *Service) GetEnvStatus() EnvStatus {
 	return EnvStatus{
 		DockerAvailable:  isCommandAvailable("docker"),
 		DaytonaAvailable: isCommandAvailable("daytona"),
-		PlaywrightReady:  s.checkPlaywright(),
+		BrowserReady:    browser.Available(),
 		NodeAvailable:    isCommandAvailable("node"),
 	}
-}
-
-func (s *Service) checkPlaywright() bool {
-	if !isCommandAvailable("node") {
-		return false
-	}
-	cmd := exec.Command("node", "-e", "require('playwright')")
-	if err := cmd.Run(); err == nil {
-		return true
-	}
-	return false
 }
 
 // SetProvider sets the active sandbox provider.
@@ -120,41 +108,10 @@ func (s *Service) InstallProvider(name string) (string, error) {
 	return string(out), nil
 }
 
-// InstallPlaywright installs Playwright and Chromium.
-func (s *Service) InstallPlaywright() (string, error) {
-	if !isCommandAvailable("node") {
-		return "", fmt.Errorf("Node.js 未安装")
-	}
-
-	if s.checkPlaywright() {
-		return "Playwright 已安装", nil
-	}
-
-	home := envconfig.DataHome()
-	runDir := filepath.Join(home, "playwright")
-	os.MkdirAll(runDir, 0o755)
-
-	cmd := exec.Command("npm", "install", "playwright")
-	cmd.Dir = runDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("npm install playwright: %w", err)
-	}
-
-	cmd = exec.Command("npx", "playwright", "install", "chromium")
-	cmd.Dir = runDir
-	out2, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out) + "\n" + string(out2), fmt.Errorf("playwright install chromium: %w", err)
-	}
-
-	return string(out) + "\n" + string(out2), nil
-}
-
 // EnvStatus represents the status of required runtime environments.
 type EnvStatus struct {
-	DockerAvailable   bool `json:"dockerAvailable"`
+	DockerAvailable  bool `json:"dockerAvailable"`
 	DaytonaAvailable bool `json:"daytonaAvailable"`
-	PlaywrightReady  bool `json:"playwrightReady"`
+	BrowserReady    bool `json:"browserReady"`
 	NodeAvailable    bool `json:"nodeAvailable"`
 }

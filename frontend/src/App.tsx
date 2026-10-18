@@ -48,7 +48,7 @@ import SearchPanel from "./components/SearchPanel";
 import DatabasePanel from "./components/DatabasePanel";
 import TestingPanel from "./components/TestingPanel";
 import ApiTestPanel from "./components/ApiTestPanel";
-import PlaywrightPanel from "./components/PlaywrightPanel";
+import BrowserTestPanel from "./components/BrowserTestPanel";
 import DeployWorkspace from "./components/DeployWorkspace";
 import DeployPanel from "./components/DeployPanel";
 import ModelStatusIndicator from "./components/ModelStatusIndicator";
@@ -1010,10 +1010,10 @@ export default function App() {
                   editor.openTab({ path, name: t("testing.apiName"), content: "", isDirty: false });
                 editor.setActiveTab(path);
               }}
-              onOpenPlaywright={() => {
-                const path = "__playwright__";
+              onOpenBrowserTest={() => {
+                const path = "__browsertest__";
                 if (!editor.tabs.find((t) => t.path === path))
-                  editor.openTab({ path, name: "Playwright", content: "", isDirty: false });
+                  editor.openTab({ path, name: t("testing.browserTestName"), content: "", isDirty: false });
                 editor.setActiveTab(path);
               }}
             />
@@ -1144,7 +1144,8 @@ export default function App() {
             onSave={handleSave}
             renderSpecial={(path) => {
               if (path === "__api_test__") return <ApiTestPanel />;
-              if (path === "__playwright__") return <PlaywrightPanel />;
+              if (path === "__browsertest__")
+                return <BrowserTestPanel projectRoot={project.activeProject?.rootPath ?? null} />;
               if (path === "__deploy__") return <DeployWorkspace />;
               if (path.startsWith("__commit_diff__:")) {
                 const parts = path.split(":");

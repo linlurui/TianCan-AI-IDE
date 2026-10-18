@@ -9,7 +9,7 @@ import (
 //
 // 历史遗留三个目录名并存，本文件保持语义不变、只做收敛与覆盖口：
 //   - ConfigHome：~/.tiancan        （配置：MCP、自定义 provider、扩展、token、沙箱 bin）
-//   - DataHome：  ~/.tiancan-ide    （数据/运行时：playwright、debug 工具链、lm-studio）
+//   - DataHome：  ~/.tiancan-ide    （数据/运行时：浏览器测试、debug 工具链、lm-studio）
 //   - MemoryHome：~/.tiancan-ai-ide （项目记忆）
 //   - ProjectDataDir：<root>/.tiancan（项目级数据，跟随项目根）
 //

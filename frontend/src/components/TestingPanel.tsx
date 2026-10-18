@@ -4,10 +4,10 @@ import { useTranslation } from "../i18n";
 
 interface Props {
   onOpenApiTest: () => void;
-  onOpenPlaywright: () => void;
+  onOpenBrowserTest: () => void;
 }
 
-export default function TestingPanel({ onOpenApiTest, onOpenPlaywright }: Props) {
+export default function TestingPanel({ onOpenApiTest, onOpenBrowserTest }: Props) {
   const { t } = useTranslation();
   return (
     <div className="testing-panel">
@@ -30,11 +30,11 @@ export default function TestingPanel({ onOpenApiTest, onOpenPlaywright }: Props)
 
       <div className="testing-group">
         <div className="testing-group-label">{t("testing.autoGroup")}</div>
-        <div className="testing-item" onClick={onOpenPlaywright}>
-          <Code2 size={13} className="testing-item-icon pw" />
+        <div className="testing-item" onClick={onOpenBrowserTest}>
+          <FlaskConical size={13} className="testing-item-icon pw" />
           <div className="testing-item-info">
-            <span className="testing-item-name">{t("testing.playwrightName")}</span>
-            <span className="testing-item-desc">{t("testing.playwrightDesc")}</span>
+            <span className="testing-item-name">{t("testing.browserTestName")}</span>
+            <span className="testing-item-desc">{t("testing.browserTestDesc")}</span>
           </div>
           <ChevronRight size={12} className="testing-item-arrow" />
         </div>

@@ -6,6 +6,7 @@ import (
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/ctxsvc"
+	"github.com/linlurui/tiancan-ai-ide/backend/autotest"
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/mcp"
 	"github.com/linlurui/tiancan-ai-ide/backend/ai"
 	"github.com/linlurui/tiancan-ai-ide/backend/config"
@@ -17,7 +18,6 @@ import (
 	"github.com/linlurui/tiancan-ai-ide/backend/git"
 	"github.com/linlurui/tiancan-ai-ide/backend/lsp"
 	"github.com/linlurui/tiancan-ai-ide/backend/memory"
-	"github.com/linlurui/tiancan-ai-ide/backend/playwright"
 	"github.com/linlurui/tiancan-ai-ide/backend/process"
 	"github.com/linlurui/tiancan-ai-ide/backend/project"
 	"github.com/linlurui/tiancan-ai-ide/backend/remote"
@@ -34,7 +34,7 @@ func main() {
 	cfgService := config.NewService()
 	aiService := ai.NewService()
 	winManager := window.NewManager()
-	pwService := playwright.NewService()
+	atService := autotest.NewService()
 	ctxService := ctxsvc.NewService()
 
 	app := application.New(application.Options{
@@ -54,7 +54,7 @@ func main() {
 			application.NewService(debug.NewService()),
 			application.NewService(cfgService),
 			application.NewService(remote.NewService()),
-			application.NewService(pwService),
+			application.NewService(atService),
 			application.NewService(aiService),
 			application.NewService(winManager),
 			application.NewService(mcp.NewService()),
@@ -98,7 +98,7 @@ func main() {
 
 	fsService.App = app
 	aiService.App = app
-	pwService.SetApp(app)
+	atService.SetApp(app)
 	winManager.SetApp(app)
 	// Wire SmartRouter App so it can emit events (model status, kill-lm-studio, etc.)
 	cfg := aiService.Router.GetConfig()

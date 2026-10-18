@@ -98,7 +98,3 @@ export async function GetEnvStatus(): Promise<EnvStatus> {
 export async function GetManager(): Promise<Manager> {
   return { provider: "process", isConnected: true };
 }
-
-export async function InstallPlaywright(): Promise<void> {
-  console.warn("Sandbox InstallPlaywright not implemented");
-}

@@ -4306,7 +4306,7 @@ func (s *Service) ListWebProviders() []WebProviderInfo {
 	return result
 }
 
-// LoginWeb launches a Playwright browser for the user to authenticate.
+// LoginWeb launches a local browser (go-rod) for the user to authenticate.
 // It runs the login flow in a goroutine and emits events:
 //   - webai:login-success → {provider, cookie, bearer, ...}
 //   - webai:login-error   → {error: "..."}
@@ -4338,11 +4338,11 @@ func (s *Service) LoginWeb(providerID string) error {
 		return nil
 	}
 
-	// Run Playwright login in a goroutine (blocks up to 5 minutes)
+	// Run browser login in a goroutine (blocks up to 5 minutes)
 	go func() {
 		authResult, err := browser.RunLogin(providerID)
 		if err != nil {
-			log.Printf("ai: Playwright login failed for %s: %v", providerID, err)
+			log.Printf("ai: browser login failed for %s: %v", providerID, err)
 			if s.hasEmitter() {
 				s.emit("webai:login-error", map[string]string{
 					"provider": providerID,

@@ -81,7 +81,9 @@ func Launch(opts Options) (*rod.Browser, error) {
 	}
 	l := launcher.New().Bin(bin)
 	if opts.Headless {
-		l.Headless(true)
+		// 必须是 --headless=new：旧 --headless 模式已被 Chrome 132+ 移除，
+		// 传旧 flag 浏览器会启动后立刻退出，表现为 CDP 连接 EOF。
+		l.HeadlessNew(true)
 	}
 	controlURL, err := l.Launch()
 	if err != nil {

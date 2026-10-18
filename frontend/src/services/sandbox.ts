@@ -9,7 +9,6 @@ import {
   StopSandbox as _StopSandbox,
   ExecInSandbox as _ExecInSandbox,
   InstallProvider as _InstallProvider,
-  InstallPlaywright as _InstallPlaywright,
   GetManager as _GetManager,
 } from "@bindings/sandbox";
 import type {
@@ -31,7 +30,6 @@ export const CreateSandbox = _CreateSandbox;
 export const StopSandbox = _StopSandbox;
 export const ExecInSandbox = _ExecInSandbox;
 export const InstallProvider = _InstallProvider;
-export const InstallPlaywright = _InstallPlaywright;
 export const GetManager = _GetManager;
 
 // Re-export types

@@ -326,7 +326,7 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, [contextToAppend?.id]);
 
-  // Listen for Playwright-based web login events from the backend
+  // Listen for browser-based web login events from the backend
   useEffect(() => {
     const offSuccess = Events.On("webai:login-success", (evt: any) => {
       setWebLoginWaiting(false);
@@ -339,7 +339,7 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
       setWebLoginWaiting(false);
       setShowWebCookieInput(true); // fall back to manual cookie input
       const msg = typeof evt === "object" && evt !== null ? evt.error : String(evt);
-      setInstallLogs((p) => [...p, `❌ Playwright 登录失败: ${msg}，请手动粘贴 Cookie`]);
+      setInstallLogs((p) => [...p, `❌ 浏览器登录失败: ${msg}，请手动粘贴 Cookie`]);
     });
     const offFallback = Events.On("webai:login-fallback", () => {
       setWebLoginWaiting(false);
@@ -551,7 +551,7 @@ export default function AIPanel({ messages, onSend, onStop, isLoading, fullWidth
       setWebLoginWaiting(true);
       setShowWebCookieInput(false);
       await LoginWeb(webProviderID);
-      // If Playwright is available, the browser window is now open.
+      // If a local browser is available, the window is now open.
       // webai:login-success / webai:login-error / webai:login-fallback events
       // will arrive asynchronously and update the state accordingly.
     } catch (err: any) {
