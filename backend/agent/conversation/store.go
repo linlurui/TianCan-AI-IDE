@@ -13,10 +13,11 @@ import (
 	"time"
 
 	"github.com/linlurui/tiancan-ai-ide/backend/agent/journal"
+	"github.com/linlurui/tiancan-ai-ide/backend/agent/memdb"
 )
 
-// DefaultBaseDirName is the directory under the user config dir that holds every
-// project session: ~/.tiancan-ai-ide/sessions/<projectHash>/<sessionID>/.
+// DefaultBaseDirName is the directory under the user config dir that holds the
+// unified memory database: ~/.tiancan-ai-ide/sessions/store.sqlite.
 const DefaultBaseDirName = "sessions"
 
 // MainSessionID is the well-known id of a project's primary session. The roadmap
@@ -29,9 +30,9 @@ const MainSessionID = "main"
 // the prompt never has to carry an unbounded amount of verbatim history.
 const AutoSegmentTokens = 6000
 
-// AnchorEvery is how often (in appended events) a state snapshot is dropped. It
-// caps replay cost after a crash: recovery never replays more than this many
-// events from the newest anchor.
+// AnchorEvery is how often (in appended events) the folded state is persisted as a
+// tail snapshot. It caps replay cost after a restart: recovery never replays more
+// than this many events from the newest tail.
 const AnchorEvery = 64
 
 // ProjectHash turns a project root into a stable directory name. Hashing (rather
@@ -46,21 +47,30 @@ func ProjectHash(root string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// Store owns every project session under one base directory. It is safe for
-// concurrent use; individual sessions are opened lazily and kept in memory.
+// Store owns every project session and backs them with one shared SQLite database.
+// It is safe for concurrent use; individual sessions are opened lazily and kept in
+// memory (their authoritative state is the pure fold of the event log, but the
+// folded tail is persisted so reopening is O(recent events), not O(all)).
 type Store struct {
 	baseDir string
 	mu      sync.Mutex
+	db      *memdb.DB
 	open    map[string]*Session // key: projectHash + "/" + sessionID
 }
 
-// NewStore creates a store rooted at baseDir (created if missing).
+// NewStore creates a store rooted at baseDir (created if missing). If baseDir is
+// empty it defaults to ~/.tiancan-ai-ide/sessions.
 func NewStore(baseDir string) *Store {
 	if baseDir == "" {
 		baseDir = filepath.Join(configHome(), DefaultBaseDirName)
 	}
 	_ = os.MkdirAll(baseDir, 0o755)
-	return &Store{baseDir: baseDir, open: map[string]*Session{}}
+	db, err := memdb.Open(filepath.Join(baseDir, "store.sqlite"))
+	if err != nil {
+		// Defer the error to the first operation; keep the constructor signature.
+		db = nil
+	}
+	return &Store{baseDir: baseDir, db: db, open: map[string]*Session{}}
 }
 
 // DefaultStore returns a store under ~/.tiancan-ai-ide/sessions.
@@ -78,18 +88,22 @@ func configHome() string {
 // BaseDir returns the store root.
 func (s *Store) BaseDir() string { return s.baseDir }
 
-// Session is one open project session: a journal plus its live projection.
+// memID returns the global session id used inside the database (project-unique).
+func memID(hash, id string) string { return hash + "/" + id }
+
+// Session is one open project session: an event log folded into a live projection,
+// with the log persisted to the shared SQLite store.
 type Session struct {
 	store *Store
-	log   *journal.Log
-	proj  *journal.Projector
-
-	id          string
-	projectRoot string
-	dir         string
+	db    *memdb.DB
+	hash  string
+	id    string
+	memID string // hash + "/" + id, the global key in the events/messages tables
+	dir   string // per-session directory (for recall index sidecars)
 
 	mu         sync.Mutex
-	pending    int // events since the last anchor
+	state      *SessionState
+	pending    int // events since the last tail snapshot
 	onAppend   func(seq int64, role Role, content string)
 	autoSegTok int
 }
@@ -118,40 +132,62 @@ func (s *Store) OpenID(projectRoot, id, title string) (*Session, error) {
 }
 
 func (s *Store) openLocked(projectRoot, hash, id, title string) (*Session, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("conversation: store database not available")
+	}
 	dir := filepath.Join(s.baseDir, hash, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("conversation: mkdir %s: %w", dir, err)
 	}
-	logPath := filepath.Join(dir, "journal.jsonl")
-	lg, err := journal.OpenLog(logPath)
-	if err != nil {
-		return nil, fmt.Errorf("conversation: open journal: %w", err)
+	if err := s.db.EnsureProject(hash, projectRoot); err != nil {
+		return nil, err
+	}
+	if _, err := s.db.OpenSession(hash, id, title); err != nil {
+		return nil, err
 	}
 	now := time.Now().UnixMilli()
-	initial := NewSessionState(id, projectRoot, title, now)
-	proj, err := journal.NewProjector(initial, lg)
+	st := NewSessionState(id, projectRoot, title, now)
+	// Recover from the folded tail snapshot, then replay only the events after it.
+	if tj, tailSeq, ok, err := s.db.GetTail(hash, id); err == nil && ok && tj != "" {
+		_ = st.LoadJSON([]byte(tj))
+		// Replay tail is the fully folded state at tailSeq; keep HeadSeq sane.
+		if tailSeq > st.HeadSeq {
+			st.HeadSeq = tailSeq
+		}
+		st.UpdatedAt = maxInt64(st.UpdatedAt, st.CreatedAt)
+	}
+	events, err := s.db.EventsAfter(memID(hash, id), st.HeadSeq)
 	if err != nil {
-		_ = lg.Close()
-		return nil, fmt.Errorf("conversation: replay journal: %w", err)
+		return nil, err
+	}
+	for _, e := range events {
+		st.Apply(journal.Event{
+			Seq:     e.Seq,
+			Kind:    e.Kind,
+			Payload: []byte(e.Payload),
+			Time:    e.TS,
+			Refs:    int32(e.Refs),
+		})
 	}
 	sess := &Session{
-		store:       s,
-		log:         lg,
-		proj:        proj,
-		id:          id,
-		projectRoot: projectRoot,
-		dir:         dir,
-		autoSegTok:  AutoSegmentTokens,
+		store:     s,
+		db:        s.db,
+		hash:      hash,
+		id:        id,
+		memID:     memID(hash, id),
+		dir:       dir,
+		state:     st,
+		autoSegTok: AutoSegmentTokens,
 	}
 	s.open[hash+"/"+id] = sess
 	// A freshly created session should not be titled "新会话" forever.
-	if title != "" && sess.State().Title != title {
-		_, _ = sess.append(KindTitle, TitlePayload{Title: title})
+	if title != "" && st.Title != title {
+		_, _ = sess.appendLocked(KindTitle, TitlePayload{Title: title})
 	}
 	return sess, nil
 }
 
-// Close flushes and closes every open session.
+// Close flushes tails and closes every open session, then the database.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -162,22 +198,31 @@ func (s *Store) Close() error {
 		}
 		delete(s.open, k)
 	}
+	if s.db != nil {
+		if err := s.db.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.db = nil
+	}
 	return firstErr
 }
 
 // --- Session identity -------------------------------------------------------
 
 func (s *Session) ID() string          { return s.id }
-func (s *Session) ProjectRoot() string { return s.projectRoot }
+func (s *Session) ProjectRoot() string { return s.projectRoot() }
 func (s *Session) Dir() string         { return s.dir }
-func (s *Session) Log() *journal.Log   { return s.log }
+
+func (s *Session) projectRoot() string {
+	if s.state != nil {
+		return s.state.ProjectRoot
+	}
+	return ""
+}
 
 // State returns the live projection. The returned pointer is owned by the session
 // and must not be mutated by callers (read it, or go through the append methods).
-func (s *Session) State() *SessionState {
-	st, _ := s.proj.State().(*SessionState)
-	return st
-}
+func (s *Session) State() *SessionState { return s.state }
 
 // OnAppend registers a hook called for every appended message, e.g. to feed the
 // semantic recall index. Set it before appending; it is called without holding
@@ -196,8 +241,8 @@ func (s *Session) hook() func(int64, Role, string) {
 
 // --- Appending --------------------------------------------------------------
 
-// append folds one event into the projection and persists it. Callers must hold
-// no lock (it takes the session lock itself).
+// append folds one event into the projection, persists it, and (when the budget is
+// reached) persists a folded tail. Callers must not hold the lock.
 func (s *Session) append(kind string, payload interface{}) (journal.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -205,22 +250,42 @@ func (s *Session) append(kind string, payload interface{}) (journal.Event, error
 }
 
 func (s *Session) appendLocked(kind string, payload interface{}) (journal.Event, error) {
-	e, err := s.proj.AppendAndApply(kind, payload)
+	raw, err := marshalPayload(payload)
 	if err != nil {
-		return e, err
+		return journal.Event{}, err
 	}
+	now := time.Now().UnixMilli()
+	seq, err := s.db.AppendEvent(s.hash, s.memID, kind, string(raw))
+	if err != nil {
+		return journal.Event{}, err
+	}
+	e := journal.Event{Seq: seq, Kind: kind, Payload: raw, Time: now}
+	s.state.Apply(e)
+	s.persistMessage(kind, seq, raw, now)
+	_ = s.db.TouchSession(s.hash, s.id, seq)
 	s.pending++
 	if s.pending >= AnchorEvery {
-		if _, err := s.proj.Anchor(); err == nil {
-			s.pending = 0
-			s.log.Prune()
-		}
+		s.pending = 0
+		s.saveTail()
 	}
 	return e, nil
 }
 
-// AppendMessage records a chat message. It returns the journal seq, which is the
-// stable handle used by recall, audit and rollback.
+// persistMessage mirrors a message event into the FTS-indexed messages table so the
+// unified store can do lexical recall without replaying the whole log.
+func (s *Session) persistMessage(kind string, seq int64, raw json.RawMessage, now int64) {
+	if kind != KindMessage {
+		return
+	}
+	var p MessagePayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return
+	}
+	_ = s.db.UpsertMessage(s.memID, seq, string(p.Role), p.Content, p.SegmentID, now)
+}
+
+// AppendMessage records a chat message. It returns the log seq, which is the stable
+// handle used by recall, audit and rollback.
 func (s *Session) AppendMessage(role Role, content string) (int64, error) {
 	if strings.TrimSpace(content) == "" {
 		return 0, fmt.Errorf("conversation: empty message content")
@@ -271,11 +336,9 @@ func (s *Session) OpenSegment(title string) (string, error) {
 		title = "新段落"
 	}
 	id := newID("seg", time.Now().UnixNano()%100000)
-	e, err := s.append(KindSegOpen, SegOpenPayload{ID: id, Title: title})
-	if err != nil {
+	if _, err := s.append(KindSegOpen, SegOpenPayload{ID: id, Title: title}); err != nil {
 		return "", err
 	}
-	_ = e
 	return id, nil
 }
 
@@ -311,9 +374,9 @@ func (s *Session) DoneRequirement(id string) error {
 	return err
 }
 
-// AddRedline records a red line: something the user said must / must never be
-// done, or must always be watched. Red lines are injected into every prompt and
-// are never compressed away.
+// AddRedline records a red line: something the user said must / must never be done,
+// or must always be watched. Red lines are injected into every prompt and are never
+// compressed away.
 func (s *Session) AddRedline(text, source, severity string) (int64, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -332,7 +395,7 @@ func (s *Session) RecordRecall(query string, seqs []int64, score []float64) erro
 
 // --- Anchors, audit, rollback ----------------------------------------------
 
-// AnchorInfo is the UI-facing view of a journal anchor.
+// AnchorInfo is the UI-facing view of a folded-state (tail) snapshot.
 type AnchorInfo struct {
 	Seq       int64  `json:"seq"`
 	CoverFrom int64  `json:"coverFrom"`
@@ -342,47 +405,42 @@ type AnchorInfo struct {
 	Tokens    int    `json:"tokens"`
 }
 
-// DropAnchor snapshots the current state. Returns the anchor info.
+// DropAnchor persists the current folded state as a tail snapshot and returns its
+// view. Recovery replays only the events after it.
 func (s *Session) DropAnchor() (AnchorInfo, error) {
-	a, err := s.proj.Anchor()
-	if err != nil {
-		return AnchorInfo{}, err
-	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.pending = 0
-	s.mu.Unlock()
-	s.log.Prune()
-	return s.describeAnchor(a), nil
+	s.saveTail()
+	st := s.State()
+	return AnchorInfo{
+		Seq:      st.HeadSeq,
+		Time:     st.UpdatedAt,
+		Title:    st.Title,
+		Messages: len(st.Messages),
+		Tokens:   st.TotalTokens,
+	}, nil
 }
 
-// Anchors lists every anchor, newest last.
+// Anchors lists the persisted tail snapshots (at most one, the current fold).
 func (s *Session) Anchors() []AnchorInfo {
-	list := s.log.Anchors()
-	out := make([]AnchorInfo, 0, len(list))
-	for _, a := range list {
-		out = append(out, s.describeAnchor(a))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tj, ts, ok, err := s.db.GetTail(s.hash, s.id)
+	if err != nil || !ok || tj == "" {
+		return nil
 	}
-	return out
-}
-
-func (s *Session) describeAnchor(a journal.Anchor) AnchorInfo {
-	info := AnchorInfo{Seq: a.Seq, CoverFrom: a.CoverFrom}
-	var st SessionState
-	if err := st.LoadJSON(a.Snapshot); err == nil {
-		info.Title = st.Title
-		info.Messages = len(st.Messages)
-		info.Tokens = st.TotalTokens
-		info.Time = st.UpdatedAt
+	st := NewSessionState(s.id, s.projectRoot(), "", 0)
+	if e := st.LoadJSON([]byte(tj)); e != nil {
+		return nil
 	}
-	if info.Time == 0 {
-		for _, e := range s.log.Events() {
-			if e.Seq == a.Seq {
-				info.Time = e.Time
-				break
-			}
-		}
-	}
-	return info
+	return []AnchorInfo{{
+		Seq:      ts,
+		Time:     st.UpdatedAt,
+		Title:    st.Title,
+		Messages: len(st.Messages),
+		Tokens:   st.TotalTokens,
+	}}
 }
 
 // AuditEntry is one line of the audit trail: the raw event, rendered for humans.
@@ -394,22 +452,216 @@ type AuditEntry struct {
 	Preview string `json:"preview"`
 }
 
-// Audit returns the event stream, oldest first, optionally starting after
-// fromSeq and capped at limit entries (0 = all). This IS the audit trail: nothing
-// is ever rewritten, so it always reflects exactly what happened.
+// Audit returns the event stream, oldest first, optionally starting after fromSeq
+// and capped at limit entries (0 = all). This IS the audit trail: nothing is ever
+// rewritten, so it always reflects exactly what happened.
 func (s *Session) Audit(fromSeq int64, limit int) []AuditEntry {
-	events := s.log.Events()
+	events, err := s.db.GetEvents(s.memID)
+	if err != nil {
+		return nil
+	}
 	out := make([]AuditEntry, 0, len(events))
 	for _, e := range events {
 		if e.Seq <= fromSeq {
 			continue
 		}
-		out = append(out, renderAudit(e))
+		out = append(out, renderAudit(journal.Event{
+			Seq:     e.Seq,
+			Kind:    e.Kind,
+			Payload: []byte(e.Payload),
+			Time:    e.TS,
+		}))
 	}
 	if limit > 0 && len(out) > limit {
 		out = out[len(out)-limit:]
 	}
 	return out
+}
+
+// Rollback truncates the projection back to target seq. The rollback itself is
+// appended as an event, so the audit trail keeps the fact that it happened (and the
+// truncated events remain in the log for post-mortem). After rollback the folded
+// tail is persisted so a restart recovers the truncated state directly.
+func (s *Session) Rollback(target int64, note string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if target < 0 {
+		target = 0
+	}
+	if target > s.state.HeadSeq {
+		return fmt.Errorf("conversation: rollback target %d is ahead of head %d", target, s.state.HeadSeq)
+	}
+	if _, err := s.appendLocked(KindRollback, RollbackPayload{To: target, Note: note}); err != nil {
+		return err
+	}
+	s.pending = 0
+	s.saveTail()
+	return nil
+}
+
+// --- Listing ---------------------------------------------------------------
+
+// SessionInfo is the UI-facing summary of a session.
+type SessionInfo struct {
+	ID          string `json:"id"`
+	ProjectRoot string `json:"projectRoot"`
+	ProjectHash string `json:"projectHash"`
+	Title       string `json:"title"`
+	CreatedAt   int64  `json:"createdAt"`
+	UpdatedAt   int64  `json:"updatedAt"`
+	Messages    int    `json:"messages"`
+	Tokens      int    `json:"tokens"`
+	Segments    int    `json:"segments"`
+	OpenReqs    int    `json:"openReqs"`
+	Redlines    int    `json:"redlines"`
+	HeadSeq     int64  `json:"headSeq"`
+	Anchors     int    `json:"anchors"`
+}
+
+// Info summarises the current state of this session.
+func (s *Session) Info() SessionInfo {
+	st := s.State()
+	open := 0
+	for _, r := range st.Requirement {
+		if r.Status != "done" {
+			open++
+		}
+	}
+	anchors := 0
+	if _, _, ok, _ := s.db.GetTail(s.hash, s.id); ok {
+		anchors = 1
+	}
+	return SessionInfo{
+		ID:          s.id,
+		ProjectRoot: s.projectRoot(),
+		ProjectHash: ProjectHash(s.projectRoot()),
+		Title:       st.Title,
+		CreatedAt:   st.CreatedAt,
+		UpdatedAt:   st.UpdatedAt,
+		Messages:    len(st.Messages),
+		Tokens:      st.TotalTokens,
+		Segments:    len(st.Segments),
+		OpenReqs:    open,
+		Redlines:    len(st.Redlines),
+		HeadSeq:     st.HeadSeq,
+		Anchors:     anchors,
+	}
+}
+
+// ListSessions returns every session of a project, most recently updated first.
+// Live (still-open) sessions without a persisted tail are merged in from memory.
+func (s *Store) ListSessions(projectRoot string) ([]SessionInfo, error) {
+	hash := ProjectHash(projectRoot)
+	seen := map[string]bool{}
+	var out []SessionInfo
+	if rows, err := s.db.ListSessions(hash); err == nil {
+		for _, r := range rows {
+			var st SessionState
+			if r.TailJSON != "" {
+				_ = st.LoadJSON([]byte(r.TailJSON))
+			}
+			if st.Title == "" {
+				st.Title = r.Title
+			}
+			if st.HeadSeq == 0 {
+				st.HeadSeq = r.TailSeq
+			}
+			open := 0
+			for _, req := range st.Requirement {
+				if req.Status != "done" {
+					open++
+				}
+			}
+			out = append(out, SessionInfo{
+				ID:          r.ID,
+				ProjectRoot: projectRoot,
+				ProjectHash: hash,
+				Title:       st.Title,
+				CreatedAt:   st.CreatedAt,
+				UpdatedAt:   r.LastAt,
+				Messages:    len(st.Messages),
+				Tokens:      st.TotalTokens,
+				Segments:    len(st.Segments),
+				OpenReqs:    open,
+				Redlines:    len(st.Redlines),
+				HeadSeq:     st.HeadSeq,
+				Anchors:     1,
+			})
+			seen[r.ID] = true
+		}
+	}
+	s.mu.Lock()
+	for key, sess := range s.open {
+		if !strings.HasPrefix(key, hash+"/") {
+			continue
+		}
+		id := strings.TrimPrefix(key, hash+"/")
+		if seen[id] {
+			continue
+		}
+		out = append(out, sess.Info())
+		seen[id] = true
+	}
+	s.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
+	return out, nil
+}
+
+// ListProjects returns the distinct project hashes that have sessions.
+func (s *Store) ListProjects() []string {
+	ps, err := s.db.ListProjects()
+	if err != nil {
+		return nil
+	}
+	sort.Strings(ps)
+	return ps
+}
+
+// DeleteSession removes a session from the database and its directory.
+func (s *Store) DeleteSession(projectRoot, id string) error {
+	hash := ProjectHash(projectRoot)
+	key := hash + "/" + id
+	s.mu.Lock()
+	if cur, ok := s.open[key]; ok {
+		_ = cur.close()
+		delete(s.open, key)
+	}
+	s.mu.Unlock()
+	if err := s.db.DeleteSession(hash, id); err != nil {
+		return err
+	}
+	return os.RemoveAll(filepath.Join(s.baseDir, hash, id))
+}
+
+func (s *Session) close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saveTail()
+	return nil
+}
+
+// Close releases this session's state (the shared DB is owned by the store).
+func (s *Session) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.close()
+}
+
+// saveTail persists the folded projection so a restart resumes from here.
+func (s *Session) saveTail() {
+	if s.db == nil {
+		return
+	}
+	tj, err := s.state.PureJSON()
+	if err != nil {
+		return
+	}
+	_ = s.db.SetTail(s.hash, s.id, string(tj), s.state.HeadSeq)
+}
+
+// MarshalState exposes the projection as raw JSON (used by bindings / tests).
+func (s *Session) MarshalState() (json.RawMessage, error) {
+	return s.State().PureJSON()
 }
 
 func renderAudit(e journal.Event) AuditEntry {
@@ -460,183 +712,20 @@ func renderAudit(e journal.Event) AuditEntry {
 	return ent
 }
 
-// Rollback truncates the projection back to target seq. The rollback itself is
-// appended as an event, so the audit trail keeps the fact that it happened (and
-// the truncated events remain in the log file for post-mortem).
-func (s *Session) Rollback(target int64, note string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if target < 0 {
-		target = 0
+// marshalPayload normalises a payload into json.RawMessage.
+func marshalPayload(payload interface{}) (json.RawMessage, error) {
+	if payload == nil {
+		return nil, nil
 	}
-	if target > s.log.HeadSeq() {
-		return fmt.Errorf("conversation: rollback target %d is ahead of head %d", target, s.log.HeadSeq())
+	if raw, ok := payload.(json.RawMessage); ok {
+		return raw, nil
 	}
-	if _, err := s.appendLocked(KindRollback, RollbackPayload{To: target, Note: note}); err != nil {
-		return err
-	}
-	if _, err := s.proj.Anchor(); err == nil {
-		s.pending = 0
-	}
-	return nil
+	return json.Marshal(payload)
 }
 
-// --- Listing ---------------------------------------------------------------
-
-// SessionInfo is the UI-facing summary of a session.
-type SessionInfo struct {
-	ID          string `json:"id"`
-	ProjectRoot string `json:"projectRoot"`
-	ProjectHash string `json:"projectHash"`
-	Title       string `json:"title"`
-	CreatedAt   int64  `json:"createdAt"`
-	UpdatedAt   int64  `json:"updatedAt"`
-	Messages    int    `json:"messages"`
-	Tokens      int    `json:"tokens"`
-	Segments    int    `json:"segments"`
-	OpenReqs    int    `json:"openReqs"`
-	Redlines    int    `json:"redlines"`
-	HeadSeq     int64  `json:"headSeq"`
-	Anchors     int    `json:"anchors"`
-}
-
-// Info summarises the current state of this session.
-func (s *Session) Info() SessionInfo {
-	st := s.State()
-	open := 0
-	for _, r := range st.Requirement {
-		if r.Status != "done" {
-			open++
-		}
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
 	}
-	return SessionInfo{
-		ID:          s.id,
-		ProjectRoot: s.projectRoot,
-		ProjectHash: ProjectHash(s.projectRoot),
-		Title:       st.Title,
-		CreatedAt:   st.CreatedAt,
-		UpdatedAt:   st.UpdatedAt,
-		Messages:    len(st.Messages),
-		Tokens:      st.TotalTokens,
-		Segments:    len(st.Segments),
-		OpenReqs:    open,
-		Redlines:    len(st.Redlines),
-		HeadSeq:     st.HeadSeq,
-		Anchors:     len(s.log.Anchors()),
-	}
-}
-
-// ListSessions returns every session of a project, most recently updated first.
-// Sessions that are not currently open are read from disk by replaying their
-// journal (cheap, and it is the same code path used after a crash).
-func (s *Store) ListSessions(projectRoot string) ([]SessionInfo, error) {
-	dir := filepath.Join(s.baseDir, ProjectHash(projectRoot))
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var out []SessionInfo
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		id := e.Name()
-		s.mu.Lock()
-		cur, cached := s.open[ProjectHash(projectRoot)+"/"+id]
-		s.mu.Unlock()
-		if cached {
-			out = append(out, cur.Info())
-			continue
-		}
-		info, err := s.peek(ProjectHash(projectRoot), id, projectRoot)
-		if err != nil {
-			continue
-		}
-		out = append(out, info)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
-	return out, nil
-}
-
-// ListProjects returns the distinct project hashes that have sessions.
-func (s *Store) ListProjects() []string {
-	entries, err := os.ReadDir(s.baseDir)
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, e := range entries {
-		if e.IsDir() {
-			out = append(out, e.Name())
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-// peek replays a session journal read-only to summarise it without keeping it open.
-func (s *Store) peek(hash, id, projectRoot string) (SessionInfo, error) {
-	lg, err := journal.OpenLog(filepath.Join(s.baseDir, hash, id, "journal.jsonl"))
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	defer lg.Close()
-	proj, err := journal.NewProjector(NewSessionState(id, projectRoot, "", time.Now().UnixMilli()), lg)
-	if err != nil {
-		return SessionInfo{}, err
-	}
-	st, _ := proj.State().(*SessionState)
-	open := 0
-	for _, r := range st.Requirement {
-		if r.Status != "done" {
-			open++
-		}
-	}
-	return SessionInfo{
-		ID:          id,
-		ProjectRoot: projectRoot,
-		ProjectHash: hash,
-		Title:       st.Title,
-		CreatedAt:   st.CreatedAt,
-		UpdatedAt:   st.UpdatedAt,
-		Messages:    len(st.Messages),
-		Tokens:      st.TotalTokens,
-		Segments:    len(st.Segments),
-		OpenReqs:    open,
-		Redlines:    len(st.Redlines),
-		HeadSeq:     st.HeadSeq,
-		Anchors:     len(lg.Anchors()),
-	}, nil
-}
-
-// DeleteSession removes a session directory from disk (and from the open cache).
-func (s *Store) DeleteSession(projectRoot, id string) error {
-	hash := ProjectHash(projectRoot)
-	key := hash + "/" + id
-	s.mu.Lock()
-	if cur, ok := s.open[key]; ok {
-		_ = cur.close()
-		delete(s.open, key)
-	}
-	s.mu.Unlock()
-	return os.RemoveAll(filepath.Join(s.baseDir, hash, id))
-}
-
-func (s *Session) close() error {
-	return s.log.Close()
-}
-
-// Close releases this session's file handle.
-func (s *Session) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.close()
-}
-
-// MarshalState exposes the projection as raw JSON (used by bindings / tests).
-func (s *Session) MarshalState() (json.RawMessage, error) {
-	return s.State().PureJSON()
+	return b
 }

@@ -66,9 +66,9 @@ func TestProjectScopedSessionsAreIsolated(t *testing.T) {
 	if ProjectHash("/proj/a") == ProjectHash("/proj/b") {
 		t.Fatal("project hash collision")
 	}
-	// 目录布局：sessions/<hash>/<id>/journal.jsonl
-	if _, err := os.Stat(filepath.Join(dir, ProjectHash("/proj/a"), MainSessionID, "journal.jsonl")); err != nil {
-		t.Fatalf("journal file missing: %v", err)
+	// 统一存储：所有会话落到同一个 store.sqlite（不再是按会话拆分的 journal.jsonl）。
+	if _, err := os.Stat(filepath.Join(dir, "store.sqlite")); err != nil {
+		t.Fatalf("unified store file missing: %v", err)
 	}
 }
 
