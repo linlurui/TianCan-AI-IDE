@@ -274,23 +274,31 @@ func applyZCodeProviderOrder(id string, failed map[string]bool) error {
 	if cfg == nil {
 		return fmt.Errorf("zcode 配置缺少 config 节点")
 	}
-	order := []string{id}
-	if raw, ok := cfg["providerOrder"].([]interface{}); ok {
+	if raw, ok := cfg["providerOrder"].([]interface{}); ok && len(raw) > 0 {
 		// 首位是 zcode 当前的主用档。只有当它被明确探挂了才把它挪走；
 		// 探不了（账号型/OAuth）或探通的一律保持原顺序。
-		if len(raw) > 0 {
-			if first, ok := raw[0].(string); ok && first != id && !failed[first] {
-				log.Printf("ai: zcode providerOrder 首位 %s 仍可用，保持不动（不因探针重排）", first)
-				return nil
+		if first, ok := raw[0].(string); ok && first != id && !failed[first] {
+			log.Printf("ai: zcode providerOrder 首位 %s 仍可用，保持不动（不因探针重排）", first)
+			return nil
+		}
+		var original []string
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				original = append(original, s)
 			}
 		}
-		for _, v := range raw {
-			if s, ok := v.(string); ok && s != id {
+		order := []string{id}
+		for _, s := range original {
+			if s != id {
 				order = append(order, s)
 			}
 		}
+		// 先备份「动它之前」的顺序（完整原样，不能丢条目）：重排是我们在替 zcode
+		// 做决定，一旦换上来这一档报 Model creation failed（模型往往只绑在原来的
+		// 账号型档上），还要能立刻退回去。见 restoreZCodeProviderOrder。
+		backupZCodeProviderOrder(original)
+		cfg["providerOrder"] = order
 	}
-	cfg["providerOrder"] = order
 
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -303,9 +311,97 @@ func applyZCodeProviderOrder(id string, failed map[string]bool) error {
 	return os.Rename(tmp, path)
 }
 
+// zcodeOrderBackupPathOverride 便于测试把备份指到临时目录；生产为空。
+var zcodeOrderBackupPathOverride string
+
+// zcodeOrderBackupPath 存放「我们重排之前」的 providerOrder。
+func zcodeOrderBackupPath() string {
+	if zcodeOrderBackupPathOverride != "" {
+		return zcodeOrderBackupPathOverride
+	}
+	return filepath.Join(homeDir(), ".tiancan-ai-ide", "zcode-provider-order-backup.json")
+}
+
+// backupZCodeProviderOrder 记下重排前的顺序，供失败回滚使用。
+// 已有备份时不覆盖——那份才是用户原本的顺序。
+func backupZCodeProviderOrder(order []string) {
+	if len(order) == 0 {
+		return
+	}
+	path := zcodeOrderBackupPath()
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(order, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o600)
+}
+
+// restoreZCodeProviderOrder 把 providerOrder 还原成我们动它之前的样子，
+// 删除备份。没有备份（即我们没重排过）时返回 false。
+func restoreZCodeProviderOrder() bool {
+	path := zcodeOrderBackupPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var order []string
+	if err := json.Unmarshal(data, &order); err != nil || len(order) == 0 {
+		_ = os.Remove(path)
+		return false
+	}
+	cfgPath := zcodeProviderPath()
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return false
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return false
+	}
+	cfg, _ := doc["config"].(map[string]interface{})
+	if cfg == nil {
+		return false
+	}
+	cfg["providerOrder"] = order
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return false
+	}
+	tmp := cfgPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return false
+	}
+	if err := os.Rename(tmp, cfgPath); err != nil {
+		return false
+	}
+	_ = os.Remove(path)
+	log.Printf("ai: 已还原 zcode providerOrder 为 %v", order)
+	// 冷静期：回滚说明这次重排没帮上忙，短期内不要再试，否则来回抖动。
+	zcodeProbeMu.Lock()
+	zcodeReorderBlockUntil = time.Now().Add(30 * time.Minute)
+	zcodeProbeMu.Unlock()
+	return true
+}
+
+// zcodeReorderBlockUntil 在此时间之前不做 providerOrder 重排（回滚后的冷静期）。
+var zcodeReorderBlockUntil time.Time
+
 // preferZCodeCredential 在调用 zcode CLI 之前把最快可用的凭证顶上去。
 // 失败不影响主流程（最多是沿用 zcode 自己的顺序）。
 func preferZCodeCredential() {
+	zcodeProbeMu.Lock()
+	blocked := time.Now().Before(zcodeReorderBlockUntil)
+	zcodeProbeMu.Unlock()
+	if blocked {
+		// 上次重排被回滚过，冷静期内不再替 zcode 做决定。
+		return
+	}
 	// 先确保探过一轮：既拿到最快可用档，也拿到「明确失败」集合，
 	// 后者决定是否真的需要动 providerOrder。
 	bestZCodeCredential()

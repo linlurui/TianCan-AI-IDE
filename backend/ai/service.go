@@ -1347,16 +1347,45 @@ func (s *Service) chatLocalCLI(ctx context.Context, messages []ChatMessage) (str
 			// zcode 没有 --provider 参数，用哪个凭证取决于它的 providerOrder。
 			// 并发探一遍所有凭证，把最快可用的顶上去，避免卡在已挂掉的那个上
 			// （曾出现某自建中转平均 243s 才响应，直接把整档拖到首包超时）。
+			// zcode 用「锁目录」保护写文件，而锁是我们上次超时 kill 它时留下的孤儿，
+			// 不清的话每次启动都在 Built-in 刷新阶段 EEXIST 失败 → Model creation
+			// failed → 这一档永远起不来。sweep 只动陈旧锁。
+			sweepZCodeLocks()
 			preferZCodeCredential()
 			// 先建立日志基线：zcode 跑 agent loop 的工具阶段 stdout 会静默，
 			// 但它在持续写自己的运行日志，用它判断「还在干活」而非「卡死」。
 			activity := newZCodeActivityMonitor()
 			// -p 单次非交互；--mode yolo 自动放行；--no-color 避免 ANSI 混入；--cwd 限定目录。
+			args := []string{"-p", prompt, "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()}
+			out, err := s.chatGenericLocalCLI(c, "zcode", bin, cliLimits{
+				FirstOutput: 120 * time.Second,
+				Idle:        150 * time.Second,
+				Liveness:    activity.LastActive,
+			}, args)
+			if err == nil {
+				return out, nil
+			}
+			// 自愈：这一档常常是被我们自己留下的环境改动绊倒的——孤儿锁，
+			// 或 providerOrder 被我们把某个模型并不支持的凭证顶到了首位
+			// （zcode 随即报 Model creation failed）。两者都是可撤销的，
+			// 清掉/还原后重试一次，别让整条链路就此废掉。
+			hasLock := len(extractZCodeLockPaths(err.Error())) > 0
+			wrongOrder := isZCodeModelCreationFailure(err.Error())
+			if !hasLock && !wrongOrder {
+				return out, err
+			}
+			if hasLock {
+				sweepZCodeLocks()
+				clearZCodeLocksInError(err.Error())
+			}
+			if wrongOrder {
+				restoreZCodeProviderOrder()
+			}
 			return s.chatGenericLocalCLI(c, "zcode", bin, cliLimits{
 				FirstOutput: 120 * time.Second,
 				Idle:        150 * time.Second,
 				Liveness:    activity.LastActive,
-			}, []string{"-p", prompt, "--no-color", "--mode", "yolo", "--cwd", s.cliWorkDir()})
+			}, args)
 		}},
 		{key: "claude", label: "Claude Code", run: func(c context.Context) (string, error) {
 			if findLocalCLI("claude", "/usr/local/bin/claude", filepath.Join(homeDir(), ".local", "bin", "claude")) == "" {
@@ -2025,6 +2054,12 @@ func (s *Service) chatGenericLocalCLI(ctx context.Context, provider, bin string,
 			if waitErr != nil {
 				if ctx.Err() == context.DeadlineExceeded {
 					return "", fmt.Errorf("%s CLI 超时", provider)
+				}
+				// CLI 以非零码退出、但答案已经完整写在 stdout 里（见 salvageCLIOutput）时
+				// 收下答案：把一次可用档位判死，等于直接把整条备用链拖到「全部不可用」。
+				if text, ok := salvageCLIOutput(stderr.String(), text); ok {
+					log.Printf("ai: %s 退出码非零但已给出完整答案，忽略已知噪声: %v", provider, waitErr)
+					return text, nil
 				}
 				if detail := strings.TrimSpace(stderr.String()); detail != "" {
 					return "", fmt.Errorf("%s CLI 执行失败: %w: %s", provider, waitErr, truncateString(detail, 300))
