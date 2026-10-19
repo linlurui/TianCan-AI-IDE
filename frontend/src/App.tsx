@@ -36,7 +36,7 @@ import type { ModelSource } from "./components/AIPanel";
 import PermissionConfirmModal, { type PermissionRequest } from "./components/PermissionConfirmModal";
 import { applyExtensionContributes } from "./extensions/contributes";
 import { RunSetup } from "./bindings/project";
-import { SessionAppend, SessionMessages, type MsgView } from "./bindings/ctxsvc";
+import { useSessionPersistence } from "./hooks/useSessionPersistence";
 import { Project, ProjectType } from "./types";
 import { RevealSignal } from "./components/FileTree";
 import TerminalPanel from "./components/TerminalPanel";
@@ -100,17 +100,6 @@ const ANALYSIS_EXTS = new Set([
   "rs", "c", "cpp", "cc", "h", "hpp", "php", "rb", "vue", "md", "mdx", "json",
 ]);
 
-let msgUidSeq = 0;
-
-/**
- * 给消息惰性分配一个稳定标识。
- * 直接写在原对象上（不换引用）：React 不会因为多一个字段就重渲染，而之后任何
- * `{...m}` 复制都会把它带走 —— 这正是落盘去重需要的性质。
- */
-function ensureUid(m: Message): string {
-  if (!m.uid) m.uid = `u${++msgUidSeq}`;
-  return m.uid;
-}
 
 function normalizeAgentMessages(rawMessages: any[], pushActivity?: (kind: ActivityItem["kind"], text: string, detail?: string, toolName?: string) => void): Message[] {
   const rawMsgs = (rawMessages ?? []).filter((m: any) => m?.role !== "user");
@@ -286,125 +275,15 @@ export default function App() {
   // 每条落定的 user/assistant 消息都会追加到后端 journal；重启后从后端恢复；
   // 回退后也以后端为准重新加载。
   //
-  // 去重按「消息稳定标识 uid」：既不能按内容（用户重复说"在吗"会被误判成已写过，
-  // 后端收不到、本轮锚点永远不出现），也不能按对象身份（消息一被 spread 复制身份
-  // 就变，写入后 seq 写不回原对象 → 下一次又写一遍 → 无限循环把会话撑爆）。
-  // uid 在首次考虑落盘时才惰性分配，之后跟着消息走，两种坑一起避开。
-  const persistedRef = React.useRef<Map<string, "pending" | "done">>(new Map());
-  // 后端水位线：后端已有的前 N 条消息不必再写入。
-  const baselineRef = React.useRef(0);
-  // 恢复闸门：后端历史还没取回来之前不能写入，否则会把前端已有的整段历史
-  // 当成"新消息"再写一遍（持久化 effect 是同步的，必然抢在 await 之前跑完）。
-  const restoredRef = React.useRef(false);
-
-  const reloadSessionMessages = React.useCallback(async (root: string, force: boolean) => {
-    if (!root) return;
-    try {
-      const rows: MsgView[] = await SessionMessages(root, "main", 0);
-      if (!rows?.length) return;
-      // seq 必须带上：侧边锚点刻度靠它定位到具体消息。
-      const restored: Message[] = rows.map((m) => ({
-        role: m.role as Message["role"],
-        content: m.content,
-        seq: m.seq,
-        // 后端消息用 seq 当稳定标识，前端再怎么重建数组都不会认错。
-        uid: `s${m.seq}`,
-      }));
-      // 这些都是后端已经有的（带 seq），登记为已写过，避免再写一遍。
-      restored.forEach((m) => persistedRef.current.set(m.uid!, "done"));
-      // 回退后后端消息变少，水位线必须跟着降，否则新消息会被误判为"已写入"。
-      if (force) baselineRef.current = rows.length;
-      else if (rows.length > baselineRef.current) baselineRef.current = rows.length;
-      setMessages((prev) => (force || prev.length === 0 ? restored : prev));
-    } catch {
-      // 会话尚不存在（首次打开项目）：忽略，首次发消息时会创建
-    }
-  }, []);
-
-  // 切换/打开项目时从后端恢复历史
-  React.useEffect(() => {
-    const root = project.activeProject?.rootPath ?? "";
-    if (!root) return;
-    let alive = true;
-    restoredRef.current = false;
-    // 换项目就是换会话：后端消息的 uid 是 "s"+seq，不同项目之间会撞号，
-    // 不清干净的话新项目里的消息可能被上一项目遗留的登记当成"已写过"。
-    persistedRef.current.clear();
-    baselineRef.current = 0;
-    void (async () => {
-      try {
-        const rows: MsgView[] = await SessionMessages(root, "main", 0);
-        if (!alive) return;
-        if (!rows?.length) { restoredRef.current = true; return; }
-        // seq 必须带上：侧边锚点刻度靠它定位到具体消息。
-        const restored: Message[] = rows.map((m) => ({
-          role: m.role as Message["role"],
-          content: m.content,
-          seq: m.seq,
-          uid: `s${m.seq}`,
-        }));
-        // 这些都是后端已经有的（带 seq），登记为已写过，避免再写一遍。
-        restored.forEach((m) => persistedRef.current.set(m.uid!, "done"));
-        // 后端已有这些消息，抬高水位线，避免重启时被重复写入后端。
-        if (rows.length > baselineRef.current) baselineRef.current = rows.length;
-        setMessages((prev) => (prev.length ? prev : restored));
-      } catch {
-        // 会话尚不存在或后端不可用：忽略，首次发消息时会创建
-      } finally {
-        if (alive) restoredRef.current = true;
-      }
-    })();
-    return () => { alive = false; };
-  }, [project.activeProject?.rootPath]);
-
-  // 落定的消息写入后端（覆盖 auto / local / api / web 全部链路）
-  React.useEffect(() => {
-    const root = project.activeProject?.rootPath ?? "";
-    if (!root) return;
-    if (!restoredRef.current) return; // 等后端历史取回来，避免整段重复写入
-    for (let i = 0; i < messages.length; i++) {
-      const m = messages[i];
-      if (m.streaming) continue;
-      if (m.role !== "user" && m.role !== "assistant") continue;
-      if (!m.content.trim()) continue;
-      // 带 seq = 后端来的（历史恢复 / 已写回），不需要再写。
-      if (typeof m.seq === "number") continue;
-      const uid = ensureUid(m);
-      if (i < baselineRef.current) {
-        // 后端已经存在这一段（上次运行留下的），只登记不重写。
-        persistedRef.current.set(uid, "done");
-        continue;
-      }
-      if (persistedRef.current.has(uid)) continue;
-      persistedRef.current.set(uid, "pending");
-      // 后端返回的顺序号必须写回这条消息：侧边锚点刻度靠它把刻度摆在对应消息
-      // 旁边，也靠 DOM 上的 data-seq 定位过去。丢掉它，当前会话新发的消息
-      // 就永远定位不到（点击刻度只会跳到更早的一条）。
-      //
-      // 写回时按 uid 匹配：按对象身份会在消息被复制后找不到目标（写不回 seq →
-      // 下一轮又写一遍 → 无限循环），按内容又会把重复的两句话认成同一条。
-      void SessionAppend(root, "main", m.role, m.content)
-        .then((seq: number) => {
-          if (typeof seq !== "number" || seq <= 0) {
-            persistedRef.current.delete(uid); // 后端没给出序号，允许再试一次
-            return;
-          }
-          persistedRef.current.set(uid, "done");
-          setMessages((prev) => {
-            // 只找还没拿到 seq 的那一条：万一数组里短暂存在同城 uid 的副本
-            // （流式替换的瞬间），也要把序号写到缺的那个身上，否则它会一直重发。
-            const j = prev.findIndex((x) => x.uid === uid && typeof x.seq !== "number");
-            if (j < 0) return prev;
-            const next = prev.slice();
-            next[j] = { ...prev[j], seq };
-            return next;
-          });
-        })
-        .catch(() => {
-          persistedRef.current.delete(uid); // 失败则允许下次重试
-        });
-    }
-  }, [messages, project.activeProject?.rootPath]);
+  // 实现在 hooks/useSessionPersistence —— 主窗口和独立 AI 窗口共用同一条通道，
+  // 免得出现"这边发了消息、那边一条没落库"的裂缝（之前就是这条裂缝让锚点不涨）。
+  const sessionPersistence = useSessionPersistence<Message>(
+    project.activeProject?.rootPath ?? "",
+    "main",
+    messages,
+    setMessages,
+  );
+  const reloadSessionMessages = React.useCallback(() => sessionPersistence.reload(), [sessionPersistence]);
 
   useEffect(() => {
     const off = Events.On("ai:model-stream", (evt: any) => {
@@ -1187,7 +1066,7 @@ export default function App() {
             messages={messages}
             contextToAppend={aiContextSignal}
             projectRoot={project.activeProject?.rootPath ?? ""}
-            onRollback={() => { void reloadSessionMessages(project.activeProject?.rootPath ?? "", true); }}
+            onRollback={() => reloadSessionMessages()}
             // 整理记忆：按需把当前对话提炼进 SESSION_MEMORY.md（自动提取之外的手动通道）。
             // mode 用最后一次对话的模型来源，保证提炼走的是同一个后端。
             onOrganizeMemory={async () => {

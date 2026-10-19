@@ -8,6 +8,8 @@ import { appendActivity, describeTool, finishToolActivity, withConversationConte
 import DebugPanel from "./DebugPanel";
 import SplitEditorArea from "./SplitEditorArea";
 import { useEditorStore } from "../store/editorStore";
+import { useProjectStore } from "../store/projectStore";
+import { useSessionPersistence } from "../hooks/useSessionPersistence";
 import "../App.css";
 
 // Detect which window mode we're in from the URL
@@ -86,6 +88,17 @@ function AIWindow() {
   const streamRef = useRef<any>(null);
   const runSourceRef = useRef<ModelSource | null>(null);
   const stopRequestedRef = useRef(false);
+
+  // 独立 AI 窗口以前是「没有项目」的：rootPath 写死空串，消息也从不落库 ——
+  // 在这个窗口里发的每一句话都进不了会话 journal，锚点/回退/记忆提炼全部空转，
+  // 用户看到的就是"发了很多条，锚点一动不动"。项目和持久化两件事一起补上，
+  // 和主窗口走同一个 hook，避免下次改一边漏一边。
+  const project = useProjectStore();
+  const rootPath = project.activeProject?.rootPath ?? "";
+  React.useEffect(() => {
+    if (project.projects.length === 0) void project.loadPersistedProjects();
+  }, [project.projects.length, project.loadPersistedProjects]);
+  const sessionPersistence = useSessionPersistence<Message>(rootPath, "main", messages, setMessages);
 
   const pushActivity = useCallback((kind: ActivityItem["kind"], text: string, detail?: string, toolName?: string) => {
     setActivityItems((current) => {
@@ -234,7 +247,6 @@ function AIWindow() {
     setActivityItems([]);
     runSourceRef.current = source;
 
-    const rootPath = ""; // AI window doesn't have a project context; tools will use default
     pushActivity("thinking", "准备上下文", source === "auto" ? "Auto 将按可用模型自动尝试" : `使用 ${source} 模式处理当前请求`);
 
     try {
@@ -349,11 +361,20 @@ function AIWindow() {
       setMessages((p) => [...p.filter((message) => !message.streaming), { role: "assistant", content: `❌ ${err?.message ?? err}` }]);
     }
     setLoading(false);
-  }, [messages, pushActivity]);
+  }, [messages, pushActivity, rootPath]);
 
   return (
     <div className="ide-root" style={{ height: "100vh" }}>
-      <AIPanel messages={messages} onSend={handleSend} onStop={stopRequest} isLoading={loading} activityItems={activityItems} fullWidth />
+      <AIPanel
+        messages={messages}
+        onSend={handleSend}
+        onStop={stopRequest}
+        isLoading={loading}
+        activityItems={activityItems}
+        fullWidth
+        projectRoot={rootPath}
+        onRollback={() => sessionPersistence.reload()}
+      />
     </div>
   );
 }
